@@ -1,0 +1,302 @@
+version: "2"
+run:
+  # M2 (round-4 review of #2814): without this, golangci-lint never even
+  # SEES cmd/conduit/internal/generate/transcript_capture_test.go (its
+  # `//go:build generate_capture` tag excludes it from every untagged
+  # build/lint, and generate-capture.yml's live-capture job is the only
+  # place in CI that ever passes `-tags=generate_capture` - and that job
+  # runs `go test`, never `golangci-lint run`). This is not redundant with
+  # `go vet`/compilation catching a break: gosec's own taint analysis on
+  # transcript.go's LoadManifest (the `#nosec G703` on its os.ReadFile)
+  # only sees a tainted call site at all once this file's own
+  # patchManifestForScopedRun is in the build - remove that #nosec and
+  # `--build-tags=generate_capture` reports `G703: Path traversal via
+  # taint analysis` while an untagged run reports zero issues, verified
+  # empirically. Add a tag here, add the matching `go vet`/`go test`
+  # step to .github/workflows/test.yml's `test` job in the same PR (LOW-1,
+  # round-5 review of #2814: `go vet`, not `go build` - `go build` never
+  # compiles `_test.go` files at all and so cannot catch a break in this
+  # tagged _test.go file; see that step's own comment).
+  build-tags:
+    - generate_capture
+linters:
+  default: none
+  enable:
+    - bodyclose
+    - copyloopvar
+    - depguard
+    - dogsled
+    - durationcheck
+    - errcheck
+    - errname
+    - exhaustive
+    - forbidigo
+    - goconst
+    - gocritic
+    - gocyclo
+    - goheader
+    - gomoddirectives
+    - gomodguard_v2
+    - goprintffuncname
+    - gosec
+    - govet
+    - ineffassign
+    - makezero
+    - noctx
+    - nolintlint
+    - predeclared
+    # - revive # TODO enable
+    - rowserrcheck
+    - sqlclosecheck
+    - staticcheck
+    - unconvert
+    - unused
+    - wastedassign
+    - whitespace
+  settings:
+    gomoddirectives:
+      # Temporary: patched goja fork until dop251/goja#816 is merged and
+      # released. See the comment above the replace in go.mod.
+      replace-allow-list:
+        - github.com/dop251/goja
+    depguard:
+      rules:
+        Main:
+          deny:
+            - pkg: errors
+              desc: To accommodate for custom error creation and handling use Conduit's 'cerrors' package instead.
+            - pkg: golang.org/x/xerrors
+              desc: To accommodate for custom error creation and handling use Conduit's 'cerrors' package instead.
+            - pkg: github.com/golang/mock
+              desc: github.com/golang/mock is deprecated, use go.uber.org/mock instead.
+            - pkg: encoding/json
+              desc: github.com/goccy/go-json is preferred for performance reasons.
+        # P1-3 / plan-v2 §6: policy.Decide is the ONLY function permitted to
+        # return "skip artifact verification" for a connector install. This
+        # rule is the structural half of that guarantee (the other half is
+        # policy.Decision's unexported field, pkg/registry/policy/gate.go) —
+        # restricting which files may even import the package means no new
+        # call site can be added that calls policy.Decide without a
+        # deliberate, reviewable change to this file too.
+        PolicyBypass:
+          files:
+            - "!**/pkg/registry/install.go"
+            # bundle.go is the second (and, as of PR-4, only other)
+            # sanctioned call site: it calls policy.DecideStaleBundle for
+            # the --allow-stale-bundle gate (plan-v2/step5 §7 step 3,
+            # gated exactly like --allow-unsigned per DeVaris's
+            # ratification) the same way install.go calls policy.Decide for
+            # --allow-unsigned.
+            - "!**/pkg/registry/bundle.go"
+            - "!**/pkg/registry/policy/**"
+            # Test files may import policy to assert against its exported
+            # Code*/Decision types (the "confirms wiring" test pattern,
+            # plan-v2 §11.2) without calling Decide themselves — that
+            # narrower invariant (only install.go calls Decide) is enforced
+            # by Decision's unexported field (gate.go), not by this rule;
+            # this rule's job is production call sites only.
+            - "!**/*_test.go"
+            # allcodes.go blank-imports every codes.go-declaring package
+            # (including this one) solely for conduiterr.Register's
+            # init-time side effect, for the llms.txt error-code generator
+            # (D5, 20260712-llms-txt-generation.md) — it never calls
+            # Decide or references any exported symbol.
+            - "!**/cmd/conduit/internal/llmsgen/allcodes/allcodes.go"
+          deny:
+            - pkg: github.com/conduitio/conduit/pkg/registry/policy
+              desc: >-
+                policy.Decide is the ONLY function permitted to skip connector
+                artifact verification (plan-v2 §6/P1-3). Only
+                pkg/registry/install.go may call it — the CLI/MCP layers pass
+                primitive signals (TTY, CI env, confirmation, allow-unsigned
+                flag) through registry.InstallOptions instead of importing
+                this package directly.
+    forbidigo:
+      # Needed for the pconnector.*Request field-access pattern below: without
+      # analyze-types, forbidigo only has literal source text to match against,
+      # and cannot tell a `config.Config`-typed selector from any other `.Config`
+      # access.
+      analyze-types: true
+      forbid:
+        # conduiterr#2526 follow-up: construction must go through New/Wrap (or the
+        # WithCode escape hatch), which guarantee a stack frame and a validated,
+        # registered Code. A raw literal skips both.
+        #
+        # Caveat: forbidigo only matches Ident/SelectorExpr node text, not the
+        # enclosing composite literal, so it cannot distinguish "constructing
+        # ConduitError{}" from "naming the ConduitError type" (e.g. as a var, param,
+        # or return type). In this codebase the type is meant to be reached via
+        # New/Wrap/Get, not named directly outside the package, so forbidding the
+        # bare identifier is the closest enforceable guard and today has zero known
+        # legitimate hits outside the package/tests (verified by grep). It also
+        # will not catch the literal if conduiterr is imported under a different
+        # local name.
+        - pattern: '^conduiterr\.ConduitError$'
+          msg: construct via conduiterr.New, conduiterr.Wrap, or conduiterr.WithCode instead of a raw ConduitError{} literal - see package doc.
+        # Execution plan §1.1 (CI error-code guard): pkg/http/api/status/status.go
+        # is the sole sanctioned chokepoint for building a gRPC status at the API
+        # boundary — every path through it now guarantees a google.rpc.ErrorInfo
+        # detail (see conduitErrorStatus / fallbackStatus). A raw grpcstatus.Error(f)
+        # or status.Error(f) call anywhere else under pkg/http/api bypasses that
+        # guarantee and reintroduces a codeless status the codes_contract_test.go
+        # guard cannot see (it only drives the four exported functions, not every
+        # call site). Forbidding the constructor here, structurally, is the
+        # backstop for call sites the contract test can't reach.
+        #
+        # Scope: this repo has exactly two other legitimate handwritten
+        # grpcstatus/status.Error(f) call sites today, both excluded below —
+        # pkg/http/api/health_server.go (the gRPC health-check protocol reply,
+        # not a Conduit business error) and the generated proto/api/v1/*.pb*.go
+        # files (already covered by `exclusions.generated: lax`, listed here only
+        # for auditability).
+        - pattern: '^grpcstatus\.Error(f)?$'
+          msg: build gRPC statuses via pkg/http/api/status (PipelineError/ConnectorError/ProcessorError/PluginError), not a raw grpcstatus.Error(f) call - see status.go's fallbackStatus.
+        - pattern: '^status\.Error(f)?$'
+          msg: build gRPC statuses via pkg/http/api/status (PipelineError/ConnectorError/ProcessorError/PluginError), not a raw status.Error(f) call - see status.go's fallbackStatus.
+        # v0.16.1 secrets-redaction follow-up (execution plan §1.1): connector
+        # config.Config routinely carries secrets (DB urls with embedded
+        # passwords, SASL credentials, access keys) and there is no
+        # per-parameter sensitivity metadata yet, so it must never be logged
+        # raw - see pkg/foundation/log/redact.go.
+        #
+        # This pattern only catches a direct `.Config`/`.ConfigBefore`/
+        # `.ConfigAfter` field read on one of the 8 pconnector request types
+        # that carry connector settings (verified empirically: with
+        # analyze-types on, forbidigo expands a field-selector expression like
+        # `in.Config` to "pconnector.SourceConfigureRequest.Config", but a
+        # composite literal key such as `pconnector.SourceConfigureRequest{Config:
+        # cfg}` expands to just "pconnector.Config" - so building the real
+        # request to send to a plugin does not trip this rule, only reading the
+        # field back out, e.g. to log it, does). Wrapping the value in
+        # log.RedactAll(...) still trips it, since forbidigo has no way to see
+        # the wrapping call - those (currently 10, all in
+        # pkg/plugin/connector/builtin/{source,destination}.go) need a
+        # `//nolint:forbidigo` with that justification.
+        #
+        # Known gap, documented rather than silently accepted: this does NOT
+        # cover pkg/connector/{source,destination}.go's
+        # `oldConfig`/`newConfig map[string]string` (bare locals, not a
+        # selector on a named type - forbidigo has no type info for them) or
+        # sandbox.go's generic `res any` echoed on a cancelled context (same
+        # reason, plus `res`/`oldConfig`/`newConfig` are reused throughout
+        # their functions for legitimate, unrelated purposes, so a name-based
+        # rule there would be all noise). sandbox.go's site has a dedicated
+        # regression test (pkg/plugin/connector/builtin/redact_test.go); the
+        # pkg/connector default branch is unreachable today (isEqual(nil, nil)
+        # returns early before the switch, per its own "should never happen"
+        # comment) and is fixed defensively, sharing the same RedactAll
+        # covered by pkg/foundation/log's tests, but has no dedicated
+        # reachability test since there is no live path to drive.
+        - pattern: '^pconnector\.(Source|Destination)(Configure|LifecycleOnCreated|LifecycleOnUpdated|LifecycleOnDeleted)Request\.(Config|ConfigBefore|ConfigAfter)$'
+          pkg: '^github\.com/conduitio/conduit-connector-protocol/pconnector$'
+          msg: never log a raw pconnector request Config/ConfigBefore/ConfigAfter field - wrap it in log.RedactAll(...) (pkg/foundation/log/redact.go) and silence this line with a `//nolint:forbidigo` explaining it is wrapped.
+        # conduit-commons#305 / #308: the Avro codec's package-level API shares
+        # process-wide state. avro.DefaultConfig holds one encoder/decoder cache
+        # for the whole process, keyed by the schema's String(), where a
+        # reference to a named type is just its name. avro.DefaultSchemaCache
+        # makes every parsed named type visible to every later parse. Two
+        # pipelines in one process whose schemas share a type name then encode
+        # with each other's definitions, and the bytes are written and acked
+        # without an error. Encode and decode through conduit-commons
+        # schema/avro (one isolated config per Serde), or build a private
+        # avro.Config{}.Freeze() / &avro.SchemaCache{} owned by one schema.
+        # The rule covers both codecs (hamba/avro and the iskorotkov fork).
+        - pattern: '^avro\.(Marshal|Unmarshal|NewEncoder|NewDecoder|NewEncoderForSchema|NewDecoderForSchema|Register|RegisterTypeConverters|DefaultConfig|DefaultSchemaCache)$'
+          pkg: '^github\.com/(hamba|iskorotkov)/avro/v2$'
+          msg: the Avro codec's package-level API shares one cache per process and can encode with another schema's named types (conduit-commons#305) - use conduit-commons schema/avro, or a private avro.Config{}.Freeze() owned by one schema.
+        - pattern: '^avro\.(Parse|ParseBytes|ParseFiles|MustParse|ParseWithCache|ParseBytesWithCache)$'
+          pkg: '^github\.com/(hamba|iskorotkov)/avro/v2$'
+          msg: parse Avro schemas through conduit-commons schema/avro.Parse; the codec's Parse/ParseBytes register named types in a process-wide cache (conduit-commons#308). A call that passes a fresh &avro.SchemaCache{} owned by one schema may be silenced with a `//nolint:forbidigo` saying so.
+      exclude-godoc-examples: true
+    gocyclo:
+      min-complexity: 20
+    govet:
+      # shadow would have caught #2925 (an `err :=` in a loop hid the outer
+      # err, so a failed store write was committed and reported as success).
+      # It is scoped to pkg/connector by the exclusion rule below; see that
+      # rule for why it is not repo-wide.
+      enable:
+        - shadow
+    goheader:
+      values:
+        regexp:
+          copyright-year: 20[2-9]\d
+      template-path: .golangci.goheader.template
+    nolintlint:
+      allow-unused: false # report any unused nolint directives
+      require-explanation: true # require an explanation for nolint directives
+      require-specific: true # require nolint directives to mention the specific linter being suppressed
+  exclusions:
+    generated: lax
+    paths:
+      - ^examples/
+      - ^pkg/plugin/processor/builtin/internal/diff # external code
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+    rules:
+      - linters:
+          - goconst
+        path: pkg/plugin/processor/builtin/impl
+      - linters:
+          - goconst
+        # test fixtures and acceptance-test harnesses are not named *_test.go
+        # but are test-only code where repeated literals are expected
+        path: (pkg/provisioning/test/|_testing\.go)
+      - linters:
+          - staticcheck
+        text: "QF1008:" # could remove embedded field from selector
+      - linters:
+          - govet
+        text: "^shadow:"
+        # govet's shadow check (#2930) runs on pkg/connector only, where it
+        # found the #2925 bug and where all 3 findings were fixed when it was
+        # turned on. Repo-wide it reports 141 findings; the 21 in
+        # pkg/lifecycle and pkg/lifecycle-poc were reviewed and none is a
+        # bug: they are `if err := ...; err != nil` blocks, deliberate fresh
+        # contexts in cleanup goroutines, and one goroutine in
+        # pkg/lifecycle/stream/destination_acker.go where the shadow is what
+        # keeps it from racing on the outer err. Extend this path when a
+        # package's findings have been fixed.
+        path-except: ^pkg/connector/
+      - linters:
+          - dogsled
+          - gosec
+          - goconst
+          - forbidigo
+        path: (.+)_test\.go
+      - linters:
+          - forbidigo
+        # conduiterr's own constructors (New/Wrap/WithCode) are the only place
+        # allowed to build a ConduitError{} literal directly.
+        path: ^pkg/foundation/cerrors/conduiterr/
+      - linters:
+          - forbidigo
+        text: 'grpcstatus\.Error|status\.Error'
+        # The grpcstatus.Error(f)/status.Error(f) forbid pair (execution plan
+        # §1.1) only polices pkg/http/api - the API error boundary. Everywhere
+        # else in the tree keeps constructing gRPC statuses however it always
+        # has (e.g. proto/api/v1/*.pb*.go, which is also `generated: lax`).
+        path-except: ^pkg/http/api/
+      - linters:
+          - forbidigo
+        text: 'grpcstatus\.Error|status\.Error'
+        # health_server.go implements the gRPC health-check protocol reply
+        # (grpc.health.v1), not a Conduit business error - it has no
+        # ConduitError code to carry and isn't reached by codes_contract_test.go.
+        path: ^pkg/http/api/health_server\.go$
+formatters:
+  enable:
+    - gofmt
+    - gofumpt
+    - goimports
+  settings:
+    gofmt:
+      simplify: false
+  exclusions:
+    generated: lax
+    paths:
+      - ^examples/
+      - ^pkg/plugin/processor/builtin/internal/diff

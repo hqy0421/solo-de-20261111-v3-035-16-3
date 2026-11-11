@@ -1,0 +1,319 @@
+// Copyright © 2022 Meroxa, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package orchestrator
+
+import (
+	"context"
+	"fmt"
+
+	"github.com/conduitio/conduit-commons/rollback"
+	"github.com/conduitio/conduit/pkg/foundation/cerrors"
+	"github.com/conduitio/conduit/pkg/inspector"
+	"github.com/conduitio/conduit/pkg/pipeline"
+	"github.com/conduitio/conduit/pkg/processor"
+	"github.com/google/uuid"
+)
+
+type ProcessorOrchestrator base
+
+func (p *ProcessorOrchestrator) Create(
+	ctx context.Context,
+	plugin string,
+	parent processor.Parent,
+	cfg processor.Config,
+	cond string,
+) (*processor.Instance, error) {
+	var mark mutationMark
+	defer mark.release()
+	var r rollback.R
+	defer r.MustExecute()
+
+	txn, ctx, err := p.db.NewTransaction(ctx, true)
+	if err != nil {
+		return nil, cerrors.Errorf("could not create db transaction: %w", err)
+	}
+	r.AppendPure(txn.Discard)
+
+	pl, err := p.getProcessorsPipeline(ctx, parent)
+	if err != nil {
+		return nil, err
+	}
+
+	// check if pipeline was provisioned by config
+	if pl.ProvisionedBy != pipeline.ProvisionTypeAPI {
+		// Invariant: errors.Is(err, ErrImmutableProvisionedByConfig) still holds —
+		// sentinel wrapped, ConduitError adds the code.
+		return nil, immutableProvisionedByConfigErr(fmt.Sprintf("cannot add a processor to the pipeline %q", pl.ID))
+	}
+
+	// Invariant 2: admitted by run liveness, not status (#2899 item 2): a
+	// starting or recovering run counts.
+	// #2961: the check and the mark are one step under the lifecycle's
+	// admission lock; Start is refused until the processor is written.
+	if err := mark.acquire(p.lifecycle, pl.ID, pipeline.ErrPipelineRunning.Error()); err != nil {
+		return nil, err
+	}
+
+	// Nothing is stored yet, so "***" (the API's redaction placeholder) has
+	// no value to keep; storing it literally would break the setting (#2913).
+	if err := RefuseRedactedSettings(cfg.Settings, "/config/settings"); err != nil {
+		return nil, err
+	}
+
+	// create processor and add to pipeline or connector
+	proc, err := p.processors.Create(
+		ctx,
+		uuid.NewString(),
+		plugin,
+		parent,
+		cfg,
+		processor.ProvisionTypeAPI,
+		cond,
+	)
+	if err != nil {
+		return nil, err
+	}
+	r.Append(func() error { return p.processors.Delete(ctx, proc.ID) })
+
+	switch parent.Type {
+	case processor.ParentTypePipeline:
+		_, err = p.pipelines.AddProcessor(ctx, pl.ID, proc.ID)
+		if err != nil {
+			return nil, cerrors.Errorf("could not add processor to pipeline: %w", err)
+		}
+		r.Append(func() error {
+			_, err := p.pipelines.RemoveProcessor(ctx, pl.ID, proc.ID)
+			return err
+		})
+	case processor.ParentTypeConnector:
+		_, err = p.connectors.AddProcessor(ctx, parent.ID, proc.ID)
+		if err != nil {
+			return nil, cerrors.Errorf("could not add processor to connector: %w", err)
+		}
+		r.Append(func() error {
+			_, err := p.connectors.RemoveProcessor(ctx, parent.ID, proc.ID)
+			return err
+		})
+	default:
+		// Invariant: errors.Is(err, ErrInvalidProcessorParentType) still holds —
+		// sentinel wrapped, ConduitError adds the code.
+		return nil, invalidProcessorParentTypeErr(fmt.Sprintf("%s: %s", ErrInvalidProcessorParentType, parent.Type))
+	}
+
+	// commit db transaction and skip rollback
+	err = txn.Commit()
+	if err != nil {
+		return nil, cerrors.Errorf("could not commit db transaction: %w", err)
+	}
+
+	r.Skip() // skip rollback
+	return proc, err
+}
+
+func (p *ProcessorOrchestrator) List(ctx context.Context) map[string]*processor.Instance {
+	return p.processors.List(ctx)
+}
+
+func (p *ProcessorOrchestrator) InspectIn(
+	ctx context.Context,
+	id string,
+) (*inspector.Session, error) {
+	proc, err := p.Get(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+
+	return proc.InspectIn(ctx, proc.ID), nil
+}
+
+func (p *ProcessorOrchestrator) InspectOut(
+	ctx context.Context,
+	id string,
+) (*inspector.Session, error) {
+	proc, err := p.Get(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+
+	return proc.InspectOut(ctx, proc.ID), nil
+}
+
+func (p *ProcessorOrchestrator) Get(ctx context.Context, id string) (*processor.Instance, error) {
+	return p.processors.Get(ctx, id)
+}
+
+func (p *ProcessorOrchestrator) Update(ctx context.Context, id string, plugin string, cfg processor.Config) (*processor.Instance, error) {
+	var mark mutationMark
+	defer mark.release()
+	var r rollback.R
+	defer r.MustExecute()
+
+	txn, ctx, err := p.db.NewTransaction(ctx, true)
+	if err != nil {
+		return nil, cerrors.Errorf("could not create db transaction: %w", err)
+	}
+	r.AppendPure(txn.Discard)
+
+	proc, err := p.processors.Get(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+
+	// check if processor was provisioned by config
+	if proc.ProvisionedBy != processor.ProvisionTypeAPI {
+		// Invariant: errors.Is(err, ErrImmutableProvisionedByConfig) still holds —
+		// sentinel wrapped, ConduitError adds the code.
+		return nil, immutableProvisionedByConfigErr(fmt.Sprintf("processor %q cannot be updated", proc.ID))
+	}
+	// provisioned by API
+	oldPlugin := proc.Plugin
+	oldConfig := proc.Config
+
+	pl, err := p.getProcessorsPipeline(ctx, proc.Parent)
+	if err != nil {
+		return nil, err
+	}
+
+	// Invariant 2: admitted by run liveness, not status (#2899 item 2): a
+	// starting or recovering run counts.
+	// #2961: the check and the mark are one step under the lifecycle's
+	// admission lock; Start is refused until the processor is written.
+	if err := mark.acquire(p.lifecycle, pl.ID, pipeline.ErrPipelineRunning.Error()); err != nil {
+		return nil, err
+	}
+
+	// "***" (the API's redaction placeholder) keeps the stored value, so a
+	// redacted GET -> UPDATE round trip does not overwrite credentials (#2913).
+	cfg.Settings, err = restoreRedactedSettingsForPlugin(oldPlugin, plugin, oldConfig.Settings, cfg.Settings, "/config/settings")
+	if err != nil {
+		return nil, err
+	}
+
+	proc, err = p.processors.Update(ctx, id, plugin, cfg)
+	if err != nil {
+		return nil, err
+	}
+	r.Append(func() error {
+		_, err = p.processors.Update(ctx, proc.ID, oldPlugin, oldConfig)
+		return err
+	})
+
+	// commit db transaction and skip rollback
+	err = txn.Commit()
+	if err != nil {
+		return nil, cerrors.Errorf("could not commit db transaction: %w", err)
+	}
+
+	r.Skip() // skip rollback
+	return proc, err
+}
+
+func (p *ProcessorOrchestrator) Delete(ctx context.Context, id string) error {
+	var mark mutationMark
+	defer mark.release()
+	var r rollback.R
+	defer r.MustExecute()
+
+	txn, ctx, err := p.db.NewTransaction(ctx, true)
+	if err != nil {
+		return cerrors.Errorf("could not create db transaction: %w", err)
+	}
+	r.AppendPure(txn.Discard)
+
+	proc, err := p.processors.Get(ctx, id)
+	if err != nil {
+		return err
+	}
+
+	// check if processor was provisioned by config
+	if proc.ProvisionedBy != processor.ProvisionTypeAPI {
+		// Invariant: errors.Is(err, ErrImmutableProvisionedByConfig) still holds —
+		// sentinel wrapped, ConduitError adds the code.
+		return immutableProvisionedByConfigErr(fmt.Sprintf("processor %q cannot be deleted", proc.ID))
+	}
+
+	pl, err := p.getProcessorsPipeline(ctx, proc.Parent)
+	if err != nil {
+		return err
+	}
+
+	// Invariant 2: admitted by run liveness, not status (#2899 item 2): a
+	// starting or recovering run counts.
+	// #2961: the check and the mark are one step under the lifecycle's
+	// admission lock; Start is refused until the delete is written.
+	if err := mark.acquire(p.lifecycle, pl.ID, pipeline.ErrPipelineRunning.Error()); err != nil {
+		return err
+	}
+
+	err = p.processors.Delete(ctx, id)
+	if err != nil {
+		return err
+	}
+	r.Append(func() error {
+		_, err = p.processors.Create(ctx, id, proc.Plugin, proc.Parent, proc.Config, processor.ProvisionTypeAPI, proc.Condition)
+		return err
+	})
+
+	switch proc.Parent.Type {
+	case processor.ParentTypePipeline:
+		_, err = p.pipelines.RemoveProcessor(ctx, pl.ID, proc.ID)
+		if err != nil {
+			return cerrors.Errorf("could not add processor to pipeline: %w", err)
+		}
+		r.Append(func() error {
+			_, err := p.pipelines.AddProcessor(ctx, pl.ID, proc.ID)
+			return err
+		})
+	case processor.ParentTypeConnector:
+		_, err = p.connectors.RemoveProcessor(ctx, proc.Parent.ID, proc.ID)
+		if err != nil {
+			return cerrors.Errorf("could not add processor to connector: %w", err)
+		}
+		r.Append(func() error {
+			_, err := p.connectors.AddProcessor(ctx, proc.Parent.ID, proc.ID)
+			return err
+		})
+	default:
+		// Invariant: errors.Is(err, ErrInvalidProcessorParentType) still holds —
+		// sentinel wrapped, ConduitError adds the code.
+		return invalidProcessorParentTypeErr(fmt.Sprintf("%s: %s", ErrInvalidProcessorParentType, proc.Parent.Type))
+	}
+
+	// commit db transaction and skip rollback
+	err = txn.Commit()
+	if err != nil {
+		return cerrors.Errorf("could not commit db transaction: %w", err)
+	}
+
+	r.Skip() // skip rollback
+	return err
+}
+
+func (p *ProcessorOrchestrator) getProcessorsPipeline(ctx context.Context, parent processor.Parent) (*pipeline.Instance, error) {
+	switch parent.Type {
+	case processor.ParentTypePipeline:
+		return p.pipelines.Get(ctx, parent.ID)
+	case processor.ParentTypeConnector:
+		conn, err := p.connectors.Get(ctx, parent.ID)
+		if err != nil {
+			return nil, err
+		}
+		return p.pipelines.Get(ctx, conn.PipelineID)
+	default:
+		// Invariant: errors.Is(err, ErrInvalidProcessorParentType) still holds —
+		// sentinel wrapped, ConduitError adds the code.
+		return nil, invalidProcessorParentTypeErr(fmt.Sprintf("%s: %s", ErrInvalidProcessorParentType, parent.Type))
+	}
+}

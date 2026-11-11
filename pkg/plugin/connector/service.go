@@ -1,0 +1,240 @@
+// Copyright © 2022 Meroxa, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//go:generate mockgen -typed -source=service.go -destination=mock/source_interface_mocks.go -package=mock -mock_names=builtinReg=BuiltinReg,standaloneReg=StandaloneReg,authManager=AuthManager . builtinReg,standaloneReg,authManager
+
+package connector
+
+import (
+	"context"
+
+	"github.com/conduitio/conduit-connector-protocol/pconnector"
+	"github.com/conduitio/conduit/pkg/foundation/cerrors"
+	"github.com/conduitio/conduit/pkg/foundation/log"
+	"github.com/conduitio/conduit/pkg/plugin"
+)
+
+// registry is an object that can create new plugin dispensers. We need to use
+// an interface to prevent a cyclic dependency between the plugin package and
+// builtin and standalone packages.
+// There are two registries that implement this interface: builtinReg and standaloneReg
+type registry interface {
+	NewDispenser(logger log.CtxLogger, name plugin.FullName, cfg pconnector.PluginConfig) (Dispenser, error)
+	List() map[plugin.FullName]pconnector.Specification
+}
+
+// The built-in registry creates a dispenser which dispenses a plugin adapter
+// that communicates with the plugin directly as if it was a library. These
+// plugins are baked into the Conduit binary and included at compile time.
+type builtinReg interface {
+	registry
+
+	Init(context.Context)
+}
+
+// standaloneReg creates a dispenser which starts the plugin in a
+// separate process and communicates with it via gRPC. These plugins are
+// compiled independently of Conduit and can be included at runtime.
+type standaloneReg interface {
+	registry
+
+	Init(ctx context.Context, connUtilsAddr string, maxReceiveRecordSize int)
+}
+
+type authManager interface {
+	GenerateNew(connectorID string) string
+	Deregister(token string)
+}
+
+// SettingsGuard vets the settings of a validation-only Configure call before the
+// plugin sees them. A refusal is returned to the caller as is.
+type SettingsGuard func(plugin string, settings map[string]string) error
+
+// PluginServiceOption configures a PluginService.
+type PluginServiceOption func(*PluginService)
+
+// WithSettingsGuard sets the guard applied by ValidateSourceConfig and
+// ValidateDestinationConfig. Without it settings reach the plugin unvetted, so
+// a validation request could probe the host (the file connector stats its
+// path).
+func WithSettingsGuard(g SettingsGuard) PluginServiceOption {
+	return func(s *PluginService) { s.settingsGuard = g }
+}
+
+type PluginService struct {
+	logger log.CtxLogger
+
+	settingsGuard SettingsGuard
+
+	builtinReg    builtinReg
+	standaloneReg standaloneReg
+	authManager   authManager
+}
+
+func NewPluginService(
+	logger log.CtxLogger,
+	builtin builtinReg,
+	standalone standaloneReg,
+	authManager authManager,
+	opts ...PluginServiceOption,
+) *PluginService {
+	s := &PluginService{
+		logger:        logger.WithComponent("connector.PluginService"),
+		builtinReg:    builtin,
+		standaloneReg: standalone,
+		authManager:   authManager,
+	}
+	for _, o := range opts {
+		o(s)
+	}
+	return s
+}
+
+func (s *PluginService) Init(ctx context.Context, connUtilsAddr string, maxReceiveRecordSize int) {
+	s.builtinReg.Init(ctx)
+	s.standaloneReg.Init(ctx, connUtilsAddr, maxReceiveRecordSize)
+}
+
+func (s *PluginService) Check(context.Context) error {
+	return nil
+}
+
+func (s *PluginService) NewDispenser(logger log.CtxLogger, name string, connectorID string) (Dispenser, error) {
+	logger = logger.WithComponent("plugin")
+
+	cfg := pconnector.PluginConfig{
+		Token:       s.authManager.GenerateNew(connectorID),
+		ConnectorID: connectorID,
+		LogLevel:    logger.GetLevel().String(),
+	}
+
+	dispenser, err := s.newDispenser(logger, name, cfg)
+	if err != nil {
+		// No plugin was started, so no Teardown will ever revoke the token.
+		s.authManager.Deregister(cfg.Token)
+		return nil, err
+	}
+
+	return DispenserWithCleanup(
+		dispenser,
+		func() { s.authManager.Deregister(cfg.Token) },
+	), nil
+}
+
+func (s *PluginService) List(context.Context) (map[string]pconnector.Specification, error) {
+	builtinSpecs := s.builtinReg.List()
+	standaloneSpecs := s.standaloneReg.List()
+
+	specs := make(map[string]pconnector.Specification, len(builtinSpecs)+len(standaloneSpecs))
+	for k, v := range builtinSpecs {
+		specs[string(k)] = v
+	}
+	for k, v := range standaloneSpecs {
+		specs[string(k)] = v
+	}
+
+	return specs, nil
+}
+
+func (s *PluginService) ValidateSourceConfig(ctx context.Context, name string, settings map[string]string) (err error) {
+	if s.settingsGuard != nil {
+		if err := s.settingsGuard(name, settings); err != nil {
+			return err
+		}
+	}
+	d, err := s.NewDispenser(s.logger, name, "validate-source-config")
+	if err != nil {
+		return cerrors.Errorf("couldn't get dispenser: %w", err)
+	}
+
+	src, err := d.DispenseSource()
+	if err != nil {
+		return cerrors.Errorf("could not dispense source: %w", err)
+	}
+
+	defer func() {
+		_, terr := src.Teardown(ctx, pconnector.SourceTeardownRequest{})
+		if err == nil {
+			err = terr // only overwrite error if it's nil
+		}
+	}()
+
+	_, err = src.Configure(ctx, pconnector.SourceConfigureRequest{Config: settings})
+	if err != nil {
+		return &ValidationError{Err: MapSDKCode(err)}
+	}
+
+	return nil
+}
+
+func (s *PluginService) ValidateDestinationConfig(ctx context.Context, name string, settings map[string]string) (err error) {
+	if s.settingsGuard != nil {
+		if err := s.settingsGuard(name, settings); err != nil {
+			return err
+		}
+	}
+	d, err := s.NewDispenser(s.logger, name, "validate-destination-config")
+	if err != nil {
+		return cerrors.Errorf("couldn't get dispenser: %w", err)
+	}
+
+	dest, err := d.DispenseDestination()
+	if err != nil {
+		return cerrors.Errorf("could not dispense destination: %w", err)
+	}
+
+	defer func() {
+		_, terr := dest.Teardown(ctx, pconnector.DestinationTeardownRequest{})
+		if err == nil {
+			err = terr // only overwrite error if it's nil
+		}
+	}()
+
+	_, err = dest.Configure(ctx, pconnector.DestinationConfigureRequest{Config: settings})
+	if err != nil {
+		return &ValidationError{Err: err}
+	}
+
+	return nil
+}
+
+// newDispenser resolves name to a dispenser from the standalone or built-in
+// registry. Every dispenser it returns must carry the specification of the
+// plugin it dispenses (DispenserSpecification): the arch-v2 engine reads the
+// connector's sdk.batch.* defaults from it (#3321). Both registries attach it;
+// pkg/plugin/connector/external.Dispenser does not yet, so wiring a new kind of
+// dispenser in here starts by attaching its specification (see that package's
+// doc).
+func (s *PluginService) newDispenser(logger log.CtxLogger, name string, cfg pconnector.PluginConfig) (Dispenser, error) {
+	fullName := plugin.FullName(name)
+	switch fullName.PluginType() {
+	case plugin.PluginTypeStandalone:
+		return s.standaloneReg.NewDispenser(logger, fullName, cfg)
+	case plugin.PluginTypeBuiltin:
+		return s.builtinReg.NewDispenser(logger, fullName, cfg)
+	case plugin.PluginTypeAny:
+		d, err := s.standaloneReg.NewDispenser(logger, fullName, cfg)
+		// Only a genuinely absent standalone plugin falls back to the built-in
+		// registry. Any other standalone error — including the egress-allowlist
+		// refusal of pkg/plugin/connector/standalone — must propagate, not be
+		// masked by a built-in lookup.
+		if err != nil && cerrors.Is(err, plugin.ErrPluginNotFound) {
+			s.logger.Debug(context.Background()).Err(err).Msg("could not find standalone plugin dispenser, falling back to builtin plugin")
+			d, err = s.builtinReg.NewDispenser(logger, fullName, cfg)
+		}
+		return d, err
+	default:
+		return nil, cerrors.Errorf("invalid plugin name prefix %q", fullName.PluginType())
+	}
+}

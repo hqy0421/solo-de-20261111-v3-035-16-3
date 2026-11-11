@@ -1,0 +1,468 @@
+// Copyright © 2022 Meroxa, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package connector
+
+import (
+	"context"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/conduitio/conduit-commons/database/inmemory"
+	"github.com/conduitio/conduit/pkg/foundation/log"
+	"github.com/google/uuid"
+	"github.com/matryer/is"
+	"github.com/rs/zerolog"
+)
+
+func TestPersister_EmptyFlushDoesNothing(t *testing.T) {
+	is := is.New(t)
+	ctx := context.Background()
+	persister, store := initPersisterTest(time.Millisecond*100, 2)
+
+	persister.Flush(ctx)
+	persister.Wait()
+
+	got, err := store.GetAll(ctx)
+	is.NoErr(err)
+	is.Equal(0, len(got))
+}
+
+// TestPersister_PersistFlushesAfterDelayThreshold verifies the delay-based
+// side of the flush contract described on Persist: a batch is flushed once
+// delayThreshold has elapsed (as long as the bundle-count threshold wasn't
+// hit first). It uses a fakeClock instead of real sleeps so the assertions
+// are exact rather than tolerance-based: advancing by less than the
+// threshold must never flush, and advancing to (or past) the threshold must
+// always flush. This replaces a previous version of the test that measured
+// real wall-clock delay against a fixed tolerance window, which flaked under
+// load when the timer fired later than the tolerance allowed.
+func TestPersister_PersistFlushesAfterDelayThreshold(t *testing.T) {
+	is := is.New(t)
+	ctx := context.Background()
+	delayThreshold := time.Millisecond * 100
+
+	persister, store := initPersisterTest(delayThreshold, 2)
+	clk := newFakeClock()
+	persister.clock = clk
+
+	conn := &Instance{ID: uuid.NewString(), Type: TypeDestination}
+	callbackCalled := make(chan struct{})
+	err := persister.Persist(ctx, conn, 1, func(err error) {
+		if err != nil {
+			t.Errorf("expected nil error, got: %v", err)
+		}
+		close(callbackCalled)
+	})
+	is.NoErr(err)
+
+	// Advancing by less than the threshold must not schedule a flush.
+	// fakeClock.Advance fires any due timers synchronously before
+	// returning, so this check is deterministic: there is no window in
+	// which the flush could still be "in flight".
+	clk.Advance(delayThreshold - time.Millisecond)
+	select {
+	case <-callbackCalled:
+		t.Fatal("flush was triggered before the delay threshold elapsed")
+	default:
+	}
+
+	// Advancing past the threshold must trigger the flush. The flush itself
+	// still runs in a background goroutine (flushNow, and the callback
+	// invocation within it), so we wait on the channel rather than asserting
+	// immediately - but with a generous timeout, not a tight tolerance.
+	clk.Advance(time.Millisecond * 2)
+	select {
+	case <-callbackCalled:
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected callback to be called after the delay threshold elapsed")
+	}
+
+	got, err := store.Get(ctx, conn.ID)
+	is.NoErr(err)
+	is.Equal(conn, got)
+}
+
+func TestPersister_PersistFlushesAfterBundleCountThreshold(t *testing.T) {
+	is := is.New(t)
+	ctx := context.Background()
+	bundleCountThreshold := 50
+
+	persister, store := initPersisterTest(time.Second, bundleCountThreshold)
+
+	allCallbacksCalled := make(chan struct{})
+	var wgCallbacks sync.WaitGroup
+	wgCallbacks.Add(bundleCountThreshold / 2)
+	go func() {
+		wgCallbacks.Wait()
+		close(allCallbacksCalled)
+	}()
+
+	for i := 0; i < bundleCountThreshold/2; i++ {
+		conn := &Instance{ID: uuid.NewString(), Type: TypeDestination}
+		err := persister.Persist(ctx, conn, 1, func(err error) {
+			t.Fatal("expected callback to be overwritten!")
+		})
+		is.NoErr(err)
+		// second persist will overwrite first callback
+		err = persister.Persist(ctx, conn, 1, func(err error) {
+			if err != nil {
+				t.Fatalf("expected nil error, got: %v", err)
+			}
+			wgCallbacks.Done()
+		})
+		is.NoErr(err)
+	}
+	lastPersistAt := time.Now()
+
+	// we are testing a delay which is not exact, this is the acceptable margin
+	maxDelay := time.Millisecond * 100
+	select {
+	case <-allCallbacksCalled:
+		if gotDelay := time.Since(lastPersistAt); gotDelay > maxDelay {
+			t.Fatalf("flush delay should be less than %s, actual delay: %s", maxDelay, gotDelay)
+		}
+	case <-time.After(maxDelay):
+		t.Fatalf("expected callbacks to be called in %s", maxDelay)
+	}
+
+	conns, err := store.GetAll(ctx)
+	is.NoErr(err)
+	is.Equal(bundleCountThreshold/2, len(conns))
+}
+
+func TestPersister_FlushStoresRightAway(t *testing.T) {
+	is := is.New(t)
+	ctx := context.Background()
+	persister, store := initPersisterTest(time.Millisecond*100, 2)
+
+	conn := &Instance{ID: uuid.NewString(), Type: TypeDestination}
+	callbackCalled := make(chan struct{})
+	timeAtPersist := time.Now()
+	err := persister.Persist(ctx, conn, 1, func(err error) {
+		if err != nil {
+			t.Fatalf("expected nil error, got: %v", err)
+		}
+		close(callbackCalled)
+	})
+	is.NoErr(err)
+
+	// flush right away
+	persister.Flush(ctx)
+	persister.Wait()
+
+	// we are testing a delay which is not exact, this is the acceptable margin
+	maxDelay := time.Millisecond * 10
+	select {
+	case <-callbackCalled:
+		if gotDelay := time.Since(timeAtPersist); gotDelay > maxDelay {
+			t.Fatalf("flush delay should be less than %s, actual delay: %s", maxDelay, gotDelay)
+		}
+	case <-time.After(maxDelay):
+		t.Fatalf("expected callback to be called in a certain time frame")
+	}
+
+	got, err := store.Get(ctx, conn.ID)
+	is.NoErr(err)
+	is.Equal(conn, got)
+}
+
+// TestPersister_WaitsForOpenConnectorsAndFlush verifies that Wait blocks
+// until every started connector has been stopped and the flush triggered by
+// the last stop has actually completed. It used to simulate "connectors are
+// still open" by having a background goroutine time.Sleep(100ms) before
+// calling ConnectorStopped, then asserting Wait() unblocked within a
+// delay..delay+10ms wall-clock window, which flaked under load. It never went
+// through clock.AfterFunc (ConnectorStopped triggers an immediate flush, not
+// the delay-threshold timer), so there is no timer to fake here.
+//
+// What Wait guarantees, and what it does not:
+//
+//   - Guaranteed: the flush triggered by the last ConnectorStopped has written
+//     to the store. ConnectorStopped publishes that flush generation
+//     (triggerFlush sets p.flush) while holding m, BEFORE it calls
+//     connWg.Done. Wait's connWg.Wait therefore cannot return until that
+//     generation is published, and WaitPendingWrites then blocks on its
+//     writeDone. So store.Get right after Wait returns must see the record.
+//   - NOT guaranteed: that the goroutine calling ConnectorStopped has itself
+//     returned. connWg.Done runs inside the third ConnectorStopped, before it
+//     unlocks m and returns, and before that goroutine's deferred
+//     close(stoppedAll). Wait can return in that window. An earlier version
+//     of this test asserted stoppedAll was already closed with a
+//     non-blocking select and called that deterministic; it flaked in CI
+//     (run 38772862899). The goroutine must still finish promptly, so the
+//     test waits for it with a deadline instead.
+//
+// The 5s timeouts guard against a genuine deadlock; they are not part of the
+// assertion.
+func TestPersister_WaitsForOpenConnectorsAndFlush(t *testing.T) {
+	is := is.New(t)
+	ctx := context.Background()
+	persister, store := initPersisterTest(time.Millisecond*100, 2)
+
+	conn := &Instance{ID: uuid.NewString(), Type: TypeDestination}
+	persister.ConnectorStarted()
+	persister.ConnectorStarted()
+	persister.ConnectorStarted()
+
+	stoppedAll := make(chan struct{})
+	var persistErr error
+	go func() {
+		defer close(stoppedAll)
+		persister.ConnectorStopped()
+		persister.ConnectorStopped()
+		// before the last stop we persist another change which should be
+		// flushed automatically when the last connector is stopped
+		persistErr = persister.Persist(ctx, conn, 1, func(err error) {})
+		persister.ConnectorStopped()
+	}()
+
+	waitReturned := make(chan struct{})
+	go func() {
+		persister.Wait()
+		close(waitReturned)
+	}()
+
+	select {
+	case <-waitReturned:
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected Wait to return once all connectors stopped and the final flush completed")
+	}
+
+	// The flush triggered by the last ConnectorStopped was published before
+	// connWg.Done and Wait blocked on its write, so the persisted state is
+	// visible now, with no polling. Checked before joining the goroutine so a
+	// regression in that ordering fails here rather than being masked.
+	got, err := store.Get(ctx, conn.ID)
+	is.NoErr(err)
+	is.Equal(conn, got)
+
+	// The stop goroutine may still be between connWg.Done and its deferred
+	// close (see the doc comment), but it has nothing left to block on.
+	select {
+	case <-stoppedAll:
+	case <-time.After(5 * time.Second):
+		t.Fatal("connector-stop goroutine did not finish after Wait returned")
+	}
+	is.NoErr(persistErr)
+}
+
+func initPersisterTest(
+	delayThreshold time.Duration,
+	bundleCountThreshold int,
+) (*Persister, *Store) {
+	logger := log.New(zerolog.Nop())
+	db := &inmemory.DB{}
+
+	persister := NewPersister(logger, db, delayThreshold, bundleCountThreshold)
+	return persister, NewStore(db, logger)
+}
+
+// fakeClock is a test-only implementation of the connector package's clock
+// interface. It gives tests explicit, synchronous control over time so that
+// delay-threshold behavior (see Persister.Persist) can be asserted exactly
+// instead of within a real-time tolerance window.
+//
+// Advance fires any due timers synchronously, in the calling goroutine,
+// before returning. That means a call to Advance which does not cross a
+// timer's deadline is guaranteed to have triggered no side effects by the
+// time it returns - callers don't need to sleep or poll to check that
+// "nothing happened yet".
+type fakeClock struct {
+	mu     sync.Mutex
+	now    time.Time
+	timers []*fakeTimer
+}
+
+func newFakeClock() *fakeClock {
+	return &fakeClock{now: time.Now()}
+}
+
+func (c *fakeClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.now
+}
+
+func (c *fakeClock) AfterFunc(d time.Duration, f func()) stoppableTimer {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	t := &fakeTimer{fireAt: c.now.Add(d), fn: f}
+	c.timers = append(c.timers, t)
+	return t
+}
+
+// Advance moves the fake clock forward by d and synchronously fires any
+// timers whose deadline is now due, in the order they were scheduled. Firing
+// happens after releasing the clock's internal lock (but before Advance
+// returns), so timer callbacks are free to call back into the clock (e.g.
+// schedule a new AfterFunc) without deadlocking.
+func (c *fakeClock) Advance(d time.Duration) {
+	c.mu.Lock()
+	c.now = c.now.Add(d)
+	now := c.now
+
+	remaining := make([]*fakeTimer, 0, len(c.timers))
+	var due []*fakeTimer
+	for _, t := range c.timers {
+		if !t.fireAt.After(now) {
+			due = append(due, t)
+		} else {
+			remaining = append(remaining, t)
+		}
+	}
+	c.timers = remaining
+	c.mu.Unlock()
+
+	for _, t := range due {
+		t.fire()
+	}
+}
+
+// fakeTimer is the fakeClock counterpart to *time.Timer, tracked by the
+// clock so Advance can fire it once its deadline is due.
+type fakeTimer struct {
+	fireAt time.Time
+	fn     func()
+
+	mu      sync.Mutex
+	stopped bool
+	fired   bool
+}
+
+// Stop mirrors *time.Timer.Stop: it returns true if this call is the one
+// that prevents the timer from firing, false if it had already fired or
+// been stopped.
+func (t *fakeTimer) Stop() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	stoppedNow := !t.stopped && !t.fired
+	t.stopped = true
+	return stoppedNow
+}
+
+func (t *fakeTimer) fire() {
+	t.mu.Lock()
+	if t.stopped || t.fired {
+		t.mu.Unlock()
+		return
+	}
+	t.fired = true
+	t.mu.Unlock()
+
+	t.fn()
+}
+
+// TestPersister_CountThresholdWithUnalignedBatches pins the >= trigger on the
+// bundle-count threshold. Arch-v2 acks whole batches, and batch sizes do not
+// line up with the threshold (100 from the default source batch, 37 from a
+// short read, 1000 from a Postgres CDC batch). With the old == check the
+// counter steps past the threshold, never fires, and the only flush trigger
+// left is the delay timer, which this test never advances. The test therefore
+// fails with == and passes with >=.
+func TestPersister_CountThresholdWithUnalignedBatches(t *testing.T) {
+	const threshold = 1000
+
+	// Each sequence crosses the threshold without ever landing on it exactly.
+	tests := []struct {
+		name   string
+		counts []int
+		// flushAt is the index of the call that must trigger the flush.
+		flushAt int
+	}{
+		{name: "37 and 100 alternating", counts: repeat(8, 37, 100), flushAt: 15}, // 7*137=959, +37=996, +100=1096
+		{name: "single batch over the threshold", counts: []int{1000, 1}, flushAt: 0},
+		{name: "1000 after 37", counts: []int{37, 1000}, flushAt: 1},
+		{name: "exact hit still flushes", counts: []int{900, 100}, flushAt: 1},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			is := is.New(t)
+			ctx := context.Background()
+
+			persister, _ := initPersisterTest(time.Hour, threshold)
+			persister.clock = newFakeClock() // never advanced: only the count can flush
+
+			flushed := make(chan int, len(tc.counts))
+			for i, n := range tc.counts {
+				is.NoErr(persister.Persist(ctx, &Instance{ID: "c1", Type: TypeSource}, n, func(err error) {
+					if err != nil {
+						t.Errorf("unexpected persist error: %v", err)
+					}
+					flushed <- i
+				}))
+				if i < tc.flushAt {
+					select {
+					case got := <-flushed:
+						t.Fatalf("flushed too early at call %d (callback for call %d)", i, got)
+					case <-time.After(20 * time.Millisecond):
+					}
+				}
+			}
+
+			select {
+			case got := <-flushed:
+				// The callback registered last for the connector is the one
+				// that runs, which is the call that crossed the threshold.
+				is.Equal(got, tc.flushAt)
+			case <-time.After(5 * time.Second):
+				t.Fatalf("threshold %d crossed by %v but no flush happened", threshold, tc.counts)
+			}
+		})
+	}
+}
+
+// TestPersister_CountResetsAfterFlush checks that crossing the threshold
+// resets the counter, so the overshoot does not carry into the next window.
+func TestPersister_CountResetsAfterFlush(t *testing.T) {
+	is := is.New(t)
+	ctx := context.Background()
+
+	persister, _ := initPersisterTest(time.Hour, 100)
+	persister.clock = newFakeClock()
+
+	flushed := make(chan struct{}, 4)
+	cb := func(error) { flushed <- struct{}{} }
+	conn := &Instance{ID: "c1", Type: TypeSource}
+
+	is.NoErr(persister.Persist(ctx, conn, 150, cb)) // overshoots, flushes
+	select {
+	case <-flushed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected a flush for the overshooting batch")
+	}
+
+	is.NoErr(persister.Persist(ctx, conn, 99, cb)) // below the threshold again: must not flush
+	select {
+	case <-flushed:
+		t.Fatal("counter carried the overshoot into the next window")
+	case <-time.After(50 * time.Millisecond):
+	}
+	is.NoErr(persister.Persist(ctx, conn, 1, cb)) // reaches 100: flushes
+	select {
+	case <-flushed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected a flush at the threshold")
+	}
+}
+
+func repeat(n int, vals ...int) []int {
+	var out []int
+	for i := 0; i < n; i++ {
+		out = append(out, vals...)
+	}
+	return out
+}

@@ -1,0 +1,97 @@
+### Go ###
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+/vendor
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool, specifically when used with LiteIDE
+*.out
+
+### Intellij ###
+.idea
+
+### VisualStudioCode ###
+.vscode
+
+### Conduit ###
+
+# Output of `make bench-engine`
+/bench-engine*.txt
+
+# Internal strategy notes — never ship public (see CLAUDE.md)
+/STRATEGY.md
+
+# Badger DB
+conduit.db
+
+# Binary, built with `make build`
+/conduit
+/conduit-pipeline-check
+
+### OS ###
+.DS_Store
+
+dist/
+# pkg/web/ui/dist/ is a deliberate exception: it's the built conduit-ui SPA,
+# embedded via go:embed (pkg/web/ui) and committed so the binary is
+# reproducible without a Node toolchain at conduit build time. Reproduce it
+# with `make ui` (see the Makefile target's comment for the pinned commit).
+!pkg/web/ui/dist/
+!pkg/web/ui/dist/**
+
+# Examples
+/examples/processors/file_destination.txt
+/example.in
+/example.out
+
+# Standalone connectors
+/connectors
+# Standalone processors
+/processors
+
+/pipelines
+
+# Conduit local config
+/conduit.yaml
+
+# Escape Analysis Report
+escape_analysis.txt
+
+# Profiles
+*.prof
+
+# Compiled test wasm processors
+pkg/plugin/processor/standalone/test/wasm_processors/*/processor.wasm
+
+# Test data
+**/test/*.txt
+**/test/*.txt.committed
+
+# this one is needed for integration tests
+!pkg/provisioning/test/source-file.txt
+
+golangci-report.xml
+# Claude Code local state
+.claude/worktrees/
+.claude/settings.local.json
+
+# Python bytecode (the CI helper scripts under .github/scripts are run, not imported)
+__pycache__/
+*.pyc
+
+# lychee's link-check result cache (.github/workflows/link-check.yml); written
+# when the check is run locally, restored from the Actions cache in CI.
+.lycheecache
+
+# Golden databases for the storage-engine upgrade gate (tests/upgrade/storecompat).
+!tests/upgrade/storecompat/testdata/*/conduit.db
+!tests/upgrade/storecompat/testdata/*/conduit.db/**
+
+# Fail files rapid writes to replay a failing property locally.
+**/testdata/rapid/

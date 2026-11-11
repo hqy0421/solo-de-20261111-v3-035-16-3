@@ -1,0 +1,55 @@
+# This is a fixture used in tests. The Go objects, expected to be created by
+# this configuration file, can be found in the same folder.
+---
+version: 2.0
+pipelines:
+  - id: pipeline1
+    status: running
+    name: name1
+    description: desc1
+    dead-letter-queue:
+      plugin: builtin:file
+      settings:
+        path: ./test/dlq-file.txt
+    connectors:
+      - id: con1
+        type: source
+        plugin: builtin:file
+        name: file-src
+        settings:
+          path: ./test/source-file.txt
+      - id: con2
+        type: destination
+        plugin: builtin:file
+        name: file-dest
+        settings:
+          path: ./test/dest-file.txt
+        processors:
+          - id: con2proc1
+            plugin: builtin:field.exclude
+            settings:
+              fields: '.Metadata["opencdc.readAt"]'
+    processors:
+      - id: proc1
+        plugin: builtin:field.exclude
+        settings:
+          fields: '.Metadata["opencdc.readAt"]'
+---
+version: 2.0
+pipelines:
+  - id: pipeline2
+    status: stopped
+    name: name2
+    description: desc2
+    connectors:
+      - id: con1
+        type: destination
+        plugin: builtin:file
+        name: file-dest
+        settings:
+          path: ./test/file3.txt
+
+  - id: pipeline3
+    status: stopped
+    name: name3
+    description: empty

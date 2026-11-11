@@ -1,0 +1,25 @@
+# This is a fixture used in tests. The Go objects, expected to be created by
+# this configuration file, can be found in the same folder.
+version: 2.0
+pipelines:
+  - id: pipeline2
+    status: running
+    name: name2
+    description: desc2
+    connectors:
+      - id: con1
+        type: source
+        plugin: builtin:file
+        name: source
+        settings:
+          path: my/path/file1.txt
+      - id: con2
+        type: destination
+        plugin: builtin:file
+        name: dest
+        settings:
+          path: my/path/file2.txt
+  - id: pipeline1 # duplicated pipeline ID in the same folder
+    status: stopped
+    name: name1
+    description: desc1

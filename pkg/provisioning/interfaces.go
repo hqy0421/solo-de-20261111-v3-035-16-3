@@ -1,0 +1,105 @@
+// Copyright © 2022 Meroxa, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package provisioning
+
+import (
+	"context"
+
+	"github.com/conduitio/conduit/pkg/connector"
+	"github.com/conduitio/conduit/pkg/foundation/log"
+	"github.com/conduitio/conduit/pkg/pipeline"
+	connectorPlugin "github.com/conduitio/conduit/pkg/plugin/connector"
+	"github.com/conduitio/conduit/pkg/processor"
+)
+
+//go:generate mockgen -typed -destination=mock/provisioning.go -package=mock -mock_names=PipelineService=PipelineService,ConnectorService=ConnectorService,ProcessorService=ProcessorService,ConnectorPluginService=ConnectorPluginService,LifecycleService=LifecycleService . PipelineService,ConnectorService,ProcessorService,ConnectorPluginService,LifecycleService
+
+type PipelineService interface {
+	Get(ctx context.Context, id string) (*pipeline.Instance, error)
+	List(ctx context.Context) map[string]*pipeline.Instance
+	Create(ctx context.Context, id string, cfg pipeline.Config, p pipeline.ProvisionType) (*pipeline.Instance, error)
+	Update(ctx context.Context, pipelineID string, cfg pipeline.Config) (*pipeline.Instance, error)
+	UpdateStatus(ctx context.Context, pipelineID string, status pipeline.Status, errMsg string) error
+	Delete(ctx context.Context, pipelineID string) error
+	UpdateDLQ(ctx context.Context, pipelineID string, cfg pipeline.DLQ) (*pipeline.Instance, error)
+
+	AddConnector(ctx context.Context, pipelineID string, connectorID string) (*pipeline.Instance, error)
+	RemoveConnector(ctx context.Context, pipelineID string, connectorID string) (*pipeline.Instance, error)
+	AddProcessor(ctx context.Context, pipelineID string, processorID string) (*pipeline.Instance, error)
+	RemoveProcessor(ctx context.Context, pipelineID string, processorID string) (*pipeline.Instance, error)
+}
+
+type ConnectorService interface {
+	Get(ctx context.Context, id string) (*connector.Instance, error)
+	Create(ctx context.Context, id string, t connector.Type, plugin string, pipelineID string, c connector.Config, p connector.ProvisionType) (*connector.Instance, error)
+	Update(ctx context.Context, id string, plugin string, c connector.Config) (*connector.Instance, error)
+	Delete(ctx context.Context, id string, dispenserFetcher connector.PluginDispenserFetcher) error
+	// Restore puts back an instance Delete removed (#3137); see
+	// connector.Service.Restore for what it keeps.
+	Restore(ctx context.Context, instance *connector.Instance) error
+
+	AddProcessor(ctx context.Context, connectorID string, processorID string) (*connector.Instance, error)
+	RemoveProcessor(ctx context.Context, connectorID string, processorID string) (*connector.Instance, error)
+}
+
+type ProcessorService interface {
+	Get(ctx context.Context, id string) (*processor.Instance, error)
+	Create(
+		ctx context.Context,
+		id string,
+		plugin string,
+		parent processor.Parent,
+		cfg processor.Config,
+		p processor.ProvisionType,
+		condition string,
+	) (*processor.Instance, error)
+	MakeRunnableProcessor(ctx context.Context, i *processor.Instance) (*processor.RunnableProcessor, error)
+	// UpdateWhileRunning updates a processor's stored config without the
+	// running-instance guard Update enforces — provisioning applies processor
+	// updates either on a stopped pipeline or as a live in-place reconfigure that
+	// immediately swaps the node, so the guard (meant for direct API callers who
+	// do not swap) must not block it. See processor.Service.UpdateWhileRunning.
+	UpdateWhileRunning(ctx context.Context, id string, plugin string, cfg processor.Config) (*processor.Instance, error)
+	Delete(ctx context.Context, id string) error
+}
+
+type ConnectorPluginService interface {
+	NewDispenser(ctx log.CtxLogger, name string, connectorID string) (connectorPlugin.Dispenser, error)
+}
+
+type LifecycleService interface {
+	Start(ctx context.Context, pipelineID string) error
+	Stop(ctx context.Context, pipelineID string, force bool) error
+	// StopAndWait gracefully stops the pipeline and blocks until it has fully
+	// drained and its connectors' positions are durably persisted — see
+	// lifecycle.Service.StopAndWait's doc. ApplyPlanLive relies on this
+	// (rather than Stop) to know it is safe to mutate a running pipeline's
+	// stored config; see docs/design-documents/20260708-live-server-deploy-apply.md.
+	StopAndWait(ctx context.Context, pipelineID string) error
+	// ReconfigureProcessor swaps a processor's config in a running pipeline in
+	// place, without a restart — see lifecycle.Service.ReconfigureProcessor.
+	// ApplyPlanLiveInPlace uses it for live-eligible diffs; the caller persists
+	// the new config first. Returns lifecycle.ErrProcessorNotLiveReconfigurable
+	// when the processor cannot be swapped live (e.g. it is parallelized), so
+	// the caller falls back to a restart. See the live in-place hot-reload
+	// design doc.
+	ReconfigureProcessor(ctx context.Context, pipelineID, processorID string) error
+	// TryLockForMutation atomically checks that the pipeline has no run and,
+	// if so, refuses every Start of it until unlock is called (#2961). It
+	// reports false, holding nothing, when the pipeline has a run. ApplyPlanLive
+	// holds it across the import, and releases it before its own Start. See
+	// lifecycle.Service.TryLockForMutation.
+	TryLockForMutation(pipelineID string) (unlock func(), ok bool)
+}

@@ -1,0 +1,448 @@
+// Copyright © 2026 Meroxa, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package cecdysis
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"strconv"
+	"strings"
+
+	"github.com/conduitio/conduit/cmd/conduit/internal/ui"
+	"github.com/conduitio/conduit/pkg/foundation/cerrors"
+	"github.com/conduitio/conduit/pkg/foundation/cerrors/conduiterr"
+	"github.com/conduitio/ecdysis"
+	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
+)
+
+// Result is the shared --json envelope every v0.17 "CLI as product" command
+// (pipelines validate|lint|dry-run, doctor, connector|processor new) emits,
+// per the CLI output conventions §1. It is marshaled lowerCamelCase, matching
+// existing protojson output.
+//
+// Command, OK and Error are always present (Error is null on success) so an
+// agent can write one success check (.ok) and one error check (.error) for
+// every command that uses this envelope. Summary and Result are
+// command-specific payloads.
+type Result struct {
+	// Command is the stable dotted discriminator, e.g. "pipelines.validate".
+	Command string `json:"command"`
+	// OK is the run's verdict. This is the domain outcome (e.g. "did
+	// validation find zero errors"), not "did the command execute
+	// successfully" — a validation run that finds problems is OK:false with
+	// Error:nil; the run itself succeeded.
+	OK bool `json:"ok"`
+	// Summary is a command-specific count/rollup payload.
+	Summary any `json:"summary"`
+	// Result is the command-specific detail payload.
+	Result any `json:"result"`
+	// Error is set on a HARD command failure (bad input, preflight failure,
+	// crash) — never for domain findings, which belong in Summary/Result
+	// with OK:false instead. Nil (JSON null) on success.
+	Error *ResultError `json:"error"`
+}
+
+// ResultError is the envelope's error shape. It mirrors
+// conduiterr.ConduitError's structured fields (Code, Message, Suggestion,
+// ConfigPath, Fix) so a --json consumer gets the same remediation data a
+// human sees rendered via ui.RenderFinding.
+type ResultError struct {
+	Code       string `json:"code,omitempty"`
+	Message    string `json:"message"`
+	Suggestion string `json:"suggestion,omitempty"`
+	ConfigPath string `json:"configPath,omitempty"`
+	// Fix is a structured, machine-appliable fix (conduiterr.Fix), when the
+	// underlying error carries one.
+	Fix any `json:"fix,omitempty"`
+}
+
+// Outcome is what CommandWithResult.ExecuteWithResult returns on a
+// successful run — the command completed; OK/Summary/Result carry the
+// domain verdict and findings. A non-nil error return from
+// ExecuteWithResult, not a false OK here, is what signals a HARD command
+// failure (see CommandWithResult's doc).
+type Outcome struct {
+	OK      bool
+	Summary any
+	Result  any
+
+	// ExitErr, when non-nil, is returned by CommandWithResultDecorator after
+	// it has already rendered this Outcome (JSON or human) — purely so the
+	// process gets a correctly classified nonzero exit code (via
+	// pkg/conduit/exitcode, applied where cmd.Execute()'s returned error
+	// reaches cmd/conduit/cli) for a domain failure (OK:false) that is NOT a
+	// hard command failure.
+	//
+	// This exists because ecdysis routes the process exit code through
+	// cmd.Execute()'s returned error, and CommandWithResult's contract keeps
+	// domain findings out of that error (they belong in Summary/Result with
+	// the envelope's error field staying null, per CLI output conventions
+	// §1) — so there is no other channel back to the process exit code for
+	// "the run completed and found problems." ExitErr is never rendered
+	// itself (RunE returns it after Render/marshal has already written the
+	// full Outcome to output) and never appears in the --json envelope.
+	//
+	// A command with findings synthesizes this via its own classification
+	// logic (see docs/design-documents/20260707-cli-output-conventions.md
+	// §4: reducing N findings to one exit code is new aggregation logic each
+	// command owns, not something this package does on a command's behalf).
+	ExitErr error
+}
+
+// CommandWithResult can be implemented by a command that needs the shared
+// --json envelope but does NOT dial the Conduit API client — the offline
+// sibling of CommandWithExecuteWithClientResult, for commands like `doctor`
+// and `pipelines validate` whose own checks are the thing being run, not a
+// client call. Use CommandWithExecuteWithClientResult instead for a command
+// that does need a client.
+type CommandWithResult interface {
+	ecdysis.Command
+
+	// ResultCommand returns the stable dotted discriminator for the
+	// envelope's "command" field, e.g. "pipelines.validate".
+	ResultCommand() string
+	// ExecuteWithResult performs the command's work. A non-nil error is a
+	// HARD command failure and populates the envelope's Error field, NOT
+	// domain findings — a validation run that found problems returns
+	// Outcome{OK: false, ...}, err: nil.
+	ExecuteWithResult(ctx context.Context) (Outcome, error)
+	// Render returns the human-readable rendering of a successful run's
+	// Outcome. Not called under --json, and not called on a HARD failure
+	// (the decorator renders that itself via ui.RenderFinding, since there
+	// is no Outcome to hand Render in that case).
+	Render(outcome Outcome) string
+}
+
+// CommandWithResultExitCode is implemented by a CommandWithResult whose
+// domain findings (Outcome.OK == false) must still fail the process exit
+// code — e.g. `doctor`'s failing checks, or a future `pipelines validate`
+// run that found errors. Per the CLI output conventions §1, a domain
+// finding is NOT a HARD command failure: ExecuteWithResult returns
+// (Outcome{OK: false, ...}, nil), so the --json envelope's "error" stays
+// null. But per conventions §4, a multi-result command still must reduce
+// its findings to a nonzero process exit code. Without this interface,
+// there would be no way to do that: CommandWithResultDecorator's RunE
+// returns nil whenever ExecuteWithResult returns a nil error (see Decorate),
+// so cmd/conduit/cli's classification of the returned error would always see
+// OK and exit 0 — silently wrong for a command whose checks failed.
+//
+// Implement this alongside CommandWithResult. ExitCode is only consulted
+// when ExecuteWithResult returns a nil error; a HARD failure's exit code is
+// already classified from the error itself, via pkg/conduit/exitcode.
+type CommandWithResultExitCode interface {
+	CommandWithResult
+	// ExitCode returns the process exit code for a successful (err == nil)
+	// run's Outcome — e.g. by delegating to check.Report.ExitCode() (see
+	// pkg/conduit/check). Return 0 (exitcode.OK) when nothing failed.
+	ExitCode(outcome Outcome) int
+}
+
+// exitCodeAnnotation is the cobra Command.Annotations key
+// CommandWithResultDecorator uses to smuggle a CommandWithResultExitCode's
+// exit code out of a successful (err == nil) RunE. RunE's own return value
+// can't carry it without turning a domain finding into what looks like a
+// HARD failure (see CommandWithResultExitCode's doc), so this rides out on
+// the leaf *cobra.Command instead — cmd/conduit/cli reads it back via
+// ResultExitCode from the *cobra.Command cmd.ExecuteC() returns (the leaf
+// command that actually ran), after a nil-error Execute().
+const exitCodeAnnotation = "conduit.exitCode"
+
+// ResultExitCode returns the exit code CommandWithResultDecorator recorded
+// on cmd via a CommandWithResultExitCode's ExitCode method, if any, and
+// whether one was recorded at all. cmd should be the *cobra.Command
+// cmd.ExecuteC() returned (the leaf command that actually ran), not the
+// root command — Annotations are per-Command, not inherited from a parent.
+func ResultExitCode(cmd *cobra.Command) (int, bool) {
+	if cmd == nil || cmd.Annotations == nil {
+		return 0, false
+	}
+	s, ok := cmd.Annotations[exitCodeAnnotation]
+	if !ok {
+		return 0, false
+	}
+	code, err := strconv.Atoi(s)
+	if err != nil {
+		// Should not happen — this package is the only writer of this
+		// annotation, and it always writes strconv.Itoa's output. Treat a
+		// corrupted value as "nothing recorded" rather than panicking.
+		return 0, false
+	}
+	return code, true
+}
+
+// CommandWithResultDecorator wires CommandWithResult's --json flag, renders
+// the shared Result envelope (JSON) or Outcome (human), and — structurally,
+// for every command it decorates, per CLI output conventions §5 — sets
+// SilenceErrors and SilenceUsage so cobra never prints its own duplicate
+// "Error: ..." line over the command's own rendering, and never corrupts a
+// --json run's single JSON object with a stderr error line.
+type CommandWithResultDecorator struct{}
+
+func (CommandWithResultDecorator) Decorate(_ *ecdysis.Ecdysis, cmd *cobra.Command, c ecdysis.Command) error {
+	v, ok := c.(CommandWithResult)
+	if !ok {
+		return nil
+	}
+
+	if cmd.Flags().Lookup("json") == nil {
+		cmd.Flags().Bool("json", false, "output the result as JSON")
+	}
+
+	// Structural, not opt-in: every command that uses this decorator gets
+	// this, per CLI output conventions §5 ("Fold this into the shared
+	// offline CommandWithResult decorator so it is structural").
+	cmd.SilenceErrors = true
+	cmd.SilenceUsage = true
+
+	// SilenceErrors also silences what cobra rejects before RunE ever runs:
+	// flag parse errors, Args validation, PreRunE (ecdysis parses positional
+	// arguments and config there) and missing required flags. Route each one
+	// through renderResultError as a coded usage error, or the command exits
+	// with no output at all (#3086).
+	decorateUsageErrors(cmd, v)
+
+	old := cmd.RunE
+	cmd.RunE = func(cmd *cobra.Command, args []string) error {
+		asJSON, _ := cmd.Flags().GetBool("json")
+
+		// A prior decorator in the chain (e.g. a future confirm/prompt step
+		// on a scaffold command) can fail before ExecuteWithResult ever
+		// runs. SilenceErrors above means cobra will not print anything for
+		// that error on its own, so it gets the same rendering treatment as
+		// an ExecuteWithResult failure — otherwise a declined confirmation
+		// would exit nonzero with no output at all, under both --json and
+		// human mode.
+		if old != nil {
+			if err := old(cmd, args); err != nil {
+				renderResultError(cmd, v.ResultCommand(), err, asJSON)
+				return err
+			}
+		}
+
+		ctx := ecdysis.ContextWithCobraCommand(cmd.Context(), cmd)
+
+		outcome, err := v.ExecuteWithResult(ctx)
+		if err != nil {
+			renderResultError(cmd, v.ResultCommand(), err, asJSON)
+			// Preserve err so the process exit code (pkg/conduit/exitcode,
+			// wired in cmd/conduit/cli) still classifies it correctly;
+			// SilenceErrors above stops cobra from printing it a second time.
+			return err
+		}
+
+		// A domain finding (Outcome.OK == false with a nil err) still needs
+		// to fail the process exit code — see CommandWithResultExitCode's
+		// doc for why this can't ride on RunE's return value.
+		if ec, ok := v.(CommandWithResultExitCode); ok {
+			if code := ec.ExitCode(outcome); code != 0 {
+				if cmd.Annotations == nil {
+					cmd.Annotations = map[string]string{}
+				}
+				cmd.Annotations[exitCodeAnnotation] = strconv.Itoa(code)
+			}
+		}
+
+		if asJSON {
+			res := Result{Command: v.ResultCommand(), OK: outcome.OK, Summary: outcome.Summary, Result: outcome.Result}
+			b, merr := marshalJSON(res)
+			if merr != nil {
+				return cerrors.Errorf("could not marshal result to JSON: %w", merr)
+			}
+			// cmd.Println/cmd.Print resolve through cobra's OutOrStderr, not
+			// OutOrStdout (cobra's own doc: "fallback to Stderr if not
+			// set") — since no production call site ever calls cmd.SetOut,
+			// using them here would silently put the "single JSON object to
+			// stdout" envelope on stderr instead. Write to OutOrStdout
+			// explicitly everywhere in this file instead.
+			fmt.Fprintln(cmd.OutOrStdout(), string(b))
+			// outcome.ExitErr (nil for most commands) is returned, not
+			// swallowed, AFTER the envelope above is already written —
+			// see Outcome.ExitErr's doc: this is how a domain failure
+			// (OK:false, Error:null in the envelope just emitted) still
+			// gives the process a nonzero, correctly classified exit code.
+			return outcome.ExitErr
+		}
+
+		fmt.Fprint(cmd.OutOrStdout(), v.Render(outcome))
+		return outcome.ExitErr
+	}
+
+	return nil
+}
+
+// decorateUsageErrors makes every error cobra raises before RunE render like
+// an ExecuteWithResult failure: the envelope under --json, a finding on
+// stderr otherwise. An error that already carries a conduiterr code keeps
+// it, and a config-file parse error stays uncoded (see isConfigParseError);
+// anything else becomes CodeInvalidUsage, so the process exits 2
+// (validation) instead of 1.
+func decorateUsageErrors(cmd *cobra.Command, v CommandWithResult) {
+	fail := func(cmd *cobra.Command, err error, asJSON bool) error {
+		if !isConfigParseError(err) {
+			err = usageError(cmd, err)
+		}
+		renderResultError(cmd, v.ResultCommand(), err, asJSON)
+		return err
+	}
+
+	cmd.SetFlagErrorFunc(func(cmd *cobra.Command, err error) error {
+		if cerrors.Is(err, pflag.ErrHelp) {
+			return err
+		}
+		return fail(cmd, err, jsonRequested(cmd))
+	})
+
+	if oldArgs := cmd.Args; oldArgs != nil {
+		cmd.Args = func(cmd *cobra.Command, args []string) error {
+			if err := oldArgs(cmd, args); err != nil {
+				return fail(cmd, err, jsonRequested(cmd))
+			}
+			return nil
+		}
+	}
+
+	oldPreRunE := cmd.PreRunE
+	cmd.PreRunE = func(cmd *cobra.Command, args []string) error {
+		if oldPreRunE != nil {
+			if err := oldPreRunE(cmd, args); err != nil {
+				return fail(cmd, err, jsonRequested(cmd))
+			}
+		}
+		// cobra checks these right after PreRunE, and its errors would be
+		// silenced too. Checking them here first gives the same verdict
+		// with our rendering; cobra's own check then passes.
+		if err := cmd.ValidateRequiredFlags(); err != nil {
+			return fail(cmd, err, jsonRequested(cmd))
+		}
+		if err := cmd.ValidateFlagGroups(); err != nil {
+			return fail(cmd, err, jsonRequested(cmd))
+		}
+		return nil
+	}
+}
+
+// ecdysisConfigParseErrPrefix starts the error ecdysis.ParseConfig returns
+// when the config file or environment can't be read (ecdysis v0.6.0,
+// config.go). It has no sentinel to match instead.
+const ecdysisConfigParseErrPrefix = "error parsing config"
+
+// isConfigParseError reports whether err is ecdysis's config-parse error from
+// PreRunE. That is a bad config file, not a bad command line, so it is
+// rendered but not labeled CodeInvalidUsage; it keeps its existing (uncoded)
+// classification.
+func isConfigParseError(err error) bool {
+	return strings.HasPrefix(err.Error(), ecdysisConfigParseErrPrefix)
+}
+
+// usageError returns err unchanged when it already carries a conduiterr
+// code, and otherwise wraps it as CodeInvalidUsage with a pointer to the
+// command's help.
+func usageError(cmd *cobra.Command, err error) error {
+	if _, ok := conduiterr.Get(err); ok {
+		return err
+	}
+	ce := conduiterr.Wrap(CodeInvalidUsage, err.Error(), err)
+	ce.Suggestion = fmt.Sprintf("run '%s --help' for usage", cmd.CommandPath())
+	return ce
+}
+
+// rawArgs returns the process's command-line arguments. A var so tests can
+// substitute the arguments they pass to cobra.
+var rawArgs = func() []string { return os.Args[1:] }
+
+// jsonRequested reports whether --json was given. A flag parse error stops
+// pflag at the bad flag, so a --json after it was never parsed; in that case
+// the raw arguments are scanned for it, up to a "--" terminator, with the
+// last occurrence winning as it would in pflag.
+func jsonRequested(cmd *cobra.Command) bool {
+	if f := cmd.Flags().Lookup("json"); f != nil && f.Changed {
+		on, _ := cmd.Flags().GetBool("json")
+		return on
+	}
+	on := false
+	for _, a := range rawArgs() {
+		if a == "--" {
+			break
+		}
+		name, val, hasVal := strings.Cut(a, "=")
+		if name != "--json" {
+			continue
+		}
+		if !hasVal {
+			on = true
+			continue
+		}
+		b, err := strconv.ParseBool(val)
+		on = err == nil && b
+	}
+	return on
+}
+
+// renderResultError renders a HARD command failure: the single JSON object
+// (with Error set) under --json, or a located finding via ui.RenderFinding
+// on stderr otherwise. It never returns an error itself — marshaling
+// ResultError can't fail (it's a plain struct of strings and an any Fix that
+// is itself always JSON-safe, being either nil or a conduiterr.Fix), so a
+// marshal failure here would indicate a bug, not a runtime condition to
+// propagate.
+func renderResultError(cmd *cobra.Command, command string, err error, asJSON bool) {
+	re := newResultError(err)
+
+	if asJSON {
+		res := Result{Command: command, OK: false, Error: re}
+		b, merr := marshalJSON(res)
+		if merr != nil {
+			// Should not happen (see doc above); fall back to something
+			// rather than emitting nothing at all under --json. This one
+			// case intentionally goes to stderr (via the correctly-behaved
+			// PrintErrln, which does resolve through ErrOrStderr) since
+			// there is no well-formed JSON object to put on stdout here.
+			cmd.PrintErrln("Error:", err)
+			return
+		}
+		// See the OutOrStdout note in Decorate: cmd.Println would put this
+		// on stderr instead of stdout in production.
+		fmt.Fprintln(cmd.OutOrStdout(), string(b))
+		return
+	}
+
+	noColor, _ := cmd.Flags().GetBool("no-color")
+	out := cmd.ErrOrStderr()
+	r := ui.NewRenderer(out, noColor)
+	ui.RenderFinding(out, r.Glyph(ui.StatusFail), re.Code, re.ConfigPath, re.Message, re.Suggestion)
+}
+
+// newResultError converts a plain error into the envelope's ResultError
+// shape: a *conduiterr.ConduitError's structured fields are carried through
+// as-is; any other error falls back to conduiterr.CodeUnknown's reason with
+// just a message, so every hard failure still carries a stable code.
+func newResultError(err error) *ResultError {
+	if ce, ok := conduiterr.Get(err); ok {
+		var fix any
+		if ce.Fix != nil {
+			fix = ce.Fix
+		}
+		return &ResultError{
+			Code:       ce.Code.Reason(),
+			Message:    ce.Message,
+			Suggestion: ce.Suggestion,
+			ConfigPath: ce.ConfigPath,
+			Fix:        fix,
+		}
+	}
+	return &ResultError{Code: conduiterr.CodeUnknown.Reason(), Message: err.Error()}
+}

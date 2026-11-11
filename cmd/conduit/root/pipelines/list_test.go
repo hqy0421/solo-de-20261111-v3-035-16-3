@@ -1,0 +1,122 @@
+// Copyright © 2025 Meroxa, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package pipelines
+
+import (
+	"context"
+	"strings"
+	"testing"
+
+	"github.com/matryer/is"
+	"go.uber.org/mock/gomock"
+	"google.golang.org/protobuf/encoding/protojson"
+
+	"github.com/conduitio/conduit/cmd/conduit/api"
+	"github.com/conduitio/conduit/cmd/conduit/api/mock"
+	"github.com/conduitio/conduit/cmd/conduit/internal/testutils"
+	apiv1 "github.com/conduitio/conduit/proto/api/v1"
+)
+
+func TestListCommandExecuteWithClient(t *testing.T) {
+	is := is.New(t)
+
+	ctx := context.Background()
+	ctrl := gomock.NewController(t)
+
+	mockService := mock.NewMockPipelineService(ctrl)
+
+	testutils.MockGetPipelines(mockService, []*apiv1.Pipeline{
+		{Id: "1", State: &apiv1.Pipeline_State{Status: apiv1.Pipeline_STATUS_RUNNING}},
+		{Id: "2", State: &apiv1.Pipeline_State{Status: apiv1.Pipeline_STATUS_STOPPED}},
+		{Id: "3", State: &apiv1.Pipeline_State{Status: apiv1.Pipeline_STATUS_RECOVERING}},
+		{Id: "4", State: &apiv1.Pipeline_State{Status: apiv1.Pipeline_STATUS_DEGRADED}},
+	})
+
+	client := &api.Client{
+		PipelineServiceClient: mockService,
+	}
+
+	cmd := &ListCommand{}
+
+	result, err := cmd.ExecuteWithClientResult(ctx, client)
+	is.NoErr(err)
+
+	output := cmd.Render(result)
+
+	is.Equal(output, ""+
+		"+----+------------+----------------------+----------------------+\n"+
+		"| ID |   STATE    |       CREATED        |     LAST_UPDATED     |\n"+
+		"+----+------------+----------------------+----------------------+\n"+
+		"| 1  | running    | 1970-01-01T00:00:00Z | 1970-01-01T00:00:00Z |\n"+
+		"| 2  | stopped    | 1970-01-01T00:00:00Z | 1970-01-01T00:00:00Z |\n"+
+		"| 3  | recovering | 1970-01-01T00:00:00Z | 1970-01-01T00:00:00Z |\n"+
+		"| 4  | degraded   | 1970-01-01T00:00:00Z | 1970-01-01T00:00:00Z |\n"+
+		"+----+------------+----------------------+----------------------+\n")
+}
+
+func TestListCommandExecuteWithClient_EmptyResponse(t *testing.T) {
+	is := is.New(t)
+
+	ctx := context.Background()
+	ctrl := gomock.NewController(t)
+
+	mockService := mock.NewMockPipelineService(ctrl)
+
+	testutils.MockGetPipelines(mockService, []*apiv1.Pipeline{})
+	client := &api.Client{
+		PipelineServiceClient: mockService,
+	}
+
+	cmd := &ListCommand{}
+
+	result, err := cmd.ExecuteWithClientResult(ctx, client)
+	is.NoErr(err)
+
+	output := strings.TrimSpace(cmd.Render(result))
+	is.True(len(output) == 0)
+}
+
+// TestListCommandExecuteWithClient_JSON proves the result is a proto response that
+// renders as the API's JSON shape — what `conduit pipelines list --json` emits.
+func TestListCommandExecuteWithClient_JSON(t *testing.T) {
+	is := is.New(t)
+
+	ctx := context.Background()
+	ctrl := gomock.NewController(t)
+
+	mockService := mock.NewMockPipelineService(ctrl)
+	testutils.MockGetPipelines(mockService, []*apiv1.Pipeline{
+		{Id: "1", State: &apiv1.Pipeline_State{Status: apiv1.Pipeline_STATUS_RUNNING}},
+	})
+	client := &api.Client{PipelineServiceClient: mockService}
+
+	cmd := &ListCommand{}
+	result, err := cmd.ExecuteWithClientResult(ctx, client)
+	is.NoErr(err)
+
+	resp, ok := result.(*apiv1.ListPipelinesResponse)
+	is.True(ok) // result is a proto message -> protojson renders the API's JSON shape
+
+	b, err := protojson.Marshal(resp)
+	is.NoErr(err)
+	is.True(strings.Contains(string(b), `"id":"1"`))
+
+	// Family B negative check (v0.19 workstream 8 — cli-contract.md §4.6):
+	// this command's --json output must never accidentally start
+	// conforming to Family A's envelope shape; see
+	// cmd/conduit/cli/schema_golden_test.go's completeness walk, which
+	// classifies this command as Family B by interface.
+	is.True(!testutils.MatchesEnvelope(b))
+}

@@ -1,0 +1,1974 @@
+// Copyright © 2024 Meroxa, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//go:generate mockgen -typed -destination=worker_mock_test.go -package=funnel . Task
+
+package funnel
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"iter"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/conduitio/conduit-commons/opencdc"
+	"github.com/conduitio/conduit-commons/rollback"
+	"github.com/conduitio/conduit/pkg/foundation/cerrors"
+	"github.com/conduitio/conduit/pkg/foundation/cerrors/conduiterr"
+	"github.com/conduitio/conduit/pkg/foundation/log"
+	"github.com/conduitio/conduit/pkg/foundation/metrics"
+	"github.com/conduitio/conduit/pkg/plugin"
+	"github.com/sourcegraph/conc/pool"
+)
+
+// Task is a unit of work that can be executed by a Worker. Each Task in a
+// pipeline is executed sequentially, except for tasks related to different
+// destinations, which can be executed in parallel.
+type Task interface {
+	// ID returns the identifier of this Task. Each Task in a pipeline must be
+	// uniquely identified by the ID.
+	ID() string
+
+	// Open opens the Task for processing. It is called once before the worker
+	// starts processing records.
+	Open(context.Context) error
+	// Close closes the Task. It is called once after the worker has stopped
+	// processing records.
+	Close(context.Context) error
+	// Do processes the given batch of records. It is called for each batch of
+	// records that the worker processes.
+	Do(context.Context, *Batch) error
+}
+
+// Worker collects the tasks that need to be executed in a pipeline for a
+// specific source. It processes records from the source through the tasks until
+// it is stopped. The worker is responsible for coordinating tasks and
+// acking/nacking records.
+//
+// Batches are processed in the following way:
+//   - The first task is always a source task which reads a batch of records
+//     from the source. The batch is then passed to the next task.
+//   - Any task between the source and the destination can process the batch by
+//     updating the records or their status (see [RecordStatus]). If a record in
+//     the batch is marked as filtered, the next task will skip processing it
+//     and consider it as already processed. If a record is marked as nacked,
+//     the record will be sent to the DLQ. If a record is marked as retry, the
+//     record will be reprocessed by the same task (relevant if a task processed
+//     only part of the batch, experienced an error and skipped the rest).
+//   - The last task is always a destination task which writes the batch of
+//     records to the destination. The batch is then acked.
+//
+// Note that if a task marks a record in the middle of a batch as nacked, the
+// batch is split into sub-batches. The records that were successfully processed
+// continue to the next task (and ideally to the end of the pipeline), because
+// Conduit provides ordering guarantees. Only once the records before the nacked
+// record are end-to-end processed, will the nacked record be sent to the DLQ.
+// The rest of the records are processed as a sub-batch, and the same rules
+// apply to them.
+type Worker struct {
+	Source    Source
+	FirstTask *TaskNode
+	DLQ       *DLQ
+
+	// lastReadAt is the UnixNano timestamp of the most recent source read,
+	// used as the fallback readAt in updateTimer. It is atomic because the
+	// destination flusher goroutine calls updateTimer (via Worker.Ack) while
+	// the worker writes this on every source read (see
+	// docs/design-documents/20261019-funnel-read-ahead-pipelining.md).
+	lastReadAt atomic.Int64
+	timer      metrics.Timer
+
+	// processingLock is a lock in form of a channel with a buffer size of 1 to
+	// be able to acquire the lock with a context timeout.
+	processingLock chan struct{}
+	// stop stores the information if a graceful stop was triggered.
+	stop atomic.Bool
+	// teardownMu guards sourceTornDown and serializes teardown so the source is
+	// torn down at most once across the Stop/Close race.
+	teardownMu sync.Mutex
+	// sourceTornDown is set only after Source.Teardown SUCCEEDS, so a failed
+	// teardown is retried by a later call rather than masked as done.
+	sourceTornDown bool
+	// teardownErr is the error from the FIRST failed Source.Teardown. It is
+	// sticky: every later tearDownSource call returns it, so the root cause
+	// (typically a final position write the state store rejected) is what
+	// Close reports, not the retry's "plugin is not running" (#2966).
+	teardownErr error
+
+	logger log.CtxLogger
+}
+
+// tearDownSource releases the source connector's resources. It serves two
+// purposes: on a graceful stop it interrupts a blocked source Read, and on every
+// path it frees the source. It is called from both Stop (graceful) and Close (all
+// paths, including a fatal error where Stop is never called), so it is idempotent.
+//
+// Only a *successful* teardown is remembered as done: if Source.Teardown fails,
+// the source is left un-torn-down so the next caller retries, rather than
+// masking the failure and leaking the source (#2559). The first failure is
+// sticky, though: once a Teardown has failed, this and every later call return
+// that first error, whatever the retry does. connector.Source.Teardown releases
+// the plugin before it reports a failed final position write, so the retry
+// almost always fails with plugin.ErrPluginNotRunning, and reporting that would
+// hide why the stop was not clean (#2966). The retry's own error is logged.
+func (w *Worker) tearDownSource(ctx context.Context) error {
+	w.teardownMu.Lock()
+	defer w.teardownMu.Unlock()
+	if w.sourceTornDown {
+		return w.teardownErr
+	}
+	err := w.Source.Teardown(ctx)
+	if err == nil {
+		w.sourceTornDown = true
+		return w.teardownErr
+	}
+	if w.teardownErr == nil {
+		w.teardownErr = err
+		return err // not marked torn down; a later Stop/Close call retries
+	}
+	// A retry after an earlier failure. Invariant 3: the first error is what
+	// says whether the last positions were persisted, so it must not be
+	// replaced by the retry's.
+	w.logger.Warn(ctx).Err(err).
+		AnErr("first_teardown_error", w.teardownErr).
+		Msg("retrying source teardown failed; reporting the first teardown error")
+	return w.teardownErr
+}
+
+func NewWorker(
+	firstTask *TaskNode,
+	dlq *DLQ,
+	logger log.CtxLogger,
+	timer metrics.Timer,
+) (*Worker, error) {
+	firstTask.first = true // mark the first task as the first task in the pipeline
+	err := validateTasks(firstTask)
+	if err != nil {
+		return nil, cerrors.Errorf("invalid task order: %w", err)
+	}
+
+	st, ok := firstTask.Task.(interface{ GetSource() Source })
+	if !ok {
+		return nil, cerrors.Errorf("first task must be a source task, got %T", firstTask.Task)
+	}
+
+	w := &Worker{
+		Source:    st.GetSource(),
+		FirstTask: firstTask,
+		DLQ:       dlq,
+		logger:    logger.WithComponent("funnel.Worker"),
+		timer:     timer,
+
+		processingLock: make(chan struct{}, 1),
+	}
+	if err := registerFeeder(w, firstTask, nil); err != nil {
+		return nil, err
+	}
+	return w, nil
+}
+
+// registerFeeder registers w with every batching destination at or below n
+// (following Next, so across the shared boundary), together with the outermost
+// shared boundary node above it, as drainNode finds it. The synchronous flush
+// timer of such a destination holds the processing lock of each worker
+// registered with it (see DestinationTask.flushDueSync).
+//
+// It runs in NewWorker, so the shared roots must already be marked
+// (TaskNode.MarkSharedBoundary's contract), and workers register in the order
+// they are built: every destination sees its feeders in that one global order,
+// which is what keeps timers that hold several processing locks from
+// deadlocking each other.
+//
+// On error, destinations visited earlier in the tree may already hold w as a
+// feeder; registration is not rolled back. That is harmless only because the
+// caller discards the whole build (runPipeline fails the start), so NewWorker
+// must not be retried on the same task tree: build the tasks again.
+func registerFeeder(w *Worker, n *TaskNode, shared *TaskNode) error {
+	if n.sharedBoundary && shared == nil {
+		shared = n
+	}
+	if dt, ok := n.Task.(*DestinationTask); ok && dt.batchingEnabled() {
+		if err := dt.addFeeder(w, shared); err != nil {
+			return err
+		}
+	}
+	for _, next := range n.Next {
+		if err := registerFeeder(w, next, shared); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateTasks(task *TaskNode) error {
+	// Traverse the tasks according to the order and validate that each task
+	// is included exactly once.
+	seen := make(map[string]bool)
+
+	for t := range task.Tasks() {
+		if seen[t.ID()] {
+			return cerrors.Errorf("task %s included multiple times in order", task.Task.ID())
+		}
+		seen[t.ID()] = true
+	}
+
+	return nil
+}
+
+// Open opens the worker for processing. It opens all tasks and the DLQ. If any
+// task fails to open, the worker is not opened and the error is returned.
+// Once a worker is opened, it can start processing records. The worker should
+// be closed using Close after it is no longer needed.
+func (w *Worker) Open(ctx context.Context) (err error) {
+	var r rollback.R
+	defer func() {
+		rollbackErr := r.Execute()
+		err = cerrors.LogOrReplace(err, rollbackErr, func() {
+			w.logger.Err(ctx, rollbackErr).Msg("failed to execute rollback")
+		})
+	}()
+
+	for task := range w.FirstTask.Tasks() {
+		err = task.Open(ctx)
+		if err != nil {
+			return cerrors.Errorf("task %s failed to open: %w", task.ID(), err)
+		}
+
+		r.Append(func() error {
+			return task.Close(ctx)
+		})
+	}
+
+	err = w.DLQ.Open(ctx)
+	if err != nil {
+		return cerrors.Errorf("failed to open DLQ: %w", err)
+	}
+
+	r.Skip()
+	return nil
+}
+
+// Stop stops the worker from processing more records. It does not stop the
+// current batch from being processed. If a batch is currently being processed,
+// the method will block and trigger the stop after the batch is processed.
+func (w *Worker) Stop(ctx context.Context) error {
+	// The lock is locked every time a batch is being processed. We lock it
+	// to be sure no batch is currently being processed.
+	release, err := w.acquireProcessingLock(ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
+
+	// Lock acquired: no batch is currently being processed, but a new batch's
+	// first task can already be blocked in (or about to start) a source Read,
+	// unprotected by processingLock by design (see doTask) so a slow Read
+	// doesn't hold up Stop. Set stop *before* tearing down the source: doTask
+	// only treats a plugin.ErrPluginNotRunning from that Read as a graceful
+	// stop when w.stop.Load() is already true (see doTask's IsFirst check). If
+	// tearDownSource ran first, a Read racing the teardown could observe the
+	// torn-down plugin (ErrPluginNotRunning) before this flag flips, and get
+	// misreported as a real failure instead of a graceful stop — confirmed by
+	// repro under `-race -count=800` (pkg/lifecycle-poc/service_test.go
+	// TestServiceLifecycle_PipelineStop flaking with "failed to read from
+	// source: plugin is not running").
+	w.stop.Store(true)
+	// Invariant 1/7 (enforcement site, #3231): flush and ack everything the
+	// destinations hold BEFORE the source goes away; afterwards every source ack
+	// fails with plugin.ErrPluginNotRunning and the written records replay.
+	// guard: funnel-stop-drains-before-teardown tests=^TestWorker_Stop_DrainsDestinationBeforeSourceTeardown$
+	w.drainDestinationsBeforeTeardown(ctx)
+	// A drain that failed or ran out of time left records unwritten; they replay
+	// (nothing is lost). That is not a failed Stop: the worker is armed and the
+	// source is torn down below, and a Stop error here would make StopAndWait
+	// report "never began stopping, safe to retry" for a pipeline that is in
+	// fact stopping. The failure is reported where it belongs: the destination's
+	// Close (and the shared sink's Close) return it as
+	// pipeline.flush_on_close_failed.
+	if err := w.tearDownSource(ctx); err != nil {
+		return cerrors.Errorf("failed to tear down source: %w", err)
+	}
+	return nil
+}
+
+// drainDestinationsBeforeTeardown flushes every batching destination below this
+// worker and waits for its source acks, so they are issued while the source is
+// still running. A drain failure is logged, not returned: the records were not
+// acked and replay on restart (at-least-once), and teardown must still run.
+func (w *Worker) drainDestinationsBeforeTeardown(ctx context.Context) {
+	if err := drainNode(ctx, w.FirstTask, nil); err != nil {
+		w.logger.Err(ctx, err).Msg("failed to drain buffered records before source teardown (records replay on restart)")
+	}
+}
+
+// drainNode drains the batching destinations at and below n.
+//
+// Both modes take the outermost shared-boundary mutex on the way down, the
+// same lock doTask holds around a pass through a shared destination. For the
+// synchronous path that serialises the flush with a sibling's Write/Ack on the
+// one destination stream. For the pipelined path the flusher is the only writer
+// so it is not needed for the stream, but it orders the drain behind any
+// sibling pass that is mid hand-off. The flusher never takes the mutex, so
+// neither can deadlock.
+//
+// A drain that fails on a shared destination poisons it, exactly as a failed
+// doTask pass does (see doTask): the failure may have left the shared ack
+// stream desynchronized or a sibling's batches undelivered, and a sibling must
+// not go on to ack past them.
+func drainNode(ctx context.Context, n *TaskNode, shared *TaskNode) error {
+	if n.sharedBoundary && shared == nil {
+		shared = n
+	}
+	var errs []error
+	if dt, ok := n.Task.(*DestinationTask); ok && dt.batchingEnabled() {
+		err := drainTask(ctx, dt, shared)
+		if shared != nil && shared.testAfterDrain != nil {
+			shared.testAfterDrain()
+		}
+		errs = append(errs, err)
+	}
+	for _, next := range n.Next {
+		errs = append(errs, drainNode(ctx, next, shared))
+	}
+	return cerrors.Join(errs...)
+}
+
+// drainTask drains dt, holding the shared lock (if any) for the whole drain AND
+// for the poisoning that follows a failure, exactly as doTask poisons before it
+// releases sharedMu. Poisoning after the unlock would leave a window in which a
+// sibling takes the lock, sees an unpoisoned node and writes or acks a later
+// batch past the batch the failed drain dropped.
+func drainTask(ctx context.Context, dt *DestinationTask, shared *TaskNode) error {
+	return underSharedLock(ctx, dt, shared, dt.Drain)
+}
+
+// underSharedLock runs flush, a flush of dt (its Drain, or the synchronous flush
+// timer's flush), under the shared boundary mutex of shared, if any, and
+// poisons the shared node and its batching destinations before it releases the
+// mutex when flush fails. A ctx that ends before the mutex is acquired returns
+// a drainNotStartedError: nothing was taken, so there is nothing to poison.
+func underSharedLock(ctx context.Context, dt *DestinationTask, shared *TaskNode, flush func(context.Context) error) error {
+	if shared == nil {
+		return flush(ctx)
+	}
+	// The stop deadline must also bound the wait for the shared lock: a sibling
+	// can hold it while blocked behind a wedged destination. If the deadline
+	// ends before anything was taken there is nothing to poison.
+	acquired := shared.sharedMu.LockCtx(ctx) == nil
+	defer func() {
+		if acquired {
+			shared.sharedMu.Unlock()
+		}
+	}()
+	// guard: funnel-drain-ctx-aware-shared-lock tests=^TestWorker_Stop_DrainTimeoutIsNotAStopFailure$
+	if !acquired {
+		return &drainNotStartedError{err: cerrors.Errorf("drain of destination %s did not start: %w", dt.id, ctx.Err())}
+	}
+	err := flush(ctx)
+	if err != nil && !isDrainNotStarted(err) {
+		// Invariant 3 (enforcement site): poison before sharedMu is released.
+		// guard: funnel-drain-failure-fails-closed tests=^TestWorker_Stop_DrainFailure_PoisonedBeforeSharedLockIsReleased$
+		shared.poisoned.Store(true)
+		// The poison flag is only read on entry to the shared node; a sibling's
+		// ordered ack (ackInOrder) never passes that check. Fail the batching
+		// destinations too so deferOrdered refuses.
+		poisonBatchingDestinations(shared, err)
+	}
+	return err
+}
+
+// Stopping reports whether this worker has armed its stop — i.e. w.stop was set
+// by a Stop call, so the Do loop will exit and no further batch will be read.
+// It becomes true the instant Stop sets the flag, BEFORE source teardown runs,
+// so it stays true even when Stop returns a teardown error. Callers use this to
+// distinguish "Stop returned an error but the worker is genuinely stopping"
+// (teardown failed after the flag was set) from "Stop failed before arming"
+// (lock-acquisition timeout) — the two have opposite implications for whether a
+// deliberate-stop marker should be rolled back. See
+// lifecycle-poc.Service.stopRunnablePipeline.
+func (w *Worker) Stopping() bool {
+	return w.stop.Load()
+}
+
+// acquireProcessingLock tries to acquire the processing lock. It returns a
+// release function that should be called to release the lock. If the context is
+// canceled before the lock is acquired, it returns the context error.
+func (w *Worker) acquireProcessingLock(ctx context.Context) (release func(), err error) {
+	select {
+	case w.processingLock <- struct{}{}:
+		return func() { <-w.processingLock }, nil
+	case <-ctx.Done():
+		// lock not acquired
+		return func() {}, ctx.Err()
+	}
+}
+
+func (w *Worker) Close(ctx context.Context) error {
+	var errs []error
+
+	// Guarantee the source is torn down on every shutdown path. On a graceful
+	// stop Stop already tore it down and this is a no-op; on a fatal-error path
+	// Stop is never called, so this is where the source's resources are released
+	// (without it the source connector/plugin would leak).
+	if err := w.tearDownSource(ctx); err != nil {
+		errs = append(errs, cerrors.Errorf("failed to tear down source: %w", err))
+	}
+
+	for task := range w.FirstTask.Tasks() {
+		err := task.Close(ctx)
+		if err != nil {
+			errs = append(errs, cerrors.Errorf("task %s failed to close: %w", task.ID(), err))
+		}
+	}
+
+	err := w.DLQ.Close(ctx)
+	if err != nil {
+		errs = append(errs, cerrors.Errorf("failed to close DLQ: %w", err))
+	}
+
+	return cerrors.Join(errs...)
+}
+
+// Do processes records from the source until the worker is stopped. It returns
+// no error if the worker is stopped gracefully.
+//
+// Do does not read the connectors' Errors() channels; the caller runs
+// WatchConnectorErrors alongside it (#2929).
+func (w *Worker) Do(ctx context.Context) error {
+	for !w.stop.Load() {
+		w.logger.Trace(ctx).Msg("starting next batch")
+		// Invariant 1/3 (enforcement site, #2723): wrap the Worker in a fresh
+		// runAckNacker for this batch-read pass. A split run's original
+		// position must not reach w.Ack/w.Nack until every one of its members
+		// is terminal - see run_ledger.go.
+		//
+		// NB: runAckNacker itself is stateless - it holds only the parent. All
+		// completion state lives in the *splitRun values inside Batch.runs, so
+		// isolation between passes comes from NewBatch allocating fresh runs
+		// (and, at a fan-out, from cloneRuns), NOT from the wrapper being
+		// fresh. Naming the wrapper as the boundary is what hid the fan-out
+		// straddle bug - see validateRunsWholeBeforeFanOut.
+		if err := w.doTask(ctx, w.FirstTask, &Batch{}, newRunAckNacker(w)); err != nil {
+			return err
+		}
+		w.logger.Trace(ctx).Msg("batch done")
+	}
+	return nil
+}
+
+// maxRetryAttempts bounds Worker.doTask's RecordFlagRetry self-recursion (see
+// retryAttempt). It is a pure stack-growth backstop, independent of the
+// non-convergence check below: even a processor that IS making genuine
+// progress (see retryAttempt's doc comment for why that is provably
+// well-founded — each attempt is strictly smaller than the last) recurses
+// once per attempt, and an absurdly large single batch could in principle
+// still need an absurd number of attempts to fully drain one record at a
+// time. This cap gives the recursion a fixed ceiling regardless of batch
+// size, so stack usage can never approach Go's 1GB per-goroutine limit
+// (#2726) even in that corner case. A source Read() call realistically
+// returns at most a few thousand records, so this is a generous multiple of
+// what any real batch needs and is not expected to ever be hit by a
+// legitimately converging processor — see TestDoTask_Retry_IterationCap_*.
+//
+// This is a var, not a const, solely so tests can lower it temporarily
+// (save the old value, defer restoring it) to exercise the cap deterministically
+// without constructing a batch of thousands of records. Production code must
+// never reassign it.
+var maxRetryAttempts = 10_000
+
+// maxRetryStall bounds how many CONSECUTIVE RecordFlagRetry attempts in a row
+// are allowed to make no progress (see retryAttempt.stall) before doTaskAttempt
+// declares the task non-converging. It exists specifically to tolerate a
+// processor whose lack of progress depends on something other than the
+// record content alone - most plausibly a real, wall-clock-based rate limiter
+// that can legitimately return "nothing processed" for a call or two while a
+// token bucket refills, then resume shrinking once it does. Comparing counts
+// (see retryAttempt's doc comment) is an EXACT test for "no progress THIS
+// round", but "no progress for one round" does not imply "will never make
+// progress" for a time-dependent processor the way it does for a purely
+// input-deterministic one (see #2726's own examples). Requiring several
+// consecutive stalls before failing trades a handful of extra (still tightly
+// bounded, still nowhere near maxRetryAttempts) recursion frames for a much
+// lower false-positive rate against that legitimate shape - a false positive
+// here kills a working pipeline with an unrecoverable fatal error, so this
+// errs conservative. A true fixpoint (the deterministic case #2726 is
+// actually about) still fails within maxRetryStall+1 Task.Do calls -
+// effectively immediate from an operator's perspective, and the count is
+// small enough that it adds no meaningful stack growth even if this
+// tolerance turns out to be wrong for some shape we haven't seen.
+//
+// This is a var, not a const, for the same test-override reason as
+// maxRetryAttempts.
+var maxRetryStall = 3
+
+// retryAttempt threads bounded-retry bookkeeping through consecutive
+// RecordFlagRetry self-recursions of Worker.doTask for the SAME task node
+// (see the RecordFlagRetry case in doTask below, and #2726). It is nil on
+// every doTask entry that is NOT itself continuing a retry chain: the
+// top-level call from Worker.Do, and every call doNextTask makes to advance
+// to a DIFFERENT task node both go through the doTask wrapper, which always
+// starts a fresh (nil) chain. Only the RecordFlagRetry case constructs one
+// and passes it to doTaskAttempt directly — that self-recursion is the ONLY
+// place unbounded stack growth was possible.
+//
+// # What "progress" means, and why comparing counts is exact here, not a proxy
+//
+// A retried sub-batch is fed forward completely unchanged in content:
+// Batch.Ack (called just before recursing) only resets recordStatuses, never
+// record data, and a RecordFlagRetry-classified record is by
+// ProcessorTask.Do's contract exactly one the processor returned NOTHING for
+// this round (the "nil" case in markBatchRecords' switch) — so no record
+// outside the current retry group can ever join it; the group fed into
+// attempt N+1 is always a SUBSET of the group fed into attempt N (never a
+// superset, never a disjoint swap). A subset with the SAME cardinality as the
+// set it was drawn from IS that set. So "the retry group's size did not
+// shrink between two consecutive attempts" is not merely correlated with "the
+// exact same records came back unresolved" — under this recursion's own
+// structure it is EQUIVALENT to it. Comparing counts is therefore an exact
+// progress test here, not a heuristic; no deeper (and slower, and
+// non-deterministic-processor-hostile) content comparison is needed to tell
+// whether a SINGLE round made progress.
+//
+// # Why one stalled round is not enough to fail (see maxRetryStall)
+//
+// The very first time a task's Do call marks part of a batch Retry is the
+// normal, universal trigger for this whole mechanism — it says nothing yet
+// about whether the processor will converge, so the FIRST attempt (retry ==
+// nil) is never compared at all. From the second attempt onward, a single
+// non-shrinking round is exact evidence that THAT round made no progress, but
+// not necessarily that the processor never will (see maxRetryStall's doc
+// comment for the time-dependent-processor case this guards against) - so
+// stall counts consecutive non-shrinking rounds, resets to 0 the moment a
+// round DOES shrink, and only trips the failure once it reaches
+// maxRetryStall. A permanently stuck (input-deterministic) processor - #2726's
+// actual failure mode - never shrinks at all, so it hits maxRetryStall
+// immediately regardless of its value.
+type retryAttempt struct {
+	// count is how many consecutive RecordFlagRetry recursions have happened
+	// so far for this task, starting at 1 for the first recursion (i.e. the
+	// second time overall Task.Do has run on data descended from this batch).
+	count int
+	// size is len(b.records) at the doTaskAttempt call this retryAttempt
+	// value was passed into — how many records were fed to Task.Do on the
+	// attempt that produced it. The NEXT retry group's size is compared
+	// against this to detect a stalled (non-shrinking) round.
+	size int
+	// stall counts CONSECUTIVE attempts, up to and including the one that
+	// produced this value, whose retry-group size did not shrink relative to
+	// the attempt before it. It resets to 0 the moment a round shrinks. See
+	// maxRetryStall for why a run of these - not a single occurrence - is
+	// what triggers CodeRetryNotConverging.
+	stall int
+}
+
+// doTask is the entry point into task processing: every caller outside a
+// RecordFlagRetry recursion (Worker.Do, and doNextTask advancing to a new
+// task node) comes through here, which always starts a fresh retry chain.
+// See doTaskAttempt and retryAttempt for the bounded-retry mechanics.
+func (w *Worker) doTask(
+	ctx context.Context,
+	taskNode *TaskNode,
+	b *Batch,
+	acker ackNacker,
+) error {
+	// Invariant 1 (enforcement site): destinations require single-writer,
+	// position-ordered Write/Ack pairing (see DestinationTask.Do, which pairs
+	// each Write with N subsequent Ack reads assuming strict FIFO ordering on
+	// the destination's single gRPC stream) and are unsafe for concurrent
+	// Send/Recv from multiple goroutines. In an N-source, shared-destination
+	// pipeline (slice 3b), every source's Worker runs Do() on its own
+	// goroutine and all of them funnel into the SAME shared TaskNode subtree,
+	// so entry into it must be serialized across workers.
+	//
+	// The lock lives HERE, in the wrapper, and deliberately NOT in
+	// doTaskAttempt. doTaskAttempt is what the bounded-retry recursion calls
+	// directly (see #2726 / retryAttempt), so acquiring a non-reentrant mutex
+	// there would self-deadlock the moment a shared node retried a sub-batch.
+	// Acquiring once at the external entry point instead means the lock is
+	// held across the whole synchronous pass — including every retry
+	// recursion and any doNextTask fan-out beneath it — which is exactly the
+	// guarantee the shared destination needs: one worker's entire pass
+	// completes before another worker's batch can enter.
+	//
+	// See TaskNode.MarkSharedBoundary and
+	// docs/design-documents/20260801-archv2-multiconnector-nsource.md.
+	if taskNode.sharedBoundary {
+		taskNode.sharedMu.Lock()
+		defer taskNode.sharedMu.Unlock()
+
+		// H2 (adversarial review of #2734): refuse to enter a shared
+		// destination subtree a PREVIOUS pass already poisoned (see the
+		// store below). This Load is guaranteed to observe a fully
+		// committed poison, never a partial/racy one: the store happens
+		// strictly before the OTHER goroutine's sharedMu.Unlock()
+		// (deferred there), and this Load happens strictly after THIS
+		// goroutine's own sharedMu.Lock() above - the mutex's own
+		// release/acquire pair is what makes the poison visible-before-
+		// entry, with no dependency on how fast rp.t.Kill's context
+		// cancellation propagates (which is exactly the race the original
+		// bug exploited: a sibling already contending for sharedMu could
+		// acquire it and call Ack() into a desynchronized stream before
+		// ever observing ctx.Done()).
+		if taskNode.poisoned.Load() {
+			ce := conduiterr.New(CodeSharedDestinationPoisoned, fmt.Sprintf(
+				"task %s: shared destination is poisoned by a previous error that may have left "+
+					"its ack stream desynchronized; refusing to write more records through it to avoid "+
+					"acking the wrong source's records", taskNode.Task.ID(),
+			))
+			ce.Suggestion = "this pipeline needs a full restart to reopen the shared destination with a " +
+				"fresh ack stream; the underlying error that poisoned it should be visible earlier in the logs"
+			return ce
+		}
+	}
+
+	err := w.doTaskAttempt(ctx, taskNode, b, acker, nil)
+	if err != nil && taskNode.sharedBoundary {
+		// H2 (adversarial review of #2734): ANY error escaping a pass
+		// through a shared subtree can desynchronize the shared
+		// destination's single gRPC ack stream from this point on - most
+		// critically DestinationTask.Do returning early on an Ack() error,
+		// which leaves whatever acks were still queued behind it UNREAD
+		// (see destination.go). A sibling worker that next acquires
+		// sharedMu would otherwise read THIS worker's leftover acks as its
+		// own: validateAcks' byte-for-byte comparison against ITS OWN
+		// positions can PASS if the two sources' position bytes happen to
+		// collide (positions are only unique WITHIN a source - see
+		// tests/chaos/nsource_child.go's deliberately disjoint posOffset,
+		// which is exactly the collision case this closes) - silently
+		// acking records upstream that were never durably written
+		// (invariant 1).
+		//
+		// Poison it HERE, before the deferred sharedMu.Unlock() above runs,
+		// so no sibling can ever observe an unlocked-but-still-
+		// desynchronized shared destination. This worker still returns err
+		// normally below - runPipeline's caller kills rp.t, which cancels
+		// ctx for every worker - but that cancellation reaching a sibling
+		// already blocked on sharedMu.Lock() is a race (see the Load's doc
+		// above); the poison flag is what closes the window regardless of
+		// that race's outcome.
+		taskNode.poisoned.Store(true)
+		// The poison flag is only read on entry to the shared node. A sibling's
+		// ordered ack (ackInOrder) comes from its own processors, above the
+		// boundary, and never passes that check; failing the batching
+		// destinations below makes deferOrdered refuse too.
+		poisonBatchingDestinations(taskNode, err)
+	}
+
+	return err
+}
+
+//nolint:gocyclo // TODO: refactor
+func (w *Worker) doTaskAttempt(
+	ctx context.Context,
+	taskNode *TaskNode,
+	b *Batch,
+	acker ackNacker,
+	retry *retryAttempt,
+) error {
+	t := taskNode.Task
+
+	w.logger.Trace(ctx).
+		Str("task_id", t.ID()).
+		Int("batch_size", len(b.records)).
+		Int("filtered_count", b.filterCount).
+		Int("split_count", len(b.splitRecords)).
+		Bool("tainted", b.tainted).
+		Msg("executing task")
+
+	// Destination-write batching (see destination_batch.go): a batching
+	// destination task owns the write+ack cycle itself, so it is called here
+	// instead of t.Do. If it buffered the batch it defers the source ack
+	// (errBuffered) and the worker reads the next batch; if it flushed, the
+	// batch is already acked/nacked and there is nothing left to do here.
+	if dt, ok := t.(*DestinationTask); ok && dt.batchingEnabled() {
+		err := dt.doBuffered(ctx, b, acker)
+		if isBuffered(err) {
+			return nil // deferred: read the next source batch, do not ack
+		}
+		if err != nil {
+			return cerrors.Errorf("task %s: %w", t.ID(), err)
+		}
+		return nil // flushed and acked by the destination task
+	}
+
+	err := t.Do(ctx, b)
+
+	w.logger.Trace(ctx).
+		Err(err).
+		Str("task_id", t.ID()).
+		Int("batch_size", len(b.records)).
+		Int("filtered_count", b.filterCount).
+		Int("split_count", len(b.splitRecords)).
+		Bool("tainted", b.tainted).
+		Msg("task done")
+
+	if err != nil {
+		// Canceled error can be returned if the worker is stopped while reading
+		// the next batch from the source (graceful stop).
+		// ErrPluginNotRunning can be returned if the plugin is stopped before
+		// trying to read the next batch.
+		// Both are considered as graceful stop, just return the context error, if any.
+		if taskNode.IsFirst() && (cerrors.Is(err, context.Canceled) ||
+			(cerrors.Is(err, plugin.ErrPluginNotRunning) && w.stop.Load())) {
+			return ctx.Err()
+		}
+		if taskNode.IsFirst() && cerrors.Is(err, io.EOF) {
+			// A source that has permanently exhausted its records (e.g. a
+			// snapshot-only connector with nothing left to stream) reports it
+			// by returning io.EOF from Read - the same sentinel this package
+			// already uses for "the source's stream has closed" elsewhere
+			// (see isClosedSourceStream). This is NOT a failure (slice 3b of
+			// the arch-v2 multi-connector epic, N-source pipelines).
+			//
+			// This branch is deliberately NOT gated on w.stop. An earlier
+			// version guarded it with !w.stop.Load(), reasoning that the
+			// stop-armed case was "handled by the branch above" - it is not.
+			// That branch matches only context.Canceled and
+			// plugin.ErrPluginNotRunning, so a source exhausting at the same
+			// instant an external Stop armed the flag matched NEITHER branch,
+			// fell through to the generic error path, and surfaced as
+			// "failed to read from source: EOF". In the Service that error
+			// reaches rp.t.Kill, so a pipeline that stopped perfectly cleanly
+			// was reported as failed instead of UserStopped. It showed up as
+			// an intermittent failure of the N-source service tests (and once
+			// as a full 10-minute test-timeout hang in CI) before being
+			// tracked down. A source reporting that it is out of records is
+			// graceful whether or not anything else also asked it to stop.
+			//
+			// M3 (adversarial review of #2734): log this transition at Info,
+			// distinctly from an externally-requested Stop, so it is never
+			// indistinguishable from a graceful operator stop in the logs -
+			// an operator reading them needs to be able to tell "this source
+			// decided on its own that it was done" apart from "something
+			// asked it to stop". As of this writing no in-tree connector or
+			// the connector-sdk's Run loop actually returns io.EOF this way
+			// (the SDK only ends Run on ctx-cancel or the plugin stream
+			// closing) - this branch exists defensively for when one does,
+			// and is honestly documented as currently unreachable in
+			// production rather than silently claimed as tested behavior;
+			// see docs/design-documents/20260801-archv2-multiconnector-nsource.md,
+			// "A source finishing gracefully is not a failure".
+			// M3 kept: distinguish self-exhaustion from an externally-requested
+			// stop in the logs. With the guard removed this branch also covers
+			// "exhausted while stopping", so say which one actually happened
+			// rather than always claiming the source decided on its own.
+			w.logger.Info(ctx).
+				Str("source_id", taskNode.Task.ID()).
+				Bool("stop_requested", w.stop.Load()).
+				Msg("source exhausted its records (io.EOF) and is stopping gracefully; sibling sources, if any, are unaffected")
+
+			// Arm w.stop so tearDownSource behaves identically to an
+			// externally-requested Stop (idempotent either way - see
+			// tearDownSource's doc), then return nil so Worker.Do's loop
+			// condition (!w.stop.Load()) exits cleanly on the next check.
+			// This worker's own source teardown happens on its own (per the
+			// crux design: source teardown is per-worker); the pipeline as a
+			// whole - and the shared sink - are unaffected and stay up for
+			// as long as any sibling worker is still running. See
+			// docs/design-documents/20260801-archv2-multiconnector-nsource.md.
+			w.stop.Store(true)
+			// Invariant 1/7 (#3231): same drain as Stop, under the processing
+			// lock so it cannot run concurrently with a Stop doing the same on
+			// a synchronous destination (this branch is reached without the
+			// lock: the read that returned io.EOF is not protected by it).
+			// guard: funnel-eof-drains-before-teardown tests=^TestWorker_SourceEOF_DrainsDestinationBeforeTeardown$
+			if release, lerr := w.acquireProcessingLock(ctx); lerr == nil {
+				w.drainDestinationsBeforeTeardown(ctx)
+				release()
+			}
+			if tdErr := w.tearDownSource(ctx); tdErr != nil {
+				return cerrors.Errorf("source finished but failed to tear down: %w", tdErr)
+			}
+			return nil
+		}
+		return cerrors.Errorf("task %s: %w", t.ID(), err)
+	}
+
+	if taskNode.IsFirst() {
+		// The first task has some specifics:
+		// - Store last time we read a batch from the source for metrics.
+		// - It locks the stop lock, so that no stop signal can be received while
+		//   the batch is being processed.
+		// - It checks if the source was torn down after receiving the batch and
+		//   before acquiring the lock.
+		w.lastReadAt.Store(time.Now().UnixNano())
+
+		release, err := w.acquireProcessingLock(ctx)
+		if err != nil {
+			return err
+		}
+		// Unlock after the batch is end-to-end processed.
+		defer release()
+
+		if w.stop.Load() {
+			// The source was already torn down, we won't be able to deliver
+			// any acks so throw away the batch and gracefully return.
+			w.logger.Warn(ctx).
+				Str("task_id", t.ID()).
+				Int("batch_size", len(b.records)).
+				Msg("stop signal received just before starting to process next batch, gracefully stopping without flushing the batch")
+			return nil
+		}
+	}
+
+	if !b.tainted {
+		w.logger.Trace(ctx).
+			Str("task_id", t.ID()).
+			Msg("task returned clean batch")
+
+		// Shortcut.
+		if !taskNode.HasNext() || !b.HasActiveRecords() {
+			// Either this is the last task (the batch has made it end-to-end),
+			// or the batch has only filtered records. Let's ack!
+			if !taskNode.hasBatchingBelow() {
+				return acker.Ack(ctx, b) // hot path: no closure, no destination walk
+			}
+			return w.ackInOrder(ctx, taskNode, func(ctx context.Context) error {
+				return acker.Ack(ctx, b)
+			})
+		}
+		// There is at least one task after this one, let's continue.
+		return w.doNextTask(ctx, taskNode, b, acker)
+	}
+
+	w.logger.Trace(ctx).
+		Str("task_id", t.ID()).
+		Msg("task returned tainted batch, splitting into sub-batches")
+
+	// Batch is tainted, we need to go through all statuses and group them by
+	// status before further processing.
+	idx := 0
+	for {
+		subBatch := w.subBatchByFlag(b, idx)
+		if subBatch == nil {
+			w.logger.Trace(ctx).Msg("processed last batch")
+			break
+		}
+
+		// Invariant 2/3: capture the span this sub-batch covers in the PARENT
+		// batch BEFORE handing it to a task, and advance idx by that — never by
+		// the sub-batch's length afterwards.
+		//
+		// A task may GROW the sub-batch: Batch.SplitRecord appends, and both the
+		// RecordFlagRetry branch (which re-enters doTask) and doNextTask can
+		// trigger it. Because subBatchByFlag three-index-clips, that growth
+		// reallocates and leaves the parent untouched — so after the call
+		// len(subBatch.positions) is larger than the span it actually covered.
+		// Advancing by the grown length made idx overshoot, and the records in
+		// between were never handed to any downstream task, never acked — while
+		// a later sub-batch's ack still advanced the persisted source position
+		// PAST them. Silent, permanent record loss with no error and no gap in
+		// the position sequence. See issue #2722.
+		span := len(subBatch.positions)
+
+		w.logger.Trace(ctx).
+			Str("task_id", t.ID()).
+			Int("batch_size", len(b.records)).
+			Str("record_flag", b.recordStatuses[0].Flag.String()).
+			Msg("collected sub-batch")
+
+		switch subBatch.recordStatuses[0].Flag {
+		case RecordFlagAck, RecordFlagFilter:
+			if !taskNode.HasNext() || !subBatch.HasActiveRecords() {
+				// Either this is the last task (the batch has made it end-to-end),
+				// or the batch has only filtered records. Let's ack!
+				// We need to ack all the records in the batch, not only active
+				// ones, filtered ones should also be acked.
+				var err error
+				if taskNode.hasBatchingBelow() {
+					err = w.ackInOrder(ctx, taskNode, func(ctx context.Context) error {
+						return acker.Ack(ctx, subBatch)
+					})
+				} else {
+					err = acker.Ack(ctx, subBatch)
+				}
+				if err != nil {
+					return err
+				}
+				break // break switch
+			}
+			// There is at least one task after this one, let's continue.
+			err := w.doNextTask(ctx, taskNode, subBatch, acker)
+			if err != nil {
+				return err
+			}
+		case RecordFlagNack:
+			var err error
+			if taskNode.hasBatchingBelow() {
+				err = w.ackInOrder(ctx, taskNode, func(ctx context.Context) error {
+					return acker.Nack(ctx, subBatch, t.ID())
+				})
+			} else {
+				err = acker.Nack(ctx, subBatch, t.ID())
+			}
+			if err != nil {
+				return err
+			}
+		case RecordFlagRetry:
+			// Retry the sub-batch by passing it to the same task. We need to
+			// mark the records as acked, as that's the default record status.
+			subBatch.Ack(0, len(subBatch.records))
+
+			size := len(subBatch.records)
+			next := &retryAttempt{count: 1, size: size}
+			if retry != nil {
+				// Invariant 3 (enforcement site, #2726): this is at least the
+				// second consecutive RecordFlagRetry recursion for this task.
+				// If the retry group did not shrink relative to what was fed
+				// into the previous attempt (retry.size), THIS round made no
+				// progress - see retryAttempt's doc comment for why comparing
+				// counts here is an exact test for that, not a heuristic. A
+				// stall run of maxRetryStall consecutive non-shrinking rounds
+				// (see its doc comment for why one round alone isn't enough)
+				// means the processor is a fixpoint: recursing further would
+				// only grow the stack without bound for no benefit (#2726),
+				// so fail the pipeline loudly instead. Nothing in this
+				// sub-batch — or anything after it, since the tainted loop's
+				// idx cursor never advances past a Retry group it recurses
+				// into — has been acked or nacked, so every record here is
+				// redelivered on restart once the pipeline is fixed.
+				stall := retry.stall
+				if size >= retry.size {
+					stall++
+				} else {
+					stall = 0
+				}
+				if stall >= maxRetryStall {
+					ce := conduiterr.New(CodeRetryNotConverging, fmt.Sprintf(
+						"task %s: retry made no progress for %d consecutive attempt(s) "+
+							"(of %d total): %d record(s) were fed to the processor and "+
+							"%d came back with no result at all — not processed, not "+
+							"filtered, not errored",
+						t.ID(), stall, retry.count+1, retry.size, size,
+					))
+					ce.Suggestion = fmt.Sprintf(
+						"task %q returned an empty/unset result for these records rather "+
+							"than a processed record, a filter, or an error. For a "+
+							"standalone (WASM) processor this usually means a malformed or "+
+							"version-mismatched plugin sending a ProcessedRecord with no "+
+							"Record set; check the plugin build and its processor-SDK "+
+							"version. NOTE: a processor that merely returns FEWER records "+
+							"than it received is not this condition — that shrinks the "+
+							"retry group and converges normally. No records were acked; "+
+							"they will be redelivered on restart", t.ID(),
+					)
+					return cerrors.FatalError(ce)
+				}
+				next = &retryAttempt{count: retry.count + 1, size: size, stall: stall}
+			}
+			if next.count > maxRetryAttempts {
+				ce := conduiterr.New(CodeRetryNotConverging, fmt.Sprintf(
+					"task %s: retry exceeded the maximum of %d attempts (%d "+
+						"record(s) still unresolved) before either converging or "+
+						"being detected as stuck; aborting to avoid unbounded "+
+						"recursion", t.ID(), maxRetryAttempts, size,
+				))
+				ce.Suggestion = fmt.Sprintf(
+					"task %q needed more than %d retry attempts to resolve a batch; "+
+						"if it is genuinely converging (shrinking every attempt) on "+
+						"unusually large batches, reduce the source's batch size — "+
+						"no records were acked, they will be redelivered on restart",
+					t.ID(), maxRetryAttempts,
+				)
+				return cerrors.FatalError(ce)
+			}
+
+			err := w.doTaskAttempt(ctx, taskNode, subBatch, acker, next)
+			if err != nil {
+				return err
+			}
+		}
+
+		idx += span
+	}
+
+	return nil
+}
+
+// subBatchByFlag collects a sub-batch of records with the same status starting
+// from the given index. It returns nil if firstIndex is out of bounds.
+func (w *Worker) subBatchByFlag(b *Batch, firstIndex int) *Batch {
+	return subBatchByFlag(b, firstIndex)
+}
+
+func subBatchByFlag(b *Batch, firstIndex int) *Batch {
+	if firstIndex >= len(b.recordStatuses) {
+		return nil
+	}
+
+	flags := make([]RecordFlag, 0, 2)
+	flags = append(flags, b.recordStatuses[firstIndex].Flag)
+	// Collect Filters and Acks together in the same batch.
+	switch flags[0] { //nolint:exhaustive // We only care about two flags.
+	case RecordFlagFilter:
+		flags = append(flags, RecordFlagAck)
+	case RecordFlagAck:
+		flags = append(flags, RecordFlagFilter)
+	}
+
+	lastIndex := firstIndex
+OUTER:
+	for _, status := range b.recordStatuses[firstIndex:] {
+		for _, f := range flags {
+			if status.Flag == f {
+				lastIndex++
+				// Record has matching status, let's continue.
+				continue OUTER
+			}
+		}
+		// Record has a different status, we're done.
+		break
+	}
+
+	return b.sub(firstIndex, lastIndex)
+}
+
+// doNextTask advances the batch b to whatever comes after taskNode. A single
+// next task is the common case (linear pipeline). Multiple next tasks means
+// taskNode is the fan-out point into M destination branches (see slice 3a of
+// the arch-v2 multi-connector epic): the batch is cloned once per branch and
+// the branches run concurrently, each writing to a different destination.
+//
+// Only the destination-fan-out axis is supported here (single source, M
+// destinations) — spawning multiple *workers* for multiple *sources* is a
+// separate, later slice; see the multi-source guard in
+// pkg/lifecycle-poc/service.go's buildSourceTasks.
+func (w *Worker) doNextTask(ctx context.Context, taskNode *TaskNode, b *Batch, acker ackNacker) error {
+	switch len(taskNode.Next) {
+	case 0:
+		// no next task, we're done
+		return nil
+	case 1:
+		// single next task, let's pass the batch to it
+		return w.doTask(ctx, taskNode.Next[0], b, acker)
+	default:
+		// Multiple next tasks: fan the batch out to each destination branch
+		// concurrently and track per-record ack/nack outcomes across all of
+		// them with multiAckNacker.
+		//
+		// Invariant 1/3 (enforcement site): capture the batch's ORIGINAL
+		// (pre-split) positions up front, before any branch runs. Branches
+		// diverge independently from this point on — a per-branch processor
+		// may split a record into pieces that a sibling branch does not — so
+		// multiAckNacker must key its per-position tally on a position that
+		// is stable across all M branches. b.originalBatch() is exactly the
+		// batch-wide "no splits yet" view; any splitting an upstream SHARED
+		// processor already did (before this fan-out point) is collapsed
+		// here so the tally is keyed by the true root position, not an
+		// intermediate one.
+		// Invariant 1/2/3: refuse to fan out a batch that holds only PART of a
+		// split run. Each branch clones the run ledger (necessarily — branches
+		// diverge), and a clone carries the whole-run member count, so a
+		// partial run can never complete on either side and its source
+		// position would be withheld forever while later positions ack past
+		// it. See validateRunsWholeBeforeFanOut.
+		// guard: funnel-fanout-whole-runs-only tests=^TestRunLedger_FanOut_RunCutBeforeFanOut_FailsLoud$
+		if err := validateRunsWholeBeforeFanOut(b); err != nil {
+			return err
+		}
+
+		orig := b.originalBatch()
+		multiAcker, err := newMultiAckNacker(acker, len(taskNode.Next), orig.positions)
+		if err != nil {
+			// Duplicate positions in the batch: fail the pipeline with the
+			// coded error rather than fan out into a silent, unbounded
+			// never-acked stall. See CodeDuplicateSourcePosition.
+			return err
+		}
+
+		p := pool.New().WithErrors()
+		for branch, nextTask := range taskNode.Next {
+			// #2910: deep-copying every record for every branch made fan-out
+			// superlinear (2 destinations cost 5.2x one). A branch that can
+			// modify a record in place (anything with a processor in it) still
+			// gets its own deep copy. A branch made only of destination tasks
+			// reads the records and never writes them, so it shares them.
+			//
+			// Invariant 1/3 (enforcement site): this changes which memory a
+			// branch reads, never which votes it casts. Each branch still gets
+			// its own recordStatuses and run ledger, and multiAckNacker still
+			// needs every branch's vote for every position, exactly as before.
+			// What the sharing relies on is that nothing writes a shared record
+			// while any branch is still running: the destination path only
+			// reads, the connector layer copies before handing records to a
+			// plugin, and the DLQ builds a new record rather than editing the
+			// nacked one. See branchMutatesRecords for the rule and
+			// TestDoNextTask_FanOut_SharedRecords_* for the checks.
+			var branchBatch *Batch
+			if branchMutatesRecords(nextTask) {
+				branchBatch = b.clone()
+			} else {
+				branchBatch = b.cloneSharingRecords()
+			}
+			// Invariant 1/3 (enforcement site, #2723): wrap multiAcker in a
+			// FRESH runAckNacker per branch. Each branch's clone can diverge
+			// independently from here on (split further, retry, filter), so
+			// each needs its own run-completion ledger; multiAckNacker itself
+			// stays purely about per-position unanimity ACROSS branches (its
+			// existing job), unaware of any run structure. Each branch votes
+			// through its own multiAcker.branch(i) view, so a branch that
+			// votes twice for a position is refused. A branch votes for
+			// a run's original position AT MOST once - when runAckNacker
+			// forwards it - which satisfies multiAckNacker's
+			// one-vote-per-branch-per-position assumption. "At most", not
+			// "exactly": a branch holding only part of a run would never
+			// complete it and so would vote ZERO times, stalling that position
+			// and every later one in multiAckNacker's prefix scan. That shape
+			// is refused up front by validateRunsWholeBeforeFanOut above.
+			p.Go(func() error {
+				return w.doTask(ctx, nextTask, branchBatch, newRunAckNacker(multiAcker.branch(branch)))
+			})
+		}
+		if err := p.Wait(); err != nil {
+			return err // no need to wrap, it already contains the task ID
+		}
+
+		return nil
+	}
+}
+
+// branchMutatesRecords reports whether any task in the fan-out branch rooted
+// at n may modify a record in place, and so needs its own deep copy of the
+// batch's records (Batch.clone) rather than sharing them with its siblings
+// (Batch.cloneSharingRecords). See Worker.doNextTask and #2910.
+//
+// The rule is an allow-list, not a deny-list: only *DestinationTask is known
+// to treat records as read-only. DestinationTask.Do reads positions, hands the
+// slice to Destination.Write and marks per-record statuses on its own Batch.
+// connector.Destination.Write never lets a plugin touch the caller's records:
+// a builtin plugin's in-memory stream clones the request before sending it,
+// and a standalone plugin receives a serialized copy over gRPC. Any other
+// task type - a ProcessorTask, or a type added later - is assumed to mutate,
+// so the safe answer is the default and a new task type has to be proven
+// read-only before it can join the list.
+func branchMutatesRecords(n *TaskNode) bool {
+	if _, ok := n.Task.(*DestinationTask); !ok {
+		return true
+	}
+	for _, next := range n.Next {
+		if branchMutatesRecords(next) {
+			return true
+		}
+	}
+	return false
+}
+
+// ackInOrder runs ack, a source ack or nack for records that stop at taskNode
+// without reaching the destinations below it (filtered, or nacked to the DLQ),
+// in source order relative to the batches those destinations have buffered.
+//
+// Invariant 1/2/3 (enforcement site): with destination batching, earlier
+// batches sit in a destination's buffer or flusher queue while later batches
+// are still being processed. Acking a bypassing batch right away would make
+// connector.Source.Ack persist a position past records that are not yet
+// durable. Each batching destination below taskNode (all of them, at a
+// fan-out) gets to queue the ack behind its earlier batches; see
+// DestinationTask.deferOrdered. With no batching destination below, ack runs
+// inline.
+func (w *Worker) ackInOrder(ctx context.Context, taskNode *TaskNode, ack func(context.Context) error) error {
+	return ackBehind(ctx, batchingDestinations(taskNode), ack)
+}
+
+// ackBehind queues ack behind the earlier batches of each destination in dts,
+// in turn: the ack of the last link runs only after every destination has
+// released everything that was ahead of it.
+func ackBehind(ctx context.Context, dts []*DestinationTask, ack func(context.Context) error) error {
+	if len(dts) == 0 {
+		return ack(ctx)
+	}
+	return dts[0].deferOrdered(ctx, func(ctx context.Context) error {
+		return ackBehind(ctx, dts[1:], ack)
+	})
+}
+
+// poisonBatchingDestinations records err as the flush error of every batching
+// destination at or below n, so they fail closed (see setFlushErr).
+func poisonBatchingDestinations(n *TaskNode, err error) {
+	if dt, ok := n.Task.(*DestinationTask); ok && dt.batchingEnabled() {
+		dt.setFlushErr(err)
+	}
+	for _, dt := range batchingDestinations(n) {
+		dt.setFlushErr(err)
+	}
+}
+
+// hasBatchingBelow reports whether any batching destination task is strictly
+// below n.
+//
+// Invariant it relies on: the task topology is fixed before any worker starts
+// (nodes are built per pipeline run by buildTaskNodes and the shared sink, and
+// are rebuilt for every run, never mutated while workers use them), and whether a
+// destination batches (DestinationTask.batchingEnabled) is fixed at construction.
+// So the answer cannot change after the first call and caching it is sound. A
+// cached "false" for a node with a batching destination below it would let a
+// filtered or nacked batch's source ack run inline ahead of buffered records (H1);
+// TestTaskNode_HasBatchingBelow_CachedAnswerIsStable pins that. The answer is fixed once the task tree is built, so it is computed on
+// first use and cached: the worker asks it for every batch that is acked at a
+// node, and walking the tree and allocating a closure there is measurable on the
+// in-process engine benchmark.
+func (n *TaskNode) hasBatchingBelow() bool {
+	switch n.batchingBelowState.Load() {
+	case 1:
+		return false
+	case 2:
+		return true
+	}
+	if len(batchingDestinations(n)) > 0 {
+		n.batchingBelowState.Store(2)
+		return true
+	}
+	n.batchingBelowState.Store(1)
+	return false
+}
+
+// batchingDestinations returns the batching destination tasks strictly below n.
+func batchingDestinations(n *TaskNode) []*DestinationTask {
+	var out []*DestinationTask
+	for _, next := range n.Next {
+		if dt, ok := next.Task.(*DestinationTask); ok && dt.batchingEnabled() {
+			out = append(out, dt)
+		}
+		out = append(out, batchingDestinations(next)...)
+	}
+	return out
+}
+
+func (w *Worker) Ack(ctx context.Context, batch *Batch) error {
+	originalBatch := batch.originalBatch()
+
+	// Invariant 2: positions are monotonic and crash-safe. connector.Source.Ack
+	// persists State.Position = p[len(p)-1] unconditionally, so handing it an
+	// empty/nil position OVERWRITES the durable source position with nothing —
+	// on restart the source resumes from an empty position, which for Postgres
+	// means a full re-snapshot and for file/Kafka means offset 0. That is a
+	// monotonicity violation with a far worse blast radius than the stall this
+	// check's sibling guard (CodeDuplicateSourcePosition) prevents.
+	//
+	// A nil position here is never the source's fault: Batch.SplitRecord marks
+	// every piece after the first with a nil position, and a sub-batch that
+	// happens to cover only that tail collapses to nils. Failing loud is the
+	// only safe response — the records are simply not acked, so they replay on
+	// restart (invariant 3 preserved), whereas proceeding corrupts the position.
+	// guard: funnel-ack-rejects-empty-position tests=^TestWorker_Ack_EmptyPosition_RefusesToWipeSourcePosition$
+	if err := validateAckPositions(originalBatch.positions); err != nil {
+		return err
+	}
+
+	err := w.Source.Ack(ctx, originalBatch.positions)
+	if err != nil && !isClosedSourceStream(err) {
+		return cerrors.Errorf("failed to ack %d records in source: %w", len(originalBatch.positions), err)
+	}
+	// A closed source stream (io.EOF) means the source already stopped, typically
+	// because it errored; forwarding the ack is a no-op and this derived error must
+	// not mask the source's real cause (#1659). Safe under invariant 3: Source.Ack
+	// does not persist a position on this error path.
+
+	w.DLQ.Ack(ctx, batch)
+	w.updateTimer(batch.records)
+	return nil
+}
+
+// validateAckPositions rejects a position slice that is about to be handed to
+// connector.Source.Ack but contains an empty/nil entry. See Worker.Ack for why
+// this is invariant-2 corruption rather than a cosmetic problem, and
+// CodeEmptySourcePosition for who is actually at fault.
+func validateAckPositions(positions []opencdc.Position) error {
+	for i, p := range positions {
+		if len(p) != 0 {
+			continue
+		}
+		ce := conduiterr.New(CodeEmptySourcePosition, fmt.Sprintf(
+			"refusing to ack an empty position (index %d of %d) to the source: "+
+				"acking it would overwrite the durable source position and force a full re-read on restart",
+			i, len(positions),
+		))
+		ce.Suggestion = "most often the source connector emitted a record with an empty position — every " +
+			"record must carry a distinct, non-empty position; it can also mean a processor split a record " +
+			"and a later processor returned only part of the split run. The records are not acked and will " +
+			"be redelivered, but the pipeline is stopped to protect the source position"
+		return ce
+	}
+	return nil
+}
+
+func (w *Worker) Nack(ctx context.Context, batch *Batch, taskID string) error {
+	originalBatch := batch.originalBatch()
+	n, err := w.DLQ.Nack(ctx, originalBatch, taskID)
+	if n > 0 {
+		// Successfully nacked n records, let's ack them, as they reached
+		// the end of the pipeline (in this case the DLQ).
+
+		// Invariant 2: positions are monotonic and crash-safe. Same corruption
+		// site as Worker.Ack, reached by a different route — see that method
+		// for why an empty position handed to connector.Source.Ack overwrites
+		// the durable source position with nothing.
+		//
+		// The live route is a SOURCE CONNECTOR emitting a record with an empty
+		// position, which then gets nacked: NewBatch copies r.Position verbatim
+		// with no validation, the record was never split so runAckNacker
+		// forwards it straight through, and originalBatch() returns the batch
+		// unchanged because splitRecords is empty. Nothing between the source
+		// and here rejects it. Worker.Ack has guarded its half of this since
+		// before this check existed; the nack path was the remaining hole.
+		//
+		// FATAL, not a plain error. A non-fatal worker error is classified into
+		// the bounded-backoff recovery arm, whose default MaxRetries is
+		// infinite — and this condition is perfectly deterministic, so the
+		// source would re-read the same record, nack it again, and write
+		// another copy to the DLQ on every single iteration, forever. Fatal
+		// degrades the pipeline once, leaving exactly one DLQ copy. This is the
+		// same reasoning DLQ.Nack applies to its own write failure ("recovering
+		// could lead to an endless loop of restarts").
+		//
+		// The n records are already durably in the DLQ and are deliberately not
+		// acked, so they replay on restart (invariant 3 holds, at-least-once).
+		// Acking instead would force the source to re-read from the beginning,
+		// which is strictly worse.
+		// guard: funnel-nack-rejects-empty-position tests=^TestWorker_Nack_TailOnlySubBatch_RefusesToWipeSourcePosition$
+		if posErr := validateAckPositions(originalBatch.positions[:n]); posErr != nil {
+			// Keep DLQ.Nack's own error in the chain. It is frequently fatal
+			// itself (a partial sendToDLQ success, or the nack threshold being
+			// exceeded), and returning only the position error would discard
+			// the reason the records were being nacked in the first place.
+			// Both are fatal, so classification is unaffected either way — this
+			// is about not throwing away the cause.
+			if err != nil {
+				return cerrors.FatalError(cerrors.Errorf("%w (while handling: %w)", posErr, err))
+			}
+			return cerrors.FatalError(posErr)
+		}
+
+		ackErr := w.Source.Ack(ctx, originalBatch.positions[:n])
+		if ackErr != nil && !isClosedSourceStream(ackErr) {
+			return cerrors.Errorf("task %s failed to ack %d records in source: %w", taskID, n, ackErr)
+		}
+		// io.EOF suppressed, same as Ack (#1659).
+
+		w.updateTimer(batch.records[:n])
+	}
+
+	if err != nil {
+		return cerrors.Errorf("failed to nack %d records: %w", len(batch.records)-n, err)
+	}
+	return nil
+}
+
+// isClosedSourceStream reports whether err is the sentinel a source connector's
+// stream returns once it has closed (io.EOF, which plugin.ErrStreamNotOpen
+// aliases). Forwarding an ack to a closed source stream is a no-op, and the
+// derived error must not mask the source's real failure. See #1659.
+func isClosedSourceStream(err error) bool {
+	return cerrors.Is(err, io.EOF)
+}
+
+func (w *Worker) updateTimer(records []opencdc.Record) {
+	for _, rec := range records {
+		readAt, err := rec.Metadata.GetReadAt()
+		if err != nil {
+			// If the record metadata has changed and does not include ReadAt
+			// fallback to the time the worker received the record.
+			readAt = time.Unix(0, w.lastReadAt.Load())
+		}
+		w.timer.UpdateSince(readAt)
+	}
+}
+
+// TaskNode represents a task in the pipeline. It contains the task itself and
+// the next tasks to be executed after it.
+type TaskNode struct {
+	Task Task
+	Next []*TaskNode
+
+	first bool
+
+	// sharedBoundary marks this node as the entry point into a subtree that
+	// is NOT owned by an individual Worker's Open/Close lifecycle, because it
+	// is shared across N source workers converging on one destination (see
+	// funnel.Sink and slice 3b of the arch-v2 multi-connector epic).
+	//
+	// TaskNode.iterator (which backs Tasks()/TaskNodes(), the only thing
+	// Worker.Open/Close/NewWorker's validateTasks use to walk a tree) stops
+	// BEFORE descending into a child marked sharedBoundary, so a Worker whose
+	// own prefix's tail points at a shared node never opens, closes, or
+	// double-counts it. Worker.doTask's runtime traversal is unaffected -it
+	// walks taskNode.Next directly, never through the iterator - and is what
+	// actually enforces exclusive access via sharedMu (see doTask's lock
+	// acquisition site).
+	sharedBoundary bool
+	// sharedMu is non-nil if and only if sharedBoundary is true. See
+	// MarkSharedBoundary and the lock acquisition in doTask.
+	sharedMu *ctxMutex
+	// testAfterDrain, if set on a shared boundary node, is called by drainNode
+	// right after a drain released sharedMu. Tests use it to interleave a sibling
+	// at that instant; nil in production.
+	testAfterDrain func()
+	// batchingBelowState caches hasBatchingBelow: 0 unknown, 1 none, 2 some.
+	batchingBelowState atomic.Int32
+	// poisoned is only meaningful if sharedBoundary is true. H2 (adversarial
+	// review of #2734): set, under sharedMu, by doTask when a pass through
+	// this shared subtree returns an error - which may have left the shared
+	// destination's single gRPC ack stream desynchronized (see
+	// DestinationTask.Do and CodeSharedDestinationPoisoned) - BEFORE
+	// sharedMu is released. Checked by doTask immediately after acquiring
+	// sharedMu, so no later caller can ever read a stream a previous pass
+	// left in an unknown state. Never cleared: the only safe recovery is a
+	// full pipeline restart, which builds a brand new TaskNode (and
+	// therefore a fresh, unpoisoned flag) from scratch.
+	poisoned atomic.Bool
+}
+
+// MarkSharedBoundary marks t as the entry point into a subtree shared by
+// multiple Workers (see the sharedBoundary field doc) and allocates the mutex
+// Worker.doTask uses to serialize entry into it.
+//
+// Call it exactly once per shared root, before building any Worker whose own
+// tree attaches it via AppendToEnd - funnel.NewSink does this for every root
+// it's given. Marking a node that is NOT the single, deliberately-chosen
+// entry point into a shared subtree (e.g. marking every node in the subtree
+// instead of just its root) would still be memory-safe but would silently
+// narrow the serialized region and is a caller bug.
+func (t *TaskNode) MarkSharedBoundary() {
+	t.sharedBoundary = true
+	t.sharedMu = &ctxMutex{}
+}
+
+// IsFirst returns true if this task is the first task in the pipeline.
+func (t *TaskNode) IsFirst() bool {
+	return t.first
+}
+
+// HasNext returns true if the task has at least one next task.
+func (t *TaskNode) HasNext() bool {
+	return len(t.Next) > 0
+}
+
+// AppendToEnd adds a new task to the end of the pipeline. Note that this doesn't
+// mean that the supplied task will be executed directly after this task. Rather,
+// it means that it will be executed after all tasks in the linked list are executed.
+//
+// If any task node in the list has more than 1 next task, the function will
+// return an error, as it would be ambiguous where to append the task.
+//
+// If the task was appended successfully, it returns the created TaskNode.
+func (t *TaskNode) AppendToEnd(next ...*TaskNode) error {
+	switch len(t.Next) {
+	case 0:
+		// No next task, let's append the new task.
+		t.Next = next
+		return nil
+	case 1:
+		// Single next task, let's append the new task to it.
+		return t.Next[0].AppendToEnd(next...)
+	default:
+		// Multiple next tasks, we can't append the new task to them.
+		// If we hit this line it's an internal bug.
+		return cerrors.Errorf("(bug) multiple next tasks, please append the task to the branch where you want it")
+	}
+}
+
+// TaskNodes returns an iterator over the task nodes in the pipeline. It iterates
+// the task nodes in the order they are defined in the pipeline, depth-first.
+func (t *TaskNode) TaskNodes() iter.Seq[*TaskNode] {
+	return func(yield func(*TaskNode) bool) {
+		t.iterator()(yield)
+	}
+}
+
+// Tasks returns an iterator over the tasks in the pipeline. It iterates
+// the tasks in the order they are defined in the pipeline, depth-first.
+func (t *TaskNode) Tasks() iter.Seq[Task] {
+	return func(yield func(Task) bool) {
+		t.iterator()(func(node *TaskNode) bool {
+			return yield(node.Task)
+		})
+	}
+}
+
+// iterator is a private method that returns an iterator which also tells the
+// caller if it should stop iterating. This is needed to break the loop in parent
+// iterators, but doesn't match the Go interface for iter.Seq, so it's just a helper.
+func (t *TaskNode) iterator() func(yield func(*TaskNode) bool) bool {
+	return func(yield func(*TaskNode) bool) bool {
+		// First yield the current task.
+		if !yield(t) {
+			return false
+		}
+
+		// Then process all children in order, skipping any child that is
+		// itself the root of a shared subtree (see sharedBoundary's doc): a
+		// per-source Worker's own Open/Close walk must stop at the boundary
+		// even though this same tree, walked at runtime by doTask/doNextTask
+		// (which use Next directly, not this iterator), continues past it.
+		for _, next := range t.Next {
+			if next.sharedBoundary {
+				continue
+			}
+			if !next.iterator()(yield) {
+				return false
+			}
+		}
+		return true
+	}
+}
+
+type ackNacker interface {
+	Ack(context.Context, *Batch) error
+	Nack(context.Context, *Batch, string) error
+}
+
+// multiAckNacker is the ackNacker used at a destination fan-out point (see
+// Worker.doNextTask): it sits between M concurrently-running destination
+// branches and the single parent ackNacker (the Worker itself, or an outer
+// multiAckNacker), and is responsible for turning M independent per-branch
+// votes for each source record into exactly one Ack or Nack call on the
+// parent.
+//
+// # Why per-batch counting is wrong
+//
+// A naive implementation would count acks/nacks per BATCH (one counter,
+// decremented once per branch, act once it hits zero). That is a data-loss
+// bug: destinations diverge per RECORD, not per batch. Destination 1 might
+// ack records 0-4 of a 5-record batch while destination 2 nacks record 3 —
+// there is no single moment where "the batch" is uniformly ack'd or nack'd.
+// A per-batch counter has no way to represent record 3 being nacked while
+// records 0, 1, 2 and 4 are acked, and either drops the divergence (silently
+// acking a record that a destination never durably wrote — invariant 1) or
+// blocks forever (waiting for a nack vote on a record every branch actually
+// acked).
+//
+// # Required semantics (per original source position)
+//
+//  1. Ack-only-when-unanimous (invariant 1): a position is acked to the
+//     parent only once ALL M branches have voted ack for it.
+//
+//  2. Nack-wins, decided after every vote (invariant 3): if ANY branch nacks
+//     a position, it is routed to the parent's DLQ exactly once, regardless
+//     of how the other branches voted. A record written durably to
+//     destination 1 but failed on destination 2 is NOT a partial success —
+//     the whole record goes to the DLQ, then is acked to the source (the DLQ
+//     write is itself the durable handling that earns the source ack). A
+//     partially-written record is never acked to the source as if it were a
+//     full success. The nack decides the OUTCOME at once, but the position
+//     becomes terminal (releasable) only once all M branches have voted,
+//     exactly like an ack. Releasing on the first nack let a nacked position
+//     reach Worker.Nack (DLQ write, then Source.Ack) while a sibling
+//     batching destination still buffered an EARLIER batch unwritten:
+//     Source.Ack persists the last position it is given, so a crash then
+//     resumed past the buffered records and that destination lost them
+//     (#3323). Waiting for every vote restores cross-batch order: see
+//     requirement 4.
+//
+//  3. Exactly one vote per branch per position: branches run concurrently
+//     and call Ack/Nack from separate goroutines, each voting once per
+//     position (ack xor nack) — the same assumption the rest of the batch
+//     pipeline already makes (see Batch's tainted-splitting in doTask). Each
+//     branch votes through its own view (branch(i)), and the tally records
+//     WHICH branches voted for each position, not only how many. A second
+//     vote from the same branch is a task-graph bug; it is refused with a
+//     (bug) error (errDoubleVote) and not counted, whether or not the
+//     siblings have voted yet. Counting it would let one branch's two votes
+//     make a position terminal without a sibling's vote, an early ack.
+//
+//  4. In-source-order release (invariant 4): positions are released to the
+//     parent in ascending source order, never in branch-completion order —
+//     a branch that finishes record 10 before another branch finishes
+//     record 3 must not let record 10 reach the parent first, or
+//     Source.Ack's monotonically-advancing position would skip ahead of a
+//     record that has not actually reached a terminal decision yet.
+//     Contiguous runs of ack decisions are batched into a single parent.Ack
+//     call to preserve the parent's batch semantics; nacks are released one
+//     position at a time (see the comment on releaseLocked for why).
+//
+//     The same order holds ACROSS fan-out batches, each of which has its own
+//     multiAckNacker. Every branch votes in source order: the fan-out is
+//     synchronous (doNextTask waits for every branch before the worker reads
+//     the next batch) and a batching destination votes for its buffered
+//     batches in pending order (ackPending). Because a position is released
+//     only by its LAST vote, and each branch's vote for batch N returns
+//     (release included) before that branch votes for batch N+1, every
+//     position of batch N is released before any position of batch N+1.
+//     This holds for nacks only because of requirement 2's "after every
+//     vote".
+//
+//  5. Fatal-error propagation: if the parent's Nack returns a fatal error
+//     (e.g. the DLQ nack-threshold was exceeded), that error is returned to
+//     the caller so the branch pool errors out and the worker tombs with it
+//     — identical to what happens on the single-destination path.
+//
+//  6. A failed release is final. Once parent.Ack or parent.Nack returns an
+//     error, every later vote returns that error (wrapped, so cerrors.Is and
+//     the fatal classification still hold) and never calls the parent again.
+//     The branch pool does not cancel siblings when one branch fails, so a
+//     sibling still running can vote on a later position; without this its
+//     release would start again at the failed position and call parent.Nack
+//     a second time: a second DLQ entry (if the DLQ write had succeeded and
+//     Source.Ack then failed) and a second count in the DLQ nack window.
+//
+// This is intentionally a mutex-guarded per-position tally rather than a
+// lock-free or channel-based design: it is Tier-1, highest-data-loss-risk
+// code, and boring-and-obviously-correct beats clever here. See
+// docs/design-documents/20260731-archv2-multiconnector.md and
+// docs/architecture-decision-records/20260731-archv2-fanout-ack-model.md.
+type multiAckNacker struct {
+	parent   ackNacker
+	branches int
+
+	// positions holds the ORIGINAL (pre-split) source positions the fan-out
+	// batch contained, captured once at construction time (see
+	// Worker.doNextTask). Index i in every other slice below corresponds to
+	// positions[i].
+	positions []opencdc.Position
+	// posIndex maps a position's byte content to its index in positions, so
+	// Ack/Nack can look up which slot an incoming (already-collapsed-to-
+	// original) record belongs to.
+	posIndex map[string]int
+
+	mu sync.Mutex
+	// votes[i] counts how many of the M branches have voted (ack or nack)
+	// for positions[i] so far.
+	votes []int
+	// voted[i*branches+b] is true once branch b has voted for positions[i].
+	// A second vote from the same branch is refused (requirement 3).
+	voted []bool
+	// terminal[i] is true once all M branches have voted for positions[i]
+	// (requirement 2): only then may it be released.
+	terminal []bool
+	// nacked[i] is true once any branch has nacked positions[i]. Nack wins:
+	// it never goes back to false, and a terminal position with nacked[i]
+	// false was acked by every branch.
+	nacked []bool
+	// record[i] holds a record to represent positions[i] in the eventual
+	// parent Ack/Nack call. For an ack it can come from any branch (only the
+	// position matters for Source.Ack; content is used only for metrics/DLQ-
+	// window bookkeeping). For a nack it MUST be the record and error from
+	// the first branch that nacked it, so the DLQ entry reflects the real
+	// failure; once nacked[i] is set, ack votes no longer overwrite it.
+	record []opencdc.Record
+	// nackErr[i] and nackTaskID[i] are set with nacked[i]: the error and
+	// originating task ID of the first branch that nacked positions[i],
+	// needed to reconstruct the single-record batch passed to parent.Nack.
+	nackErr    []error
+	nackTaskID []string
+
+	// released is the count of leading positions (a prefix of positions)
+	// that have already been handed to the parent. Positions are only ever
+	// released in order, released..len(positions), never out of order
+	// (invariant 4).
+	released int
+	// err is the error of the first failed release to the parent. Once set,
+	// every vote returns it and the parent is never called again
+	// (requirement 6).
+	err error
+}
+
+// errDoubleVote marks a vote refused because the same branch already voted
+// for the position (requirement 3). It is a task-graph bug, never a data
+// condition.
+var errDoubleVote = cerrors.New("(bug) multiAckNacker: a branch voted twice for the same position")
+
+// multiAckBranch is the ackNacker one fan-out branch votes through: it tags
+// every vote with the branch's index so multiAckNacker can refuse a second
+// vote from the same branch. See multiAckNacker.branch.
+type multiAckBranch struct {
+	m      *multiAckNacker
+	branch int
+}
+
+// Ack records an ack vote from this branch. See multiAckNacker.ack.
+func (b multiAckBranch) Ack(ctx context.Context, batch *Batch) error {
+	return b.m.ack(ctx, b.branch, batch)
+}
+
+// Nack records a nack vote from this branch. See multiAckNacker.nack.
+func (b multiAckBranch) Nack(ctx context.Context, batch *Batch, taskID string) error {
+	return b.m.nack(ctx, b.branch, batch, taskID)
+}
+
+// newMultiAckNacker creates a multiAckNacker for a fan-out of a batch whose
+// original (pre-split) source positions are given by positions, split across
+// branches concurrently-running destination branches. positions must be
+// captured from the fan-out batch's originalBatch() before cloning it for
+// the branches — see Worker.doNextTask.
+func newMultiAckNacker(parent ackNacker, branches int, positions []opencdc.Position) (*multiAckNacker, error) {
+	posIndex := make(map[string]int, len(positions))
+	for i, p := range positions {
+		// Invariant 4: positions are released to the source strictly in
+		// order, so every slot must be individually resolvable. A duplicate
+		// (including two records that both carry an empty/nil position) would
+		// silently shadow the earlier slot in this map: it could never
+		// accumulate votes, never become terminal, and the in-order release
+		// would stop there forever — the ENTIRE batch would then never be
+		// acked to the source, with no error surfaced. Fail loud instead.
+		// See CodeDuplicateSourcePosition.
+		// An EMPTY position is checked first and attributed separately: two nils
+		// would also trip the duplicate check below, but blaming the source for
+		// them is wrong — nil positions come from Batch.SplitRecord, i.e. the
+		// processor chain. A single nil never trips the duplicate check at all,
+		// which is why validateAckPositions guards the corruption site too.
+		if len(p) == 0 {
+			ce := conduiterr.New(CodeEmptySourcePosition, fmt.Sprintf(
+				"record %d of %d in a fanned-out batch has an empty position", i, len(positions),
+			))
+			ce.Suggestion = "this usually means a processor split a record and a later processor " +
+				"returned only part of the split run; fix the processor chain so split runs stay intact"
+			return nil, ce
+		}
+		if prev, dup := posIndex[string(p)]; dup {
+			ce := conduiterr.New(CodeDuplicateSourcePosition, fmt.Sprintf(
+				"records %d and %d in the same batch carry the identical position (hash %s); "+
+					"a position must uniquely identify a record", prev, i, log.KeyHash(p),
+			))
+			ce.Suggestion = "if these records came straight from the source, this is a source-connector " +
+				"bug: every record in a batch must carry a distinct, non-empty position"
+			return nil, ce
+		}
+		posIndex[string(p)] = i
+	}
+
+	n := len(positions)
+	return &multiAckNacker{
+		parent:     parent,
+		branches:   branches,
+		positions:  positions,
+		posIndex:   posIndex,
+		votes:      make([]int, n),
+		voted:      make([]bool, n*branches),
+		terminal:   make([]bool, n),
+		nacked:     make([]bool, n),
+		record:     make([]opencdc.Record, n),
+		nackErr:    make([]error, n),
+		nackTaskID: make([]string, n),
+	}, nil
+}
+
+// indexOf returns the tally slot for pos, or an error if pos is not part of
+// the original fan-out batch. That would mean a branch produced a record
+// whose position doesn't trace back (via originalBatch) to one of the
+// positions captured when the fan-out started — an internal bug in the task
+// graph, not a runtime/data condition, so it's reported as such rather than
+// silently dropped.
+func (m *multiAckNacker) indexOf(pos opencdc.Position) (int, error) {
+	idx, ok := m.posIndex[string(pos)]
+	if !ok {
+		return 0, cerrors.Errorf("(bug) multiAckNacker: position (hash %s) is not part of the original fan-out batch", log.KeyHash(pos))
+	}
+	return idx, nil
+}
+
+// branch returns the ackNacker that fan-out branch b (0 <= b < m.branches)
+// votes through. Every branch must use its own view: the tally refuses a
+// second vote from the same branch (requirement 3).
+func (m *multiAckNacker) branch(b int) ackNacker {
+	return multiAckBranch{m: m, branch: b}
+}
+
+// ack records an ack vote from branch for every position in batch.
+// batch.originalBatch() is applied first, so a branch that split records
+// internally still votes using the same original positions every other
+// branch votes on — see the doc comment on the type for why this matters.
+//
+// Invariant 1 (enforcement site): a position is only ever forwarded to
+// parent.Ack once ALL m.branches have voted, and none of them nacked it.
+func (m *multiAckNacker) ack(ctx context.Context, branch int, batch *Batch) error {
+	ob := batch.originalBatch()
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// guard: funnel-multiack-ack-after-failed-release-refused tests=^TestMultiAckNacker_FailedRelease_IsFinal$
+	if m.err != nil {
+		return m.releaseFailedErr()
+	}
+
+	for i, pos := range ob.positions {
+		idx, err := m.indexOf(pos)
+		if err != nil {
+			return err
+		}
+
+		// guard: funnel-multiack-ack-double-vote-refused tests=^TestMultiAckNacker_(AckAfterAllBranchesVoted_IsRefused|DoubleVoteBeforeAllVoted_IsRefused)$
+		if m.voted[idx*m.branches+branch] {
+			return m.doubleVoteErr("ack", branch, idx)
+		}
+
+		if !m.nacked[idx] {
+			m.record[idx] = ob.records[i]
+		}
+		m.voteLocked(branch, idx)
+	}
+
+	return m.releaseLocked(ctx)
+}
+
+// nack records a nack vote from branch (whose task is taskID) for every
+// position in batch. Like ack, batch.originalBatch() is applied first.
+//
+// Invariant 3 (enforcement site): nack wins. The first nack vote for a
+// position decides its outcome and its DLQ attribution, and the position is
+// routed to the parent's DLQ exactly once. A record durably written by some
+// but not all branches is treated as a failure of the whole record, never
+// partially acked.
+//
+// Invariant 1/3 (enforcement site, #3323): the nack is NOT released on the
+// first vote. It is released, like an ack, only once every branch has voted
+// for the position. parent.Nack writes the DLQ and then acks the source, and
+// Source.Ack persists the last position it is given; releasing before a
+// sibling batching destination has voted would ack the source past an earlier
+// batch that sibling still buffers unwritten, and a crash would lose it.
+func (m *multiAckNacker) nack(ctx context.Context, branch int, batch *Batch, taskID string) error {
+	ob := batch.originalBatch()
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// guard: funnel-multiack-nack-after-failed-release-refused tests=^TestMultiAckNacker_FailedRelease_IsFinal$
+	if m.err != nil {
+		return m.releaseFailedErr()
+	}
+
+	for i, pos := range ob.positions {
+		idx, err := m.indexOf(pos)
+		if err != nil {
+			return err
+		}
+
+		// guard: funnel-multiack-nack-double-vote-refused tests=^TestMultiAckNacker_(NackAfterAllBranchesVoted_IsRefused|DoubleVoteBeforeAllVoted_IsRefused)$
+		if m.voted[idx*m.branches+branch] {
+			return m.doubleVoteErr("nack", branch, idx)
+		}
+
+		if !m.nacked[idx] {
+			// The first nack's record, error and task ID stand for the DLQ
+			// entry; a second branch's nack only counts as a vote.
+			m.nacked[idx] = true
+			m.record[idx] = ob.records[i]
+			m.nackErr[idx] = ob.recordStatuses[i].Error
+			m.nackTaskID[idx] = taskID
+		}
+		m.voteLocked(branch, idx)
+	}
+
+	return m.releaseLocked(ctx)
+}
+
+// voteLocked counts branch's vote for positions[idx] and makes it terminal
+// (releasable) once all m.branches have voted. Must be called with m.mu held.
+func (m *multiAckNacker) voteLocked(branch, idx int) {
+	m.voted[idx*m.branches+branch] = true
+	m.votes[idx]++
+	if m.votes[idx] == m.branches {
+		m.terminal[idx] = true
+	}
+}
+
+// doubleVoteErr reports a second vote from branch for positions[idx]. That
+// breaks requirement 3: counting it could make the position terminal without
+// a sibling's vote (an early ack) or flip a decided outcome, so it fails the
+// pipeline instead of being ignored. The vote is not counted.
+func (m *multiAckNacker) doubleVoteErr(kind string, branch, idx int) error {
+	return cerrors.Errorf("%s vote from branch %d of %d for position (hash %s): %w",
+		kind, branch, m.branches, log.KeyHash(m.positions[idx]), errDoubleVote)
+}
+
+// releaseFailedErr is what every vote returns after a release to the parent
+// failed (requirement 6). It wraps m.err, so cerrors.Is and
+// cerrors.IsFatalError see the original error. Must be called with m.mu held.
+func (m *multiAckNacker) releaseFailedErr() error {
+	return cerrors.Errorf("fan-out: an earlier release of this batch to the source failed, refusing the vote: %w", m.err)
+}
+
+// releaseLocked walks the positions starting at m.released and forwards
+// every leading run of terminal positions to the parent, stopping at the
+// first position that hasn't reached a terminal decision yet. Must be called
+// with m.mu held.
+//
+// Invariant 4 (enforcement site): positions are only ever released as a
+// prefix, in ascending source order — m.released only ever moves forward,
+// and never past a position that is not yet terminal - so the parent (and
+// transitively Source.Ack's monotonically-advancing State.Position) never
+// observes a position out of order or skips over one still in flight.
+//
+// Contiguous ack runs are coalesced into a single parent.Ack call to
+// preserve the parent's batch semantics (fewer, larger Source.Ack calls).
+// Nacks are released one position at a time: parent.Nack takes a single
+// taskID for the whole batch it's given (used for DLQ metadata on every
+// record in that call), and a run of nacked positions can legitimately come
+// from different branches/tasks. Coalescing them under one taskID would
+// misattribute the DLQ failure reason for some records. Nacks are the
+// exceptional, rare path, so the extra parent calls are an acceptable
+// tradeoff for that correctness.
+func (m *multiAckNacker) releaseLocked(ctx context.Context) error {
+	for m.released < len(m.positions) {
+		if !m.terminal[m.released] {
+			return nil
+		}
+
+		if !m.nacked[m.released] {
+			from := m.released
+			to := from
+			for to < len(m.positions) && m.terminal[to] && !m.nacked[to] {
+				to++
+			}
+
+			if err := m.parent.Ack(ctx, m.ackBatch(from, to)); err != nil {
+				// Requirement 6: final. A later vote must not retry it.
+				m.err = err
+				return err
+			}
+			m.released = to
+			continue
+		}
+
+		idx := m.released
+		if err := m.parent.Nack(ctx, m.nackBatch(idx), m.nackTaskID[idx]); err != nil {
+			// Requirement 5: a fatal DLQ error (nack threshold exceeded)
+			// must surface exactly like it does on the single-destination
+			// path, so the branch pool errors out and the worker tombs.
+			// Requirement 6: final. A later vote must not call parent.Nack
+			// for this position again (a second DLQ entry, a second count
+			// in the nack window).
+			m.err = err
+			return err
+		}
+		m.released = idx + 1
+	}
+	return nil
+}
+
+// ackBatch builds a Batch representing the already-resolved, all-branches-
+// acked positions [from, to) for a parent.Ack call. The result carries no
+// split records (they were already collapsed by Ack/Nack via
+// batch.originalBatch()), so the parent's own originalBatch() call is a
+// no-op on it.
+func (m *multiAckNacker) ackBatch(from, to int) *Batch {
+	return &Batch{
+		records:        m.record[from:to],
+		recordStatuses: make([]RecordStatus, to-from), // zero value is RecordFlagAck
+		positions:      m.positions[from:to],
+	}
+}
+
+// nackBatch builds a single-record Batch for positions[idx], which some
+// branch nacked, for a parent.Nack call.
+func (m *multiAckNacker) nackBatch(idx int) *Batch {
+	return &Batch{
+		records:        []opencdc.Record{m.record[idx]},
+		recordStatuses: []RecordStatus{{Flag: RecordFlagNack, Error: m.nackErr[idx]}},
+		positions:      []opencdc.Position{m.positions[idx]},
+		tainted:        true,
+	}
+}

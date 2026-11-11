@@ -1,0 +1,44 @@
+# govulncheck baseline — vulnerabilities this codebase's call graph can REACH today.
+#
+# This file is the gate. .github/workflows/govulncheck.yml fails when a scan
+# finds a called-level vulnerability that is NOT listed here. Pre-existing
+# findings do not fail the build; a NEW one does.
+#
+# That is deliberate. Flipping straight to "fail on any finding" with 24 open
+# would have failed every PR for problems unrelated to its diff, and a check
+# that is always red is a check nobody reads. A report-only job has the
+# opposite failure: it is always green, so the only signal is a job summary
+# nobody opens on a green run. The ratchet is the version that actually bites:
+# it cannot go up silently.
+#
+# WHEN A SCAN FAILS: a new vulnerability became reachable. Fix it if you can
+# (bump the dependency, bump the toolchain, stop calling the vulnerable path).
+# Only add an ID here if it genuinely cannot be fixed right now, and write the
+# reason on the line above it. An entry with no justification is a bug.
+#
+# WHEN THE COUNT DROPS: the job says so and asks you to delete the cleared
+# lines. It does not fail — a shrinking list is the point — but leaving stale
+# entries lets a fixed vulnerability silently come back.
+#
+# Format: one GO-XXXX-NNNN per line. `#` comments and blank lines ignored.
+#
+# Baseline captured 2026-08-21 against main (24 findings). The 20 Go standard
+# library entries were cleared on 2026-10-07 by bumping go.mod to go 1.25.14;
+# every one was fixed in a 1.25.x patch release (1.25.9 through 1.25.13). The 3
+# hamba/avro entries (GO-2026-5046/5047/5048) were cleared on 2026-10-16 by the
+# v0.21 connector fleet move off hamba/avro onto iskorotkov/avro (#2817, #3012).
+
+# ---------------------------------------------------------------------------
+# Blind spot: go.mod replaces github.com/dop251/goja with the ConduitIO/goja
+# fork (dop251/goja#816) so govulncheck looks advisories up under
+# github.com/ConduitIO/goja and cannot report ones filed against dop251/goja.
+# Watch upstream goja advisories by hand until the replace is dropped.
+# ---------------------------------------------------------------------------
+# golang.org/x/crypto (1 finding)
+#
+# The openpgp package is unmaintained and "unsafe by design" per its own
+# advisory — there is no fixed version, only "stop using it." Indirect; needs
+# tracing to whichever dependency pulls it in before it can be dropped.
+# ---------------------------------------------------------------------------
+# The golang.org/x/crypto/openpgp package is unmaintained, unsafe by design, and has known security issues
+GO-2026-5932

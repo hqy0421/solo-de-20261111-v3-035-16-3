@@ -1,0 +1,32 @@
+name: validate-generated-files
+
+on:
+  push:
+    branches: [ main, 'release/**' ]
+  pull_request:
+
+env:
+  # Resolve ConduitIO modules directly from GitHub (skips proxy.golang.org +
+  # sum.golang.org index lag on fresh tags); third-party deps still use both.
+  GOPRIVATE: github.com/conduitio/*
+  GONOSUMDB: github.com/conduitio/*
+
+jobs:
+  validate-generated-files:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: 'go.mod'
+
+      - name: Check generated files
+        env:
+          BUF_TOKEN: ${{ secrets.BUF_TOKEN }}
+        run: |
+          export PATH=$PATH:$(go env GOPATH)/bin
+          make install-tools proto-generate generate
+          git diff
+          git diff --exit-code --numstat

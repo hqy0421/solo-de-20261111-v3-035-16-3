@@ -1,0 +1,314 @@
+// Copyright © 2023 Meroxa, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package builtin
+
+import (
+	"context"
+	"fmt"
+	"runtime/debug"
+	"sync"
+
+	sdk "github.com/conduitio/conduit-processor-sdk"
+	"github.com/conduitio/conduit-processor-sdk/pprocutils"
+	"github.com/conduitio/conduit/pkg/foundation/cerrors"
+	"github.com/conduitio/conduit/pkg/foundation/cerrors/conduiterr"
+	"github.com/conduitio/conduit/pkg/foundation/ctxutil"
+	"github.com/conduitio/conduit/pkg/foundation/log"
+	"github.com/conduitio/conduit/pkg/plugin"
+	"github.com/conduitio/conduit/pkg/plugin/processor/builtin/impl"
+	"github.com/conduitio/conduit/pkg/plugin/processor/builtin/impl/avro"
+	"github.com/conduitio/conduit/pkg/plugin/processor/builtin/impl/base64"
+	"github.com/conduitio/conduit/pkg/plugin/processor/builtin/impl/cohere"
+	"github.com/conduitio/conduit/pkg/plugin/processor/builtin/impl/custom"
+	"github.com/conduitio/conduit/pkg/plugin/processor/builtin/impl/field"
+	"github.com/conduitio/conduit/pkg/plugin/processor/builtin/impl/json"
+	"github.com/conduitio/conduit/pkg/plugin/processor/builtin/impl/ollama"
+	"github.com/conduitio/conduit/pkg/plugin/processor/builtin/impl/openai"
+	"github.com/conduitio/conduit/pkg/plugin/processor/builtin/impl/protobuf"
+	"github.com/conduitio/conduit/pkg/plugin/processor/builtin/impl/unwrap"
+	"github.com/conduitio/conduit/pkg/plugin/processor/builtin/impl/webhook"
+	"github.com/conduitio/conduit/pkg/plugin/processor/egress"
+	"github.com/conduitio/conduit/pkg/plugin/processor/procutils"
+	"github.com/conduitio/conduit/pkg/schemaregistry"
+)
+
+var DefaultBuiltinProcessors = map[string]ProcessorPluginConstructor{
+	"avro.decode":         Constructor(avro.NewDecodeProcessor),
+	"avro.encode":         Constructor(avro.NewEncodeProcessor),
+	"base64.decode":       Constructor(base64.NewDecodeProcessor),
+	"base64.encode":       Constructor(base64.NewEncodeProcessor),
+	"clone":               Constructor(impl.NewCloneProcessor),
+	"cohere.command":      Constructor(cohere.NewCommandProcessor),
+	"cohere.embed":        Constructor(cohere.NewEmbedProcessor),
+	"cohere.rerank":       Constructor(cohere.NewRerankProcessor),
+	"custom.javascript":   Constructor(custom.NewJavascriptProcessor),
+	"error":               Constructor(impl.NewErrorProcessor),
+	"filter":              Constructor(impl.NewFilterProcessor),
+	"field.convert":       Constructor(field.NewConvertProcessor),
+	"field.exclude":       Constructor(field.NewExcludeProcessor),
+	"field.rename":        Constructor(field.NewRenameProcessor),
+	"field.set":           Constructor(field.NewSetProcessor),
+	"json.decode":         Constructor(json.NewDecodeProcessor),
+	"json.encode":         Constructor(json.NewEncodeProcessor),
+	"ollama.request":      Constructor(ollama.NewOllamaProcessor),
+	"openai.embed":        Constructor(openai.NewEmbeddingsProcessor),
+	"protobuf.decode":     Constructor(protobuf.NewDecodeProcessor),
+	"openai.textgen":      Constructor(openai.NewTextgenProcessor),
+	"split":               Constructor(impl.NewSplitProcessor),
+	"unwrap.debezium":     Constructor(unwrap.NewDebeziumProcessor),
+	"unwrap.kafkaconnect": Constructor(unwrap.NewKafkaConnectProcessor),
+	"unwrap.opencdc":      Constructor(unwrap.NewOpenCDCProcessor),
+	"webhook.http":        Constructor(webhook.NewHTTPProcessor),
+}
+
+func Constructor[T sdk.Processor](p func(log.CtxLogger) T) ProcessorPluginConstructor {
+	return func(logger log.CtxLogger) sdk.Processor { return p(logger) }
+}
+
+type schemaRegistryProcessor interface {
+	SetSchemaRegistry(schemaregistry.Registry)
+}
+
+type dialGuardProcessor interface {
+	SetDialGuard(*egress.DialGuard)
+}
+
+type fileAccessProcessor interface {
+	SetFileAccess(custom.FileAccess)
+}
+
+// RegistryOption configures a Registry.
+type RegistryOption func(*Registry)
+
+// WithDialGuard sets the egress dial guard handed to every built-in processor
+// that opens outbound connections (webhook.http, ollama.request, openai.*,
+// cohere.*). Without it they use the default guard: private, loopback,
+// link-local and metadata ranges blocked, no exemption.
+func WithDialGuard(g *egress.DialGuard) RegistryOption {
+	return func(r *Registry) { r.dialGuard = g }
+}
+
+// WithJavaScriptFileAccess sets the files custom.javascript may read. Without
+// it the processor reads no file and has no require().
+func WithJavaScriptFileAccess(fa custom.FileAccess) RegistryOption {
+	return func(r *Registry) { r.jsFiles = fa }
+}
+
+type Registry struct {
+	logger log.CtxLogger
+
+	dialGuard *egress.DialGuard
+	jsFiles   custom.FileAccess
+
+	// plugins stores plugin blueprints in a 2D map, first key is the plugin
+	// name, the second key is the plugin version
+	plugins        map[string]map[string]blueprint
+	schemaRegistry schemaregistry.Registry
+	// schemaService is this runtime's schema service. It is attached to the
+	// context of every call into a processor this registry creates.
+	schemaService pprocutils.SchemaService
+}
+
+type blueprint struct {
+	fullName      plugin.FullName
+	specification sdk.Specification
+	constructor   ProcessorPluginConstructor
+}
+
+type ProcessorPluginConstructor func(log.CtxLogger) sdk.Processor
+
+// pprocutilsLoggerOnce bounds the SDK's process-wide logger assignment to at
+// most once per process (#3111). NewRegistry runs once per runtime, so two
+// concurrent NewRuntime calls would otherwise race on pprocutils.Logger.
+var pprocutilsLoggerOnce sync.Once
+
+func NewRegistry(
+	logger log.CtxLogger,
+	constructors map[string]ProcessorPluginConstructor,
+	schemaRegistry schemaregistry.Registry,
+	opts ...RegistryOption,
+) *Registry {
+	// Built-in processors resolve schemas through the processor SDK's
+	// package-level service. It is installed once per process as a router
+	// that answers each call from the registry of the runtime the calling
+	// processor belongs to (see schema_scope.go, issue #3088).
+	installScopedSchemaService()
+	// The SDK logger stays process-wide: with two runtimes in one process,
+	// built-in processors log through the first runtime's logger. It is set at
+	// most once per process so concurrent NewRegistry/NewRuntime don't race on
+	// pprocutils.Logger (#3111); routing to the owning runtime's logger is the
+	// v0.21 embed-hardening follow-up (#3002). Documented as a known
+	// limitation in the root doc.go.
+	pprocutilsLoggerOnce.Do(func() {
+		pprocutils.Logger = logger.WithComponent("processor").
+			ZerologWithComponent().
+			Hook(ctxutil.ProcessorIDLogCtxHook{})
+	})
+
+	logger = logger.WithComponent("plugin.processor.builtin.Registry")
+	buildInfo, ok := debug.ReadBuildInfo()
+	if !ok {
+		// we are using modules, build info should always be available, we are staying on the safe side
+		logger.Warn(context.Background()).Msg("build info not available, built-in plugin versions may not be read correctly")
+		buildInfo = &debug.BuildInfo{} // prevent nil pointer exceptions
+	}
+
+	r := &Registry{
+		plugins:        loadPlugins(buildInfo, constructors),
+		logger:         logger,
+		schemaRegistry: schemaRegistry,
+		schemaService:  procutils.NewSchemaService(logger, schemaRegistry),
+	}
+	for _, opt := range opts {
+		opt(r)
+	}
+	logger.Info(context.Background()).Int("count", len(r.List())).Msg("builtin processor plugins initialized")
+	return r
+}
+
+func loadPlugins(buildInfo *debug.BuildInfo, constructors map[string]ProcessorPluginConstructor) map[string]map[string]blueprint {
+	plugins := make(map[string]map[string]blueprint, len(constructors))
+	for moduleName, constructor := range constructors {
+		specs, err := getSpecification(moduleName, constructor, buildInfo)
+		if err != nil {
+			// stop initialization if a built-in plugin is misbehaving
+			panic(err)
+		}
+
+		versionMap := plugins[specs.Name]
+		if versionMap == nil {
+			versionMap = make(map[string]blueprint)
+			plugins[specs.Name] = versionMap
+		}
+
+		fullName := newFullName(specs.Name, specs.Version)
+		if _, ok := versionMap[specs.Version]; ok {
+			panic(cerrors.Errorf("plugin %q already registered", fullName))
+		}
+
+		bp := blueprint{
+			fullName:      fullName,
+			constructor:   constructor,
+			specification: specs,
+		}
+		versionMap[specs.Version] = bp
+
+		latestBp, ok := versionMap[plugin.PluginVersionLatest]
+		if !ok || fullName.PluginVersionGreaterThan(latestBp.fullName) {
+			versionMap[plugin.PluginVersionLatest] = bp
+		}
+	}
+	return plugins
+}
+
+func getSpecification(moduleName string, constructor ProcessorPluginConstructor, buildInfo *debug.BuildInfo) (sdk.Specification, error) {
+	procPlugin := constructor(log.CtxLogger{})
+	specs, err := procPlugin.Specification()
+	if err != nil {
+		return sdk.Specification{}, err
+	}
+
+	if version := getModuleVersion(buildInfo.Deps, moduleName); version != "" {
+		// overwrite version with the import version
+		specs.Version = version
+	}
+
+	return specs, nil
+}
+
+func getModuleVersion(deps []*debug.Module, moduleName string) string {
+	for _, dep := range deps {
+		if dep.Path == moduleName {
+			if dep.Replace != nil {
+				return dep.Replace.Version
+			}
+			return dep.Version
+		}
+	}
+	return ""
+}
+
+func newFullName(pluginName, pluginVersion string) plugin.FullName {
+	return plugin.NewFullName(plugin.PluginTypeBuiltin, pluginName, pluginVersion)
+}
+
+// NewProcessor builds a built-in processor. The egressPolicy argument exists to
+// satisfy the shared registry interface and is ignored: it is the WASM
+// host-egress policy (an allowlist for sandboxed guests). Built-in processors
+// are compiled into the core binary with full net/http, so their outbound
+// connections are governed by the Registry's DialGuard instead (set with
+// WithDialGuard), which every processor that dials out receives here.
+func (r *Registry) NewProcessor(_ context.Context, fullName plugin.FullName, id string, _ egress.Policy) (sdk.Processor, error) {
+	versionMap, ok := r.plugins[fullName.PluginName()]
+	if !ok {
+		// Invariant: errors.Is(err, plugin.ErrPluginNotFound) still holds — the
+		// sentinel is wrapped, and the ConduitError adds the machine-actionable code.
+		err := conduiterr.Wrap(
+			conduiterr.CodeProcessorPluginNotFound,
+			fmt.Sprintf("builtin processor plugin %q not found", fullName.PluginName()),
+			plugin.ErrPluginNotFound,
+		)
+		err.Suggestion = "check the plugin name and version"
+		return nil, err
+	}
+	b, ok := versionMap[fullName.PluginVersion()]
+	if !ok {
+		availableVersions := make([]string, 0, len(versionMap))
+		for k := range versionMap {
+			availableVersions = append(availableVersions, k)
+		}
+		err := conduiterr.Wrap(
+			conduiterr.CodeProcessorPluginNotFound,
+			fmt.Sprintf("builtin processor plugin %q not found; available versions: %v", fullName, availableVersions),
+			plugin.ErrPluginNotFound,
+		)
+		err.Suggestion = "check the plugin version, or omit it to use the latest"
+		return nil, err
+	}
+
+	p := b.constructor(r.logger)
+	if sr, setSR := p.(schemaRegistryProcessor); setSR {
+		sr.SetSchemaRegistry(r.schemaRegistry)
+	}
+	if dg, ok := p.(dialGuardProcessor); ok {
+		dg.SetDialGuard(r.dialGuard)
+	}
+	if fa, ok := p.(fileAccessProcessor); ok {
+		fa.SetFileAccess(r.jsFiles)
+	}
+
+	// Apply default middleware since built-in processors are created
+	// without the middleware applied.
+	// This is done by Conduit only for the built-in processors.
+	// In the standalone processors, the Run() method adds the middleware.
+	p = sdk.ProcessorWithMiddleware(p, sdk.DefaultProcessorMiddleware(p.MiddlewareOptions()...)...)
+	// attach processor ID for logs and this runtime's schema service
+	p = newProcessorWithID(p, id, r.schemaService)
+
+	return p, nil
+}
+
+func (r *Registry) List() map[plugin.FullName]sdk.Specification {
+	specs := make(map[plugin.FullName]sdk.Specification, len(r.plugins))
+	for _, versions := range r.plugins {
+		for version, bp := range versions {
+			if version == plugin.PluginVersionLatest {
+				continue // skip latest versions
+			}
+			specs[bp.fullName] = bp.specification
+		}
+	}
+	return specs
+}

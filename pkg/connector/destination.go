@@ -1,0 +1,578 @@
+// Copyright © 2022 Meroxa, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package connector
+
+import (
+	"context"
+	"strings"
+	"sync"
+
+	"github.com/conduitio/conduit-commons/opencdc"
+	"github.com/conduitio/conduit-connector-protocol/pconnector"
+	"github.com/conduitio/conduit/pkg/foundation/cerrors"
+	"github.com/conduitio/conduit/pkg/foundation/log"
+	"github.com/conduitio/conduit/pkg/plugin"
+	connectorPlugin "github.com/conduitio/conduit/pkg/plugin/connector"
+	"github.com/conduitio/conduit/pkg/schemaregistry"
+)
+
+type Destination struct {
+	Instance *Instance
+
+	dispenser connectorPlugin.Dispenser
+	plugin    connectorPlugin.DestinationPlugin
+
+	// errs is used to signal the node that the connector experienced an error
+	// when it was processing something asynchronously (e.g. persisting state).
+	errs chan error
+	// persistErrs delivers persister failures to errs without ever blocking
+	// a persister callback forever (see persistErrReporter). Stopped when
+	// Teardown starts and when Open fails after registering a persist.
+	// Created in Instance.Connector.
+	persistErrs *persistErrReporter
+	// pendingPersistErr holds a persist failure that could not be delivered
+	// on errs, returned by Teardown. Guarded by pendingMu.
+	pendingMu         sync.Mutex
+	pendingPersistErr error
+
+	// stream is the stream used to exchange records and acks with the
+	// destination plugin.
+	stream pconnector.DestinationRunStreamClient
+
+	// stopStream is a function that closes the context of the stream.
+	stopStream context.CancelFunc
+
+	// wg tracks the number of in flight calls to the connectorPlugin.
+	wg sync.WaitGroup
+
+	// pendingRecv holds the result channel of a stream.Recv started by an Ack
+	// whose context ended before the call returned. The next Ack consumes it
+	// instead of starting a new receive, so no ack response is lost or read
+	// twice. Only accessed by Ack, which must not be called concurrently.
+	pendingRecv <-chan destinationRecvResult
+
+	// pluginBatchingOverrides lists the sdk.batch.* keys configure sets to
+	// "0" before Configure, so the connector SDK's own batcher stays off while
+	// the arch-v2 funnel batches the writes itself. Only the arch-v2 engine
+	// sets it (SetPluginBatchingOverrides); the classic engine passes the
+	// settings through verbatim. See docs/design-documents/
+	// 20261103-archv2-destination-batch-timing.md, Decision 2.
+	pluginBatchingOverrides []string
+}
+
+type DestinationState struct {
+	Positions map[string]opencdc.Position
+}
+
+type DestinationAck struct {
+	Position opencdc.Position
+	Error    error
+}
+
+func (d *Destination) ID() string {
+	return d.Instance.ID
+}
+
+// SetPluginBatchingOverrides tells configure to hand the plugin "0" for each
+// of keys (sdk.batch.size, sdk.batch.delay) instead of the value the settings
+// would give it. The arch-v2 engine calls it, before Open, for every key whose
+// effective value, from the pipeline config or the connector's spec default,
+// would turn the connector SDK's batcher on: the engine batches the writes
+// itself, and a plugin batcher behind it would withhold acks that the funnel's
+// stop-and-wait loop waits for (#3321).
+//
+// configure replaces the value of every settings key that matches a listed key
+// after trimming (the SDK trims keys), and adds the plain key when none
+// matches. The engine lists only keys the plugin's spec declares, so an added
+// key is never one the plugin rejects as unrecognised. "0" rather than an
+// absent key: the SDK applies the connector's own default to a missing or
+// empty key, which is what turned S3's 1000 / 1 s batcher back on.
+//
+// It is not safe to call concurrently with Open.
+func (d *Destination) SetPluginBatchingOverrides(keys ...string) {
+	d.pluginBatchingOverrides = append([]string(nil), keys...)
+}
+
+// Specification returns the specification of the plugin this destination
+// will dispense, as resolved by the registry together with the dispenser, and
+// false if the dispenser carries none (see
+// connectorPlugin.DispenserSpecification). It starts no plugin.
+func (d *Destination) Specification() (pconnector.Specification, bool) {
+	return connectorPlugin.DispenserSpecification(d.dispenser)
+}
+
+func (d *Destination) Errors() <-chan error {
+	return d.errs
+}
+
+func (d *Destination) Open(ctx context.Context) (err error) {
+	d.Instance.Lock()
+	defer d.Instance.Unlock()
+	if d.Instance.connector != nil {
+		// this shouldn't actually happen, it indicates a problem elsewhere
+		return cerrors.New("another instance of the connector is already running")
+	}
+
+	d.Instance.logger.Debug(ctx).Msg("dispensing destination connector plugin")
+	d.plugin, err = d.dispenser.DispenseDestination()
+	if err != nil {
+		return err
+	}
+
+	defer func() {
+		// ensure the plugin gets torn down if something bad happens
+		if err != nil {
+			// The node does not call Teardown after a failed Open, so nothing
+			// will read errs: a lifecycle-event persist registered below
+			// must not block its persister callback on it (#2925).
+			d.persistErrs.stop()
+			_, tdErr := d.plugin.Teardown(ctx, pconnector.DestinationTeardownRequest{})
+			if tdErr != nil {
+				d.Instance.logger.Err(ctx, tdErr).Msg("could not tear down destination connector plugin")
+			}
+			d.plugin = nil
+		}
+	}()
+
+	err = d.configure(ctx)
+	if err != nil {
+		return err
+	}
+
+	// TODO add proper support for lifecycle events to DLQs (see https://github.com/ConduitIO/conduit/issues/1016#issuecomment-1535119773)
+	if d.Instance.ProvisionedBy != ProvisionTypeDLQ {
+		var lifecycleEventTriggered bool
+		lifecycleEventTriggered, err = d.triggerLifecycleEvent(ctx, d.Instance.LastActiveConfig.Settings, d.Instance.Config.Settings)
+		if err != nil {
+			return err
+		}
+
+		if lifecycleEventTriggered {
+			// when a lifecycle event is successfully triggered we consider the config active
+			d.Instance.LastActiveConfig = d.Instance.Config
+			// persist connector in the next batch to store last active config
+			err = d.Instance.persister.Persist(ctx, d.Instance, 1, func(err error) {
+				if err != nil {
+					d.reportPersistError(err)
+				}
+			})
+			if err != nil {
+				return err
+			}
+		}
+	}
+
+	err = d.open(ctx)
+	if err != nil {
+		return err
+	}
+
+	err = d.run(ctx)
+	if err != nil {
+		return err
+	}
+
+	d.Instance.logger.Info(ctx).Msg("destination connector plugin successfully started")
+
+	d.Instance.connector = d
+	if d.Instance.ProvisionedBy != ProvisionTypeDLQ {
+		// DLQ connectors are not persisted
+		d.Instance.persister.ConnectorStarted()
+	}
+
+	return nil
+}
+
+func (d *Destination) Stop(ctx context.Context, lastPosition opencdc.Position) error {
+	cleanup, err := d.preparePluginCall()
+	defer cleanup()
+	if err != nil {
+		return err
+	}
+
+	d.Instance.logger.Debug(ctx).
+		Str(log.RecordPositionHashField, log.KeyHash(lastPosition)).
+		Msg("sending stop signal to destination connector plugin")
+	_, err = d.plugin.Stop(ctx, pconnector.DestinationStopRequest{LastPosition: lastPosition})
+	if err != nil {
+		return cerrors.Errorf("could not stop destination plugin: %w", err)
+	}
+
+	d.Instance.logger.Debug(ctx).Msg("destination connector plugin successfully responded to stop signal")
+	return nil
+}
+
+// Teardown closes the destination's stream and plugin. It returns an error if
+// a persist failure for this destination arrived after errs stopped being
+// read (see reportPersistError), even when the plugin tore down cleanly.
+func (d *Destination) Teardown(ctx context.Context) error {
+	// From here on nothing reads errs; persist failures are kept instead.
+	d.persistErrs.stop()
+
+	// lock destination as we are about to mutate the plugin field
+	d.Instance.Lock()
+	defer d.Instance.Unlock()
+	if d.plugin == nil {
+		return plugin.ErrPluginNotRunning
+	}
+
+	// close stream
+	if d.stopStream != nil {
+		d.stopStream()
+	}
+
+	// wait for any calls to the plugin to stop running first (e.g. Stop, Ack or Write)
+	d.wg.Wait()
+
+	d.Instance.logger.Debug(ctx).Msg("tearing down destination connector plugin")
+	_, err := d.plugin.Teardown(ctx, pconnector.DestinationTeardownRequest{})
+
+	d.plugin = nil
+	d.pendingRecv = nil
+	d.Instance.connector = nil
+	if d.Instance.ProvisionedBy != ProvisionTypeDLQ {
+		// DLQ connectors are not persisted
+		d.Instance.persister.ConnectorStopped()
+	}
+
+	d.pendingMu.Lock()
+	persistErr := d.pendingPersistErr
+	d.pendingMu.Unlock()
+	if persistErr != nil {
+		persistErr = cerrors.Errorf("failed to persist destination connector state: %w", persistErr)
+	}
+
+	if err != nil {
+		return cerrors.Join(cerrors.Errorf("could not tear down destination connector plugin: %w", err), persistErr)
+	}
+	if persistErr != nil {
+		return persistErr
+	}
+
+	d.Instance.logger.Info(ctx).Msg("destination connector plugin successfully torn down")
+	return nil
+}
+
+// reportPersistError surfaces a failed state write for this destination on
+// errs while the node reads it. Once persistErrs is stopped it keeps the
+// error for Teardown instead, so the persister callback it runs in never
+// blocks forever (see persistErrReporter).
+func (d *Destination) reportPersistError(err error) {
+	if d.persistErrs.send(err) {
+		return
+	}
+	d.pendingMu.Lock()
+	d.pendingPersistErr = cerrors.Join(d.pendingPersistErr, err)
+	d.pendingMu.Unlock()
+	d.Instance.logger.Err(context.Background(), err).
+		Msg("failed to persist destination connector state while stopping")
+}
+
+func (d *Destination) Write(ctx context.Context, recs []opencdc.Record) error {
+	cleanup, err := d.preparePluginCall()
+	defer cleanup()
+	if err != nil {
+		return err
+	}
+
+	if d.stream == nil {
+		return cerrors.Errorf("destination stream not open: %w", connectorPlugin.ErrStreamNotOpen)
+	}
+
+	d.Instance.inspector.Send(ctx, recs)
+	err = d.stream.Send(pconnector.DestinationRunRequest{Records: recs})
+	if err != nil {
+		return cerrors.Errorf("error writing record: %w", err)
+	}
+
+	return nil
+}
+
+// Ack returns the next ack response from the destination. It returns when
+// ctx is done, not only when the stream's own context ends; a receive abandoned
+// that way stays pending and is picked up by the next Ack.
+func (d *Destination) Ack(ctx context.Context) ([]DestinationAck, error) {
+	cleanup, err := d.preparePluginCall()
+	defer cleanup()
+	if err != nil {
+		return nil, err
+	}
+
+	// stream.Recv does not observe ctx, so it runs in its own goroutine and Ack
+	// selects on its result and ctx.Done().
+	if d.pendingRecv == nil {
+		d.pendingRecv = d.recv()
+	}
+	var res destinationRecvResult
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case res = <-d.pendingRecv:
+		d.pendingRecv = nil
+	}
+	resp, err := res.resp, res.err
+	if err != nil {
+		return nil, cerrors.Errorf("error receiving ack: %w", err)
+	}
+
+	acks := make([]DestinationAck, len(resp.Acks))
+	for i, ack := range resp.Acks {
+		acks[i] = DestinationAck{Position: ack.Position}
+		if ack.Error != "" {
+			// The ack error crossed the plugin protocol as a string. An
+			// SDK schema-middleware decode that hit the Avro element limit
+			// is tagged schema.avro.limit_exceeded here.
+			acks[i].Error = schemaregistry.ClassifyDecodeError(cerrors.New(ack.Error))
+		}
+	}
+	return acks, nil
+}
+
+type destinationRecvResult struct {
+	resp pconnector.DestinationRunResponse
+	err  error
+}
+
+// recv starts a stream.Recv call in a separate goroutine, tracked in wg so
+// Teardown waits for it (it returns once stopStream closes the stream). It must
+// only be called while a plugin call is in flight (see preparePluginCall).
+func (d *Destination) recv() <-chan destinationRecvResult {
+	ch := make(chan destinationRecvResult, 1)
+	stream := d.stream
+	d.wg.Add(1)
+	go func() {
+		defer d.wg.Done()
+		resp, err := stream.Recv()
+		ch <- destinationRecvResult{resp: resp, err: err}
+	}()
+	return ch
+}
+
+func (d *Destination) OnDelete(ctx context.Context) (err error) {
+	if d.Instance.LastActiveConfig.Settings == nil {
+		return nil // the connector was never started, nothing to trigger
+	}
+
+	d.Instance.Lock()
+	defer d.Instance.Unlock()
+
+	d.Instance.logger.Debug(ctx).Msg("dispensing destination connector plugin")
+	d.plugin, err = d.dispenser.DispenseDestination()
+	if err != nil {
+		return err
+	}
+
+	_, err = d.triggerLifecycleEvent(ctx, d.Instance.LastActiveConfig.Settings, nil)
+
+	// call teardown to close plugin regardless of the error
+	_, tdErr := d.plugin.Teardown(ctx, pconnector.DestinationTeardownRequest{})
+
+	d.plugin = nil
+
+	err = cerrors.LogOrReplace(err, tdErr, func() {
+		d.Instance.logger.Err(ctx, tdErr).Msg("could not tear down destination connector plugin")
+	})
+	if err != nil {
+		return cerrors.Errorf("could not trigger lifecycle event: %w", err)
+	}
+
+	return nil
+}
+
+// preparePluginCall makes sure the plugin is running and registers a new plugin
+// call in the wait group. The returned function should be called in a deferred
+// statement to signal the plugin call is over.
+func (d *Destination) preparePluginCall() (func(), error) {
+	d.Instance.RLock()
+	defer d.Instance.RUnlock()
+	if d.plugin == nil {
+		return func() { /* do nothing */ }, plugin.ErrPluginNotRunning
+	}
+	// increase wait group so Teardown knows a call to the plugin is running
+	d.wg.Add(1)
+	return d.wg.Done, nil
+}
+
+func (d *Destination) configure(ctx context.Context) error {
+	d.Instance.logger.Trace(ctx).Msg("configuring destination connector plugin")
+	settings, err := d.Instance.resolveSettings(d.Instance.Config.Settings)
+	if err != nil {
+		return cerrors.Errorf("could not resolve destination connector settings: %w", err)
+	}
+	// Invariant 1 (#3321): the arch-v2 engine batches these writes and acks a
+	// record upstream only after the plugin acks it; a plugin batcher behind
+	// the engine would withhold those acks (1 record/s behind a 1-record
+	// source). "0" keeps it off on every SDK release; deleting the key would
+	// bring the connector's own default back.
+	settings = applyPluginBatchingOverrides(settings, d.pluginBatchingOverrides)
+	_, err = d.plugin.Configure(ctx, pconnector.DestinationConfigureRequest{Config: settings})
+	if err != nil {
+		return cerrors.Errorf("could not configure destination connector plugin: %w", d.Instance.redactError(err))
+	}
+	return nil
+}
+
+func (d *Destination) open(ctx context.Context) error {
+	d.Instance.logger.Trace(ctx).Msg("opening destination connector plugin")
+	_, err := d.plugin.Open(ctx, pconnector.DestinationOpenRequest{})
+	if err != nil {
+		return cerrors.Errorf("could not open destination connector plugin: %w", d.Instance.redactError(err))
+	}
+	return nil
+}
+
+func (d *Destination) run(ctx context.Context) error {
+	d.Instance.logger.Trace(ctx).Msg("running destination connector plugin")
+	ctx, stopStream := context.WithCancel(ctx)
+	stream := d.plugin.NewStream()
+	err := d.plugin.Run(ctx, stream)
+	if err != nil {
+		stopStream()
+		return cerrors.Errorf("could not run destination connector plugin: %w", d.Instance.redactError(err))
+	}
+	d.stream = stream.Client()
+	d.stopStream = stopStream
+	return nil
+}
+
+func (d *Destination) triggerLifecycleEvent(ctx context.Context, oldConfig, newConfig map[string]string) (ok bool, err error) {
+	if d.isEqual(oldConfig, newConfig) {
+		return false, nil // nothing to do, last active config is the same as current one
+	}
+
+	// Invariant (settings boundary): the plugin gets the same vetted, resolved
+	// settings it gets in Configure, never the raw stored text. A refusal here
+	// (for example a ${VAR} the operator has not allowed) fails the event.
+	oldConfig, err = d.Instance.resolveEventSettings(oldConfig)
+	if err != nil {
+		if newConfig == nil {
+			// "deleted": a setting that no longer resolves (a ${VAR} that left
+			// env.allow, or a path outside the allowed directories) must not
+			// make the connector undeletable. The plugin is not told, so its
+			// own cleanup (for example dropping a replication slot) does not
+			// run and has to be done by hand. Only the error is logged, never
+			// a setting value.
+			d.Instance.logger.Warn(ctx).Err(err).
+				Msg("skipping lifecycle event \"deleted\" on destination connector plugin: its settings could not be resolved; plugin-side cleanup must be done manually")
+			return false, nil
+		}
+		return false, cerrors.Errorf("could not resolve the previous connector settings for the lifecycle event: %w", err)
+	}
+	newConfig, err = d.Instance.resolveEventSettings(newConfig)
+	if err != nil {
+		return false, cerrors.Errorf("could not resolve the connector settings for the lifecycle event: %w", err)
+	}
+
+	defer func() {
+		// Older connectors that predate the lifecycle methods return an
+		// "Unimplemented" gRPC status, which the protocol client unwraps into
+		// pconnector.ErrUnimplemented (a distinct sentinel from plugin.ErrUnimplemented,
+		// despite the identical message). Match pconnector's sentinel so we stay
+		// backwards compatible instead of fatally erroring. See issue #1999.
+		if cerrors.Is(err, pconnector.ErrUnimplemented) {
+			d.Instance.logger.Trace(ctx).Msg("lifecycle events not implemented on destination connector plugin (it's probably an older connector)")
+			err = nil // ignore error to stay backwards compatible
+		}
+	}()
+
+	switch {
+	// created
+	case oldConfig == nil && newConfig != nil:
+		d.Instance.logger.Trace(ctx).Msg("triggering lifecycle event \"created\" on destination connector plugin")
+		_, err := d.plugin.LifecycleOnCreated(ctx, pconnector.DestinationLifecycleOnCreatedRequest{Config: newConfig})
+		if err != nil {
+			return false, cerrors.Errorf("error while triggering lifecycle event \"created\": %w", err)
+		}
+		return true, nil
+
+	// updated
+	case oldConfig != nil && newConfig != nil:
+		d.Instance.logger.Trace(ctx).Msg("triggering lifecycle event \"updated\" on destination connector plugin")
+		_, err := d.plugin.LifecycleOnUpdated(ctx, pconnector.DestinationLifecycleOnUpdatedRequest{
+			ConfigBefore: oldConfig,
+			ConfigAfter:  newConfig,
+		})
+		if err != nil {
+			return false, cerrors.Errorf("error while triggering lifecycle event \"updated\": %w", err)
+		}
+		return true, nil
+
+	// deleted
+	case oldConfig != nil && newConfig == nil:
+		d.Instance.logger.Trace(ctx).Msg("triggering lifecycle event \"deleted\" on destination connector plugin")
+		_, err := d.plugin.LifecycleOnDeleted(ctx, pconnector.DestinationLifecycleOnDeletedRequest{Config: oldConfig})
+		// guard: connector-destination-delete-hook-marks-instance tests=^TestService_Restore_AfterDeleteHook$
+		if !cerrors.Is(err, pconnector.ErrUnimplemented) {
+			// Invariant 3 (#3137): the plugin got the event and may have
+			// released what the position refers to, even if it failed. A
+			// restored instance must not start from that position.
+			d.Instance.deleteHookRan = true
+		}
+		if err != nil {
+			return false, cerrors.Errorf("error while triggering lifecycle event \"deleted\": %w", err)
+		}
+		return true, nil
+
+	// default should never happen
+	default:
+		// oldConfig/newConfig are connector settings and routinely carry
+		// secrets (DB urls with embedded passwords, SASL credentials, access
+		// keys). log.RedactAll redacts every value until per-parameter
+		// sensitivity metadata exists - see pkg/foundation/log/redact.go.
+		d.Instance.logger.Warn(ctx).
+			Any("oldConfig", log.RedactAll(oldConfig)).
+			Any("newConfig", log.RedactAll(newConfig)).
+			Msg("unexpected combination of old and new config")
+		// don't return an error when no event was triggered, strictly speaking
+		// the action did not fail
+		return false, nil
+	}
+}
+
+func (*Destination) isEqual(cfg1, cfg2 map[string]string) bool {
+	if len(cfg1) != len(cfg2) {
+		return false
+	}
+	for k, v := range cfg1 {
+		if w, ok := cfg2[k]; !ok || v != w {
+			return false
+		}
+	}
+	return (cfg1 != nil) == (cfg2 != nil)
+}
+
+// applyPluginBatchingOverrides sets every key of settings that matches one of
+// keys after trimming to "0", and adds the plain key when none matches (see
+// SetPluginBatchingOverrides). settings is the resolved copy handed to
+// Configure, never the instance's stored config. It returns settings, or a new
+// map if settings is nil and there is a key to add.
+func applyPluginBatchingOverrides(settings map[string]string, keys []string) map[string]string {
+	if settings == nil && len(keys) > 0 {
+		settings = make(map[string]string, len(keys))
+	}
+	for _, key := range keys {
+		matched := false
+		for k := range settings {
+			if strings.TrimSpace(k) == key {
+				settings[k] = "0"
+				matched = true
+			}
+		}
+		if !matched {
+			settings[key] = "0"
+		}
+	}
+	return settings
+}

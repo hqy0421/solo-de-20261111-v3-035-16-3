@@ -1,0 +1,198 @@
+// Copyright © 2024 Meroxa, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package processor
+
+import (
+	"context"
+
+	"github.com/conduitio/conduit-commons/opencdc"
+	sdk "github.com/conduitio/conduit-processor-sdk"
+	"github.com/conduitio/conduit/pkg/foundation/cerrors"
+	"github.com/conduitio/conduit/pkg/foundation/env"
+	"github.com/conduitio/conduit/pkg/plugin/processor/egress"
+)
+
+// RunnableProcessor is a stream.Processor which has been
+// initialized and is ready to be used in a pipeline.
+type RunnableProcessor struct {
+	*Instance
+	proc sdk.Processor
+	cond *processorCondition
+
+	// envAllow is the operator's env.allow list: the only environment
+	// variables a ${VAR} reference in the processor settings may expand. nil
+	// allows none.
+	envAllow *env.Allowlist
+}
+
+func newRunnableProcessor(
+	proc sdk.Processor,
+	cond *processorCondition,
+	i *Instance,
+) *RunnableProcessor {
+	return &RunnableProcessor{
+		Instance: i,
+		proc:     proc,
+		cond:     cond,
+	}
+}
+
+func (p *RunnableProcessor) Open(ctx context.Context) error {
+	// Host-reserved sdk.egress.* keys are consumed host-side by
+	// Service.resolveEgressPolicy (from the instance's own Settings); strip them
+	// from the clone handed to the guest so a processor that strictly validates
+	// its declared parameters does not reject the operator's egress opt-in as an
+	// "unrecognized parameter". The guest must never see host-reserved config
+	// (design: 20260726-wasm-host-egress-capability.md).
+	settings, err := env.ResolveSettings(p.envAllow, p.Config.Settings)
+	if err != nil {
+		return cerrors.Errorf("could not resolve processor settings: %w", err)
+	}
+	// What the processor says about its settings reaches whoever wrote them:
+	// the expanded values of environment variables stay out of it.
+	exps := env.Expansions(p.envAllow, p.Config.Settings)
+	egress.StripReservedKeys(settings)
+
+	err = p.proc.Configure(ctx, settings)
+	if err != nil {
+		return cerrors.Errorf("failed configuring processor: %w", env.RedactError(err, exps))
+	}
+
+	err = p.proc.Open(ctx)
+	if err != nil {
+		return cerrors.Errorf("failed opening processor: %w", env.RedactError(err, exps))
+	}
+
+	return nil
+}
+
+func (p *RunnableProcessor) Process(ctx context.Context, records []opencdc.Record) []sdk.ProcessedRecord {
+	// Invariant 6: isolate the engine's records from the processor. A processor
+	// that mutates its input in place and then errors (custom.javascript, and any
+	// built-in that edits before failing) must not be able to corrupt the record
+	// the engine holds — that record is what the engine nacks and writes to the
+	// DLQ, and what sibling branches still see (#3153). Hand every processor a
+	// deep copy so a mutating-then-failing processor leaves the engine's record
+	// untouched by construction. Cost: one deep copy per record per invocation;
+	// raw payloads are a memcpy, and WASM processors already serialize, so they
+	// pay a redundant copy (see
+	// docs/design-documents/20261015-processor-input-isolation-for-dlq.md).
+	inputs := make([]opencdc.Record, len(records))
+	for i, rec := range records {
+		inputs[i] = rec.Clone()
+	}
+	records = inputs
+
+	p.inInsp.Send(ctx, records)
+
+	var outRecs []sdk.ProcessedRecord
+	if p.cond == nil {
+		outRecs = p.proc.Process(ctx, records)
+	} else {
+		// We need to first evaluate condition for each record.
+
+		// TODO reuse these slices or at least use a pool
+		// keptRecords are records that will be sent to the processor
+		keptRecords := make([]opencdc.Record, 0, len(records))
+		// passthroughRecordIndexes are indexes of records that are just passed
+		// through to the other side.
+		passthroughRecordIndexes := make([]int, 0, len(records))
+
+		var err error
+
+		for i, rec := range records {
+			var keep bool
+			keep, err = p.cond.Evaluate(rec)
+			if err != nil {
+				err = cerrors.Errorf("failed evaluating condition: %w", err)
+				break
+			}
+
+			if keep {
+				keptRecords = append(keptRecords, rec)
+			} else {
+				passthroughRecordIndexes = append(passthroughRecordIndexes, i)
+			}
+		}
+
+		if len(keptRecords) > 0 {
+			outRecs = p.proc.Process(ctx, keptRecords)
+			if len(outRecs) > len(keptRecords) {
+				return []sdk.ProcessedRecord{
+					sdk.ErrorRecord{Error: cerrors.New("processor returned more records than input")},
+				}
+			}
+		}
+		if err != nil {
+			outRecs = append(outRecs, sdk.ErrorRecord{Error: err})
+		}
+
+		// Add passthrough records back into the resultset and keep the
+		// original order of the records.
+		if len(passthroughRecordIndexes) == len(records) {
+			// Optimization for the case where no records are kept
+			outRecs = make([]sdk.ProcessedRecord, len(records))
+			for i, rec := range records {
+				outRecs[i] = sdk.SingleRecord(rec)
+			}
+		} else if len(passthroughRecordIndexes) > 0 {
+			tmp := make([]sdk.ProcessedRecord, len(outRecs)+len(passthroughRecordIndexes))
+			prevIndex := -1
+			for i, index := range passthroughRecordIndexes {
+				// TODO index-i can be out of bounds if the processor returns
+				//  fewer records than the input.
+				copy(tmp[prevIndex+1:index], outRecs[prevIndex-i+1:index-i])
+				tmp[index] = sdk.SingleRecord(records[index])
+				prevIndex = index
+			}
+			// if the last index is not the last record, copy the rest
+			if passthroughRecordIndexes[len(passthroughRecordIndexes)-1] != len(tmp)-1 {
+				copy(tmp[prevIndex+1:], outRecs[prevIndex-len(passthroughRecordIndexes)+1:])
+			}
+			outRecs = tmp
+		}
+	}
+
+	inspectorRecs := make([]opencdc.Record, 0, len(outRecs))
+	for _, outRec := range outRecs {
+		singleRec, ok := outRec.(sdk.SingleRecord)
+		if ok {
+			inspectorRecs = append(inspectorRecs, opencdc.Record(singleRec))
+		}
+	}
+	p.outInsp.Send(ctx, inspectorRecs)
+
+	return outRecs
+}
+
+func (p *RunnableProcessor) Teardown(ctx context.Context) error {
+	err := p.proc.Teardown(ctx)
+	p.running.Store(false)
+	return err
+}
+
+// TeardownForReconfigure tears down the processor plugin WITHOUT clearing the
+// shared Instance.running flag. It exists for the live in-place reconfigure swap
+// (ProcessorNode.applyPendingSwap), where a RunnableProcessor is torn down but
+// the underlying Instance stays running via the other runnable in the swap: on
+// success the new runnable takes over; on a failed open the old runnable keeps
+// running. Because both runnables embed the SAME *Instance, the plain Teardown's
+// `running = false` would wrongly mark the still-running instance stopped —
+// disarming the Update/Delete running-guards (service.go) for the rest of the
+// pipeline's life. Only a real pipeline stop, which tears down the node's
+// current processor via the plain Teardown, may clear running.
+func (p *RunnableProcessor) TeardownForReconfigure(ctx context.Context) error {
+	return p.proc.Teardown(ctx)
+}

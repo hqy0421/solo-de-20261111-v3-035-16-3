@@ -1,0 +1,350 @@
+// Copyright © 2022 Meroxa, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package standalone
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"path"
+	"path/filepath"
+	"strconv"
+	"sync"
+
+	"github.com/conduitio/conduit-connector-protocol/pconnector"
+	"github.com/conduitio/conduit-connector-protocol/pconnector/client"
+	"github.com/conduitio/conduit-connector-protocol/pconnutils"
+	"github.com/conduitio/conduit/pkg/foundation/cerrors"
+	"github.com/conduitio/conduit/pkg/foundation/cerrors/conduiterr"
+	"github.com/conduitio/conduit/pkg/foundation/connegress"
+	"github.com/conduitio/conduit/pkg/foundation/log"
+	"github.com/conduitio/conduit/pkg/plugin"
+	"github.com/conduitio/conduit/pkg/plugin/connector"
+	"github.com/rs/zerolog"
+	"google.golang.org/grpc/codes"
+)
+
+// CodeStandaloneNotAllowlisted is raised when a pipeline references a standalone
+// connector while connectors.egress.allow is set. Standalone connectors are
+// separate processes that never receive the engine's dialer, so the allowlist
+// cannot bind them; they are refused at dispatch (fail closed) rather than run
+// unconstrained.
+var CodeStandaloneNotAllowlisted = conduiterr.Register("connector.standalone_not_allowlisted", codes.PermissionDenied)
+
+type Registry struct {
+	logger    log.CtxLogger
+	pluginDir string
+
+	connUtilsAddr        string
+	maxReceiveRecordSize int
+
+	// envWarning enables the startup warning about host environment variables
+	// that standalone plugin processes inherit. Advisory only; it never changes
+	// the environment plugins receive.
+	envWarning bool
+	// envPolicy decides which host environment variables plugin processes
+	// receive. The zero value passes only the base set (PATH, HOME, ...).
+	envPolicy EnvPolicy
+	// environ returns the host environment that the startup warning
+	// classifies. It defaults to os.Environ and is replaced only to supply a
+	// fixed environment in tests.
+	environ func() []string
+
+	// egressRestricted is true when connectors.egress.allow is set. A standalone
+	// connector cannot be bound by the allowlist, so dispatch is refused while
+	// it is set (see WithEgressRestricted).
+	egressRestricted bool
+
+	// plugins stores plugin blueprints in a 2D map, first key is the plugin
+	// name, the second key is the plugin version
+	plugins map[string]map[string]blueprint
+	// m guards plugins from being concurrently accessed
+	m sync.RWMutex
+}
+
+type blueprint struct {
+	FullName      plugin.FullName
+	Specification pconnector.Specification
+	Path          string
+	// TODO store hash of plugin binary and compare before running the binary to
+	// ensure someone can't switch the plugin after we registered it
+}
+
+// RegistryOption configures a Registry.
+type RegistryOption func(*Registry)
+
+// WithEnvWarning enables or disables the one-time startup warning that lists
+// the names of sensitive host environment variables standalone plugins inherit.
+// The warning is off unless enabled here (the engine enables it by default
+// through connectors.standalone.env-warning).
+func WithEnvWarning(enabled bool) RegistryOption {
+	return func(r *Registry) { r.envWarning = enabled }
+}
+
+// WithEnviron replaces the source of the host environment the startup warning
+// classifies (default os.Environ; nil also means os.Environ). It does not
+// change the environment plugin processes receive.
+func WithEnviron(environ func() []string) RegistryOption {
+	return func(r *Registry) {
+		if environ != nil {
+			r.environ = environ
+		}
+	}
+}
+
+// WithEnvPolicy sets which host environment variables standalone plugin
+// processes receive (connectors.standalone.env.allow). Without it plugins get
+// only the base set.
+func WithEnvPolicy(p EnvPolicy) RegistryOption {
+	return func(r *Registry) { r.envPolicy = p }
+}
+
+// WithEgressRestricted refuses to dispense any standalone connector while the
+// engine's connector egress allowlist (connectors.egress.allow) is set. A
+// standalone connector is a separate process that never receives the engine's
+// dialer, so the allowlist cannot restrict what it dials; refusing it at
+// dispatch is the fail-closed answer (see docs/operations/connector-egress.md).
+func WithEgressRestricted(restricted bool) RegistryOption {
+	return func(r *Registry) { r.egressRestricted = restricted }
+}
+
+func NewRegistry(logger log.CtxLogger, pluginDir string, opts ...RegistryOption) *Registry {
+	base, _ := NewEnvPolicy(nil)
+	r := &Registry{
+		logger:    logger.WithComponentFromType(Registry{}),
+		environ:   os.Environ,
+		envPolicy: base,
+	}
+	for _, opt := range opts {
+		opt(r)
+	}
+
+	if pluginDir != "" {
+		// extract absolute path to make it clearer in the logs what directory is used
+		absPluginDir, err := filepath.Abs(pluginDir)
+		if err != nil {
+			r.logger.Warn(context.Background()).Err(err).Msg("could not extract absolute connector plugins path")
+		} else {
+			r.pluginDir = absPluginDir // store plugin dir for hot reloads
+		}
+	}
+
+	return r
+}
+
+func (r *Registry) Init(ctx context.Context, connUtilsAddr string, maxReceiveRecordSize int) {
+	r.connUtilsAddr = connUtilsAddr
+	r.maxReceiveRecordSize = maxReceiveRecordSize
+
+	plugins := r.loadPlugins(ctx)
+	r.m.Lock()
+	r.plugins = plugins
+	r.m.Unlock()
+
+	count := len(r.List())
+	r.logger.Info(ctx).
+		Str(log.PluginPathField, r.pluginDir).
+		Int("count", count).
+		Msg("standalone connector plugins initialized")
+
+	if r.envWarning && count > 0 {
+		warnStrippedEnv(ctx, r.logger, r.envPolicy, r.environ())
+	}
+}
+
+func (r *Registry) loadPlugins(ctx context.Context) map[string]map[string]blueprint {
+	r.logger.Debug(ctx).Msgf("loading connector plugins from directory %v", r.pluginDir)
+	plugins := make(map[string]map[string]blueprint)
+
+	dirEntries, err := os.ReadDir(r.pluginDir)
+	if err != nil {
+		r.logger.Warn(ctx).Err(err).Msg("could not read connector plugin directory")
+		return plugins // return empty map
+	}
+	warn := func(ctx context.Context, err error, pluginPath string) {
+		r.logger.Warn(ctx).
+			Err(err).
+			Str(log.PluginPathField, pluginPath).
+			Msgf("could not load standalone connector plugin")
+	}
+
+	for _, dirEntry := range dirEntries {
+		if dirEntry.IsDir() {
+			// skip directories
+			continue
+		}
+
+		pluginPath := path.Join(r.pluginDir, dirEntry.Name())
+
+		specs, err := r.loadSpecifications(pluginPath)
+		if err != nil {
+			warn(ctx, err, pluginPath)
+			continue
+		}
+
+		versionMap := plugins[specs.Name]
+		if versionMap == nil {
+			versionMap = make(map[string]blueprint)
+			plugins[specs.Name] = versionMap
+		}
+
+		fullName := plugin.NewFullName(plugin.PluginTypeStandalone, specs.Name, specs.Version)
+		if conflict, ok := versionMap[specs.Version]; ok {
+			err = cerrors.Errorf("failed to load plugin %v from %v: %w (conflicts with %v)", fullName, pluginPath, plugin.ErrPluginAlreadyRegistered, conflict.Path)
+			warn(ctx, err, pluginPath)
+			// delete plugin from map at the end so that further duplicates can
+			// still be found
+			defer func() {
+				delete(versionMap, specs.Version)
+				if len(versionMap) == 0 {
+					delete(plugins, specs.Name)
+				}
+			}()
+			continue
+		}
+
+		bp := blueprint{
+			FullName:      fullName,
+			Specification: specs,
+			Path:          pluginPath,
+		}
+		versionMap[specs.Version] = bp
+
+		latestFullName := versionMap[plugin.PluginVersionLatest].FullName
+		if fullName.PluginVersionGreaterThan(latestFullName) {
+			versionMap[plugin.PluginVersionLatest] = bp
+			r.logger.Debug(ctx).
+				Str(log.PluginPathField, pluginPath).
+				Str(log.PluginNameField, string(bp.FullName)).
+				Msg("set connector plugin as latest")
+		}
+
+		r.logger.Debug(ctx).
+			Str(log.PluginPathField, pluginPath).
+			Str(log.PluginNameField, string(bp.FullName)).
+			Msg("loaded standalone connector plugin")
+	}
+
+	return plugins
+}
+
+func (r *Registry) loadSpecifications(pluginPath string) (pconnector.Specification, error) {
+	// create dispenser without a logger to not spam logs on refresh
+	dispenser, err := NewDispenser(
+		zerolog.Nop(),
+		pluginPath,
+		r.envPolicy.ClientOption(os.Environ()),
+		client.WithEnvVar(pconnutils.EnvConduitConnectorUtilitiesGRPCTarget, r.connUtilsAddr),
+		client.WithEnvVar(pconnutils.EnvConduitConnectorToken, "irrelevant-token"),
+		client.WithEnvVar(pconnector.EnvConduitConnectorID, "load-specifications"),
+	)
+	if err != nil {
+		return pconnector.Specification{}, cerrors.Errorf("failed to create connector dispenser: %w", err)
+	}
+
+	specPlugin, err := dispenser.DispenseSpecifier()
+	if err != nil {
+		return pconnector.Specification{}, cerrors.Errorf("failed to dispense connector specifier (tip: check if the file is a valid connector plugin binary and if you have permissions for running it): %w", err)
+	}
+
+	resp, err := specPlugin.Specify(context.Background(), pconnector.SpecifierSpecifyRequest{})
+	if err != nil {
+		return pconnector.Specification{}, cerrors.Errorf("failed to get connector specs: %w", err)
+	}
+
+	return resp.Specification, nil
+}
+
+func (r *Registry) NewDispenser(logger log.CtxLogger, fullName plugin.FullName, cfg pconnector.PluginConfig) (connector.Dispenser, error) {
+	if r.egressRestricted {
+		// Fail closed: a standalone connector is a separate process that never
+		// receives the engine's dialer, so connectors.egress.allow cannot bind
+		// it. Refuse it here, at dispatch, rather than start an unconstrained
+		// process. The refusal precedes the plugin lookup so it also holds for a
+		// plugin name that does not resolve.
+		err := conduiterr.New(CodeStandaloneNotAllowlisted,
+			fmt.Sprintf("cannot run standalone connector %q: %s is set and standalone connectors are separate processes that the allowlist cannot restrict", fullName.PluginName(), connegress.AllowConfigPath))
+		err.ConfigPath = connegress.AllowConfigPath
+		err.Suggestion = "use a built-in connector (postgres, kafka or s3), which honors the allowlist, or remove " +
+			connegress.AllowConfigPath + " and restart (see docs/operations/connector-egress.md)"
+		return nil, err
+	}
+
+	r.m.RLock()
+	defer r.m.RUnlock()
+
+	versionMap, ok := r.plugins[fullName.PluginName()]
+	if !ok {
+		// Invariant: errors.Is(err, plugin.ErrPluginNotFound) still holds — the
+		// sentinel is wrapped, and the ConduitError adds the machine-actionable code.
+		err := conduiterr.Wrap(
+			conduiterr.CodeConnectorPluginNotFound,
+			fmt.Sprintf("standalone connector plugin %q not found", fullName.PluginName()),
+			plugin.ErrPluginNotFound,
+		)
+		err.Suggestion = "check the plugin name and version"
+		return nil, err
+	}
+	bp, ok := versionMap[fullName.PluginVersion()]
+	if !ok {
+		availableVersions := make([]string, 0, len(versionMap))
+		for k := range versionMap {
+			availableVersions = append(availableVersions, k)
+		}
+		err := conduiterr.Wrap(
+			conduiterr.CodeConnectorPluginNotFound,
+			fmt.Sprintf("standalone connector plugin %q not found; available versions: %v", fullName.PluginName(), availableVersions),
+			plugin.ErrPluginNotFound,
+		)
+		err.Suggestion = "check the plugin version, or omit it to use the latest"
+		return nil, err
+	}
+
+	logger = logger.WithComponent("plugin.standalone")
+	d, err := NewDispenser(
+		logger.ZerologWithComponent(),
+		bp.Path,
+		r.envPolicy.ClientOption(os.Environ()), // first: the WithEnvVar options below append to its environment
+		client.WithEnvVar(pconnutils.EnvConduitConnectorUtilitiesGRPCTarget, r.connUtilsAddr),
+		client.WithEnvVar(pconnutils.EnvConduitConnectorToken, cfg.Token),
+		client.WithEnvVar(pconnector.EnvConduitConnectorID, cfg.ConnectorID),
+		client.WithEnvVar(pconnector.EnvConduitConnectorLogLevel, cfg.LogLevel),
+		client.WithEnvVar(pconnector.EnvConduitConnectorMaxReceiveRecordSize, strconv.Itoa(r.maxReceiveRecordSize)),
+	)
+	if err != nil {
+		return nil, err
+	}
+	// The specification loaded from this binary at registration, resolved by
+	// the same lookup as bp.Path, so the engine reads the defaults of the
+	// plugin it will run (#3321).
+	d.spec, d.hasSpec = bp.Specification, true
+	return d, nil
+}
+
+func (r *Registry) List() map[plugin.FullName]pconnector.Specification {
+	r.m.RLock()
+	defer r.m.RUnlock()
+
+	specs := make(map[plugin.FullName]pconnector.Specification, len(r.plugins))
+	for _, versions := range r.plugins {
+		for version, bp := range versions {
+			if version == plugin.PluginVersionLatest {
+				continue // skip latest versions
+			}
+			specs[bp.FullName] = bp.Specification
+		}
+	}
+	return specs
+}

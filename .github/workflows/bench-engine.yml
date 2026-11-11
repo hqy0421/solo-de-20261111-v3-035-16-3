@@ -1,0 +1,207 @@
+name: bench-engine (gate)
+
+# The benchi regression gate (CLAUDE.md Process-maturity row "benchi regression
+# gate"): fails a PR whose engine throughput regresses more than 10% against the
+# base, beyond the A/A noise floor measured on unchanged code in the same job.
+#
+# METHODOLOGY (benchi/METHODOLOGY.md): the in-process benchmark
+# (`make bench-engine`, pkg/internal/enginetest/engines/bench_test.go) counts
+# real records — the fake source produces `records*sources` records and the run
+# only reports records/s after the destination acked every one — so the metric
+# is ground truth (records actually moved through the pipeline), not engine
+# instrumentation. The job builds the base revision and the PR head, then runs
+# base, head and base again (an A/A control) alternately, five rounds, rotating
+# the order each round so position in the round does not favour any arm. The A/A
+# control is the noise floor: a head delta is only meaningful beyond it.
+#
+# THE THRESHOLD lives in .github/scripts/bench_engine_compare.py (--gate): the
+# job fails when any benchmark is more than 10% slower than base AND that
+# slowdown exceeds twice the A/A floor. That is the METHODOLOGY rule in one
+# inequality — a >10% gate is only meaningful on a runner whose A/A floor is
+# comfortably under 10%, so a 10% delta only fails when the floor is under 5%.
+# The floor is cited next to every gate decision (step summary and the PR
+# comment). A run that cannot resolve the gate (base did not build, or no floor
+# is measurable) reports "cannot resolve" and does NOT fail: no comparison is
+# not a regression. A crashing or failing benchmark binary fails the job
+# (fail-closed), so a thin sample can never be read as a pass.
+#
+# BLOCKING, NOT REQUIRED: the `bench` job is not continue-on-error, so a
+# detected regression turns the PR red. It is NOT in main's required status
+# contexts. It is path-filtered (it only runs on engine PRs), and a
+# path-filtered workflow cannot become a required context — it would never
+# report on unrelated PRs and would block every merge permanently. Before this
+# can be added to main's required contexts it must be restructured to the
+# always-report/fail-closed pattern (see chaos.yml), the same caveat as
+# rag-template-e2e in CLAUDE.md.
+#
+# SECURITY MODEL (this workflow is half of a pair; read both headers):
+#   - THIS workflow runs PR code (the benchmark binaries) on `pull_request`,
+#     never `pull_request_target`, with `contents: read` only. It gets no write
+#     token and no secrets, and checkout does not persist credentials. Its only
+#     output is a plain artifact of raw `go test -bench` text.
+#   - The comment is posted by bench-engine-comment.yml, a `workflow_run`
+#     workflow that never checks out or runs PR code. It treats the artifact as
+#     untrusted data: PR code produced it.
+#   - No PR-controlled field (title, branch name, body) is interpolated into a
+#     shell script or expression here. Only the base SHA is used, via env.
+#
+# Cost: two test-binary builds plus about 3 x 5 x 13 s of benchmark time, roughly
+# six minutes on ubuntu-latest. Same-repo PRs only: a fork's token cannot comment
+# and a fork's benchmark code must not run with any trust.
+
+on:
+  pull_request:
+    paths:
+      - 'pkg/lifecycle/**'
+      - 'pkg/lifecycle-poc/**'
+      - 'pkg/connector/**'
+      - 'pkg/plugin/**'
+      - 'pkg/internal/enginetest/**'
+      - 'go.mod'
+      - 'go.sum'
+      - '.github/workflows/bench-engine.yml'
+      - '.github/workflows/bench-engine-comment.yml'
+      - '.github/scripts/bench_engine_compare.py'
+      - '.github/scripts/test_bench_engine_compare.py'
+
+concurrency:
+  group: bench-engine-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  ROUNDS: '5'
+  BENCH_TIME: '3x'
+  # Resolve ConduitIO modules directly from GitHub (skips proxy.golang.org +
+  # sum.golang.org index lag on fresh tags); third-party deps still use both.
+  GOPRIVATE: github.com/conduitio/*
+  GONOSUMDB: github.com/conduitio/*
+
+jobs:
+  # Its own job and NOT continue-on-error: a failing comparer self-test must be
+  # visible. (A step failure inside a continue-on-error job is hidden.)
+  comparer-selftest:
+    name: bench-engine comparer self-test
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - working-directory: .github/scripts
+        run: python3 -m unittest -v test_bench_engine_compare
+
+  bench:
+    name: bench-engine (gate)
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: 'go.mod'
+
+      - name: Build head and base benchmark binaries
+        id: build
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -u
+          mkdir -p "$RUNNER_TEMP/bench"
+          out="$RUNNER_TEMP/bench"
+          go test -c -o "$out/head.test" ./pkg/internal/enginetest/engines
+
+          # Base tree + the head's harness.
+          git worktree add --detach "$RUNNER_TEMP/base" "$BASE_SHA"
+          mkdir -p "$RUNNER_TEMP/base/pkg/internal"
+          rm -rf "$RUNNER_TEMP/base/pkg/internal/enginetest"
+          cp -R pkg/internal/enginetest "$RUNNER_TEMP/base/pkg/internal/enginetest"
+          if (cd "$RUNNER_TEMP/base" && go test -c -o "$out/base.test" ./pkg/internal/enginetest/engines); then
+            echo "base_ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "base_ok=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run benchmarks, interleaved
+        env:
+          BASE_OK: ${{ steps.build.outputs.base_ok }}
+        run: |
+          set -u
+          out="$RUNNER_TEMP/bench"
+          : > "$out/head.txt"; : > "$out/base-a.txt"; : > "$out/base-b.txt"
+          # A crashing or failing benchmark binary must not become a silently
+          # thin sample: fail the job (fail-closed) instead.
+          run() { # run <binary> <output file>
+            if ! "$1" -test.run='^$' -test.bench='^BenchmarkEngine$' \
+              -test.benchtime="$BENCH_TIME" -test.count=1 >> "$2"; then
+              echo "error: benchmark binary $1 failed; aborting (fail-closed)" >&2
+              exit 1
+            fi
+          }
+          for round in $(seq 1 "$ROUNDS"); do
+            if [ "$BASE_OK" = "true" ]; then
+              # Rotate the order each round: A H B, H B A, B A H, ...
+              case $((round % 3)) in
+                1) order="a h b" ;;
+                2) order="h b a" ;;
+                0) order="b a h" ;;
+              esac
+            else
+              order="h"
+            fi
+            for who in $order; do
+              case "$who" in
+                a) run "$out/base.test" "$out/base-a.txt" ;;
+                b) run "$out/base.test" "$out/base-b.txt" ;;
+                h) run "$out/head.test" "$out/head.txt" ;;
+              esac
+            done
+          done
+
+      - name: Collect results
+        id: collect
+        env:
+          BASE_OK: ${{ steps.build.outputs.base_ok }}
+        run: |
+          set -u
+          out="$RUNNER_TEMP/bench"
+          mkdir -p "$out/upload"
+          cp "$out/base-a.txt" "$out/base-b.txt" "$out/head.txt" "$out/upload/"
+          printf '%s' "$BASE_OK" > "$out/upload/base_ok"
+          # pull_request checks out the MERGE ref, so the head binary was built
+          # from a merge commit, not from the PR head SHA. Record it.
+          git rev-parse HEAD | tr -d '\n' > "$out/upload/merge_sha"
+
+      - name: Decide gate (>10% slower than base, beyond the A/A floor)
+        env:
+          BASE_OK: ${{ steps.build.outputs.base_ok }}
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/bench"
+          # Exit code 3 fails this step (the gate); 0 passes. The summary is
+          # written to the step summary and cites the A/A floor next to the delta.
+          python3 .github/scripts/bench_engine_compare.py \
+            --gate \
+            --base-a "$out/base-a.txt" --base-b "$out/base-b.txt" --head "$out/head.txt" \
+            --out "$RUNNER_TEMP/gate-summary.md" \
+            --base-ok "$BASE_OK" \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+
+      # Untrusted output: produced by PR code. bench-engine-comment.yml parses it
+      # as data. Upload even when the gate fails, so the comment still shows the
+      # numbers and the floor.
+      - uses: actions/upload-artifact@v4
+        if: always() && steps.collect.outcome == 'success'
+        with:
+          name: bench-engine-results
+          path: ${{ runner.temp }}/bench/upload
+          retention-days: 3
+          if-no-files-found: error

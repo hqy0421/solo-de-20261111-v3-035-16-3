@@ -1,0 +1,346 @@
+// Copyright © 2022 Meroxa, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//go:generate mockgen -typed -destination=mock/plugin_service.go -package=mock -mock_names=PluginService=PluginService . PluginService
+
+package processor
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	"github.com/conduitio/conduit-commons/database"
+	sdk "github.com/conduitio/conduit-processor-sdk"
+	"github.com/conduitio/conduit/pkg/foundation/cerrors"
+	"github.com/conduitio/conduit/pkg/foundation/cerrors/conduiterr"
+	"github.com/conduitio/conduit/pkg/foundation/env"
+	"github.com/conduitio/conduit/pkg/foundation/log"
+	"github.com/conduitio/conduit/pkg/foundation/metrics/measure"
+	"github.com/conduitio/conduit/pkg/plugin/processor/egress"
+)
+
+type PluginService interface {
+	NewProcessor(ctx context.Context, pluginName string, id string, egressPolicy egress.Policy) (sdk.Processor, error)
+}
+
+type Service struct {
+	logger log.CtxLogger
+
+	registry  PluginService
+	instances map[string]*Instance
+	store     *Store
+
+	// egressCeiling is the operator-set engine-level ceiling that clamps every
+	// processor's per-pipeline egress opt-in (the intersection). Its zero value
+	// is deny-all, so on a stock instance egress stays off until the operator
+	// affirmatively opens the ceiling — defense in depth for shared instances.
+	egressCeiling egress.Policy
+
+	// envAllow is the operator's env.allow list handed to every runnable
+	// processor. The zero value allows no ${VAR} expansion.
+	envAllow *env.Allowlist
+}
+
+// ServiceOption configures a Service at construction.
+type ServiceOption func(*Service)
+
+// WithEgressCeiling sets the engine-level egress ceiling (from the Conduit
+// instance config). Omitting it leaves the ceiling at deny-all.
+func WithEgressCeiling(ceiling egress.Policy) ServiceOption {
+	return func(s *Service) { s.egressCeiling = ceiling }
+}
+
+// WithEnvAllowlist sets the operator's env.allow list: the environment
+// variables a ${VAR} reference in processor settings may expand. Omitting it
+// expands none.
+func WithEnvAllowlist(a *env.Allowlist) ServiceOption {
+	return func(s *Service) { s.envAllow = a }
+}
+
+// NewService creates a new processor plugin service.
+func NewService(logger log.CtxLogger, db database.DB, registry PluginService, opts ...ServiceOption) *Service {
+	s := &Service{
+		logger:    logger.WithComponent("processor.Service"),
+		registry:  registry,
+		instances: make(map[string]*Instance),
+		store:     NewStore(db),
+	}
+	for _, o := range opts {
+		o(s)
+	}
+	return s
+}
+
+// resolveEgressPolicy computes the effective, engine-clamped egress policy for a
+// processor instance from its current config. It is called at every processor
+// open (cold start and live reconfigure), so a reconfigure necessarily rebinds
+// the policy to the then-current config. A malformed egress config fails the
+// build rather than silently disabling egress.
+func (s *Service) resolveEgressPolicy(i *Instance) (egress.Policy, error) {
+	requested, err := egress.PolicyFromSettings(i.Config.Settings)
+	if err != nil {
+		return egress.DenyAll(), err
+	}
+	effective, dropped := egress.ResolvePolicy(requested, s.egressCeiling)
+	if len(dropped) > 0 {
+		s.logger.Warn(context.Background()).
+			Str("processor_id", i.ID).
+			Int("dropped_entries", len(dropped)).
+			Msg("egress allowlist entries dropped: outside the engine-level egress ceiling")
+	}
+	return effective, nil
+}
+
+// Init fetches instances from the store.
+func (s *Service) Init(ctx context.Context) error {
+	s.logger.Debug(ctx).Msg("initializing processors")
+	instances, err := s.store.GetAll(ctx)
+	if err != nil {
+		return cerrors.Errorf("could not retrieve processor instances from store: %w", err)
+	}
+
+	s.instances = instances
+	s.logger.Info(ctx).Int("count", len(s.instances)).Msg("processors initialized")
+
+	for _, i := range instances {
+		i.init(s.logger)
+		measure.ProcessorsGauge.WithValues(i.Plugin).Inc()
+	}
+
+	return nil
+}
+
+func (s *Service) Check(ctx context.Context) error {
+	return s.store.db.Ping(ctx)
+}
+
+// List returns all processors in the Service.
+func (s *Service) List(_ context.Context) map[string]*Instance {
+	// make a copy of the map
+	tmp := make(map[string]*Instance, len(s.instances))
+	for k, v := range s.instances {
+		tmp[k] = v
+	}
+	return tmp
+}
+
+// Get will return a single processor or an error.
+func (s *Service) Get(_ context.Context, id string) (*Instance, error) {
+	ins, ok := s.instances[id]
+	if !ok {
+		// Invariant: errors.Is(err, ErrInstanceNotFound) still holds — the sentinel
+		// is wrapped, and the ConduitError adds the machine-actionable code.
+		err := conduiterr.Wrap(
+			CodeProcessorNotFound,
+			fmt.Sprintf("processor %q not found", id),
+			ErrInstanceNotFound,
+		)
+		err.Suggestion = "check the processor ID in your pipeline configuration"
+		return nil, err
+	}
+	return ins, nil
+}
+
+func (s *Service) MakeRunnableProcessor(ctx context.Context, i *Instance) (*RunnableProcessor, error) {
+	// Reserve the instance as running with a single atomic test-and-set: this both
+	// enforces the guard (refuse an already-running instance) and closes the
+	// read-then-write race two concurrent callers would otherwise have. On any
+	// subsequent build failure we release the reservation so the instance is not
+	// left wrongly marked running.
+	if !i.running.CompareAndSwap(false, true) {
+		return nil, ErrProcessorRunning
+	}
+
+	egressPolicy, err := s.resolveEgressPolicy(i)
+	if err != nil {
+		i.running.Store(false)
+		return nil, err
+	}
+	p, err := s.registry.NewProcessor(ctx, i.Plugin, i.ID, egressPolicy)
+	if err != nil {
+		i.running.Store(false)
+		return nil, err
+	}
+	cond, err := newProcessorCondition(i.Condition)
+	if err != nil {
+		i.running.Store(false)
+		return nil, cerrors.Errorf("invalid condition: %w", err)
+	}
+
+	rp := newRunnableProcessor(p, cond, i)
+	rp.envAllow = s.envAllow
+	return rp, nil
+}
+
+// MakeRunnableProcessorForReconfigure builds a fresh RunnableProcessor for an
+// ALREADY-RUNNING processor instance, for the live in-place reconfigure swap
+// (lifecycle.ReconfigureProcessor). Unlike MakeRunnableProcessor it does not
+// refuse a running instance and does not flip the running flag: the instance
+// legitimately stays running across the swap, and the caller opens this new
+// runnable before tearing down the old one (open-before-teardown), so no record
+// is dropped. It dispenses a new plugin from the instance's current (already
+// updated) config, exactly as MakeRunnableProcessor does for a fresh start.
+func (s *Service) MakeRunnableProcessorForReconfigure(ctx context.Context, i *Instance) (*RunnableProcessor, error) {
+	// Invariant (design § reconfigure rebinds policy): resolving the egress policy
+	// here from the instance's already-updated config means the reconfigure swap
+	// binds the NEW policy to the rebuilt processor, by construction.
+	egressPolicy, err := s.resolveEgressPolicy(i)
+	if err != nil {
+		return nil, err
+	}
+	p, err := s.registry.NewProcessor(ctx, i.Plugin, i.ID, egressPolicy)
+	if err != nil {
+		return nil, err
+	}
+	cond, err := newProcessorCondition(i.Condition)
+	if err != nil {
+		return nil, cerrors.Errorf("invalid condition: %w", err)
+	}
+	rp := newRunnableProcessor(p, cond, i)
+	rp.envAllow = s.envAllow
+	return rp, nil
+}
+
+// Create will create a new processor instance.
+func (s *Service) Create(
+	ctx context.Context,
+	id string,
+	plugin string,
+	parent Parent,
+	cfg Config,
+	pt ProvisionType,
+	cond string,
+) (*Instance, error) {
+	if cfg.Workers < 0 {
+		return nil, cerrors.New("processor workers can't be negative")
+	}
+	if cfg.Workers == 0 {
+		cfg.Workers = 1
+	}
+
+	// check if the processor plugin exists — a throwaway processor torn down
+	// immediately below, so it gets deny-all egress (it never processes records).
+	p, err := s.registry.NewProcessor(ctx, plugin, id, egress.DenyAll())
+	if err != nil {
+		return nil, cerrors.Errorf("could not get processor: %w", err)
+	}
+	err = p.Teardown(ctx)
+	if err != nil {
+		s.logger.Warn(ctx).Err(err).Msg("processor teardown failed")
+	}
+
+	now := time.Now()
+	instance := &Instance{
+		ID:            id,
+		UpdatedAt:     now,
+		CreatedAt:     now,
+		ProvisionedBy: pt,
+		Plugin:        plugin,
+		Parent:        parent,
+		Config:        cfg,
+		Condition:     cond,
+	}
+	instance.init(s.logger)
+
+	// persist instance
+	err = s.store.Set(ctx, instance.ID, instance)
+	if err != nil {
+		return nil, err
+	}
+
+	s.instances[instance.ID] = instance
+	measure.ProcessorsGauge.WithValues(plugin).Inc()
+
+	return instance, nil
+}
+
+// Update will update a processor instance config.
+func (s *Service) Update(ctx context.Context, id string, plugin string, cfg Config) (*Instance, error) {
+	instance, err := s.Get(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+
+	// A running processor's stored config must not be changed out from under its
+	// live node — that would leave the node and the store divergent. Ordinary
+	// callers (the orchestrator / HTTP+gRPC API) are refused here; the sole
+	// exception is provisioning's live in-place reconfigure, which uses
+	// UpdateWhileRunning and immediately swaps the node to match.
+	if instance.running.Load() {
+		return nil, cerrors.Errorf("could not update processor instance (ID: %s): %w", id, ErrProcessorRunning)
+	}
+
+	return s.updateConfig(ctx, instance, plugin, cfg)
+}
+
+// UpdateWhileRunning updates a processor's stored config WITHOUT Update's
+// running-instance guard. It exists solely for provisioning's live in-place
+// reconfigure path (provisioning.applyInPlace -> lifecycle.ReconfigureProcessor):
+// updating a running processor's stored config is safe ONLY when the caller
+// immediately swaps the live node to the new config, so this method must never be
+// called except paired with that swap. Every other caller uses Update, which
+// refuses a running instance.
+func (s *Service) UpdateWhileRunning(ctx context.Context, id string, plugin string, cfg Config) (*Instance, error) {
+	instance, err := s.Get(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	return s.updateConfig(ctx, instance, plugin, cfg)
+}
+
+func (s *Service) updateConfig(ctx context.Context, instance *Instance, plugin string, cfg Config) (*Instance, error) {
+	if plugin == "" {
+		return nil, cerrors.Errorf("could not update processor instance (ID: %s): plugin name is empty", instance.ID)
+	}
+
+	if instance.Plugin != plugin {
+		s.logger.Warn(ctx).Msgf("processor plugin changing from %v to %v, "+
+			"this may lead to unexpected behavior and configuration issues.", instance.Plugin, plugin)
+	}
+
+	instance.Plugin = plugin
+	instance.Config = cfg
+	instance.UpdatedAt = time.Now()
+
+	// persist instance
+	if err := s.store.Set(ctx, instance.ID, instance); err != nil {
+		return nil, err
+	}
+
+	return instance, nil
+}
+
+// Delete removes a processor from the Service.
+func (s *Service) Delete(ctx context.Context, id string) error {
+	// make sure the processor exists
+	instance, err := s.Get(ctx, id)
+	if err != nil {
+		return err
+	}
+
+	if instance.running.Load() {
+		return cerrors.Errorf("could not delete processor instance (ID: %s): %w", id, ErrProcessorRunning)
+	}
+
+	err = s.store.Delete(ctx, id)
+	if err != nil {
+		return cerrors.Errorf("could not delete processor instance from store: %w", err)
+	}
+	delete(s.instances, id)
+	instance.Close()
+	measure.ProcessorsGauge.WithValues(instance.Plugin).Dec()
+
+	return nil
+}

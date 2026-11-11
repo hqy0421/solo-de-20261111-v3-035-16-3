@@ -1,0 +1,267 @@
+// Copyright © 2022 Meroxa, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package builtin
+
+import (
+	"context"
+	"fmt"
+	"runtime/debug"
+
+	"github.com/conduitio/conduit-commons/hostpolicy"
+	file "github.com/conduitio/conduit-connector-file"
+	generator "github.com/conduitio/conduit-connector-generator"
+	kafka "github.com/conduitio/conduit-connector-kafka"
+	connLog "github.com/conduitio/conduit-connector-log"
+	postgres "github.com/conduitio/conduit-connector-postgres"
+	"github.com/conduitio/conduit-connector-protocol/pconnector"
+	"github.com/conduitio/conduit-connector-protocol/pconnutils"
+	s3 "github.com/conduitio/conduit-connector-s3"
+	sdk "github.com/conduitio/conduit-connector-sdk"
+	"github.com/conduitio/conduit/pkg/foundation/cerrors"
+	"github.com/conduitio/conduit/pkg/foundation/cerrors/conduiterr"
+	"github.com/conduitio/conduit/pkg/foundation/log"
+	"github.com/conduitio/conduit/pkg/plugin"
+	"github.com/conduitio/conduit/pkg/plugin/connector"
+	"github.com/conduitio/conduit/pkg/plugin/connector/connutils"
+)
+
+// DefaultBuiltinConnectors contains the default built-in connectors.
+// The key of the map is the import path of the module
+// containing the connector implementation.
+var DefaultBuiltinConnectors = map[string]sdk.Connector{
+	"github.com/conduitio/conduit-connector-file":      file.Connector,
+	"github.com/conduitio/conduit-connector-generator": generator.Connector,
+	"github.com/conduitio/conduit-connector-kafka":     kafka.Connector,
+	"github.com/conduitio/conduit-connector-log":       connLog.Connector,
+	"github.com/conduitio/conduit-connector-postgres":  postgres.Connector,
+	"github.com/conduitio/conduit-connector-s3":        s3.Connector,
+}
+
+type blueprint struct {
+	fullName         plugin.FullName
+	specification    pconnector.Specification
+	dispenserFactory dispenserFactory
+}
+
+type dispenserFactory func(name plugin.FullName, cfg pconnector.PluginConfig, logger log.CtxLogger, policy hostpolicy.Policy) connector.Dispenser
+
+// newDispenserFactory returns a factory of dispensers for conn. service is the
+// runtime's connector schema service; a nil service leaves the plugin without
+// a schema scope (only used to read the specification).
+func newDispenserFactory(conn sdk.Connector, service *connutils.SchemaService) dispenserFactory {
+	var scoped pconnutils.SchemaService
+	if service != nil {
+		scoped = service // avoid a non-nil interface holding a nil pointer
+	}
+	if conn.NewSource == nil {
+		conn.NewSource = func() sdk.Source { return nil }
+	}
+	if conn.NewDestination == nil {
+		conn.NewDestination = func() sdk.Destination { return nil }
+	}
+
+	return func(name plugin.FullName, cfg pconnector.PluginConfig, logger log.CtxLogger, policy hostpolicy.Policy) connector.Dispenser {
+		d := NewDispenser(
+			name,
+			logger,
+			func() pconnector.SpecifierPlugin {
+				return sdk.NewSpecifierPlugin(conn.NewSpecification())
+			},
+			func() pconnector.SourcePlugin {
+				return sdk.NewSourcePlugin(conn.NewSource(), cfg, conn.NewSpecification().SourceParams)
+			},
+			func() pconnector.DestinationPlugin {
+				return sdk.NewDestinationPlugin(conn.NewDestination(), cfg, conn.NewSpecification().DestinationParams)
+			},
+		)
+		d.schemaService = scoped
+		d.policy = policy
+		return d
+	}
+}
+
+type Registry struct {
+	logger log.CtxLogger
+
+	connectors map[string]sdk.Connector
+	// plugins stores plugin blueprints in a 2D map, first key is the plugin
+	// name, the second key is the plugin version
+	plugins map[string]map[string]blueprint
+	service *connutils.SchemaService
+	// decorators add engine-owned values to the call context of the built-in
+	// connector with the given plugin name (for example the file connector's
+	// open-time path enforcement).
+	decorators map[string]func(context.Context) context.Context
+	// ambient is the operator's ambient-credentials policy; the zero value
+	// denies. Set once at construction, read-only afterwards.
+	ambient hostpolicy.Policy
+}
+
+func NewRegistry(logger log.CtxLogger, connectors map[string]sdk.Connector, service *connutils.SchemaService, opts ...RegistryOption) *Registry {
+	logger = logger.WithComponentFromType(Registry{})
+	// Built-in connectors resolve schemas through the connector SDK's
+	// package-level service. It is installed once per process as a router
+	// that answers each call from the schema service of the runtime the
+	// calling connector belongs to (see schema_scope.go, issue #3088).
+	installScopedSchemaService()
+
+	r := &Registry{
+		logger:     logger,
+		connectors: connectors,
+		service:    service,
+	}
+	for _, opt := range opts {
+		opt(r)
+	}
+
+	return r
+}
+
+func (r *Registry) Init(ctx context.Context) {
+	buildInfo, ok := debug.ReadBuildInfo()
+	if !ok {
+		// we are using modules, build info should always be available, we are staying on the safe side
+		r.logger.Warn(ctx).Msg("build info not available, built-in plugin versions may not be read correctly")
+		buildInfo = &debug.BuildInfo{} // prevent nil pointer exceptions
+	}
+
+	r.plugins = r.loadPlugins(buildInfo)
+	r.logger.Info(ctx).Int("count", len(r.List())).Msg("builtin connector plugins initialized")
+}
+
+func (r *Registry) loadPlugins(buildInfo *debug.BuildInfo) map[string]map[string]blueprint {
+	plugins := make(map[string]map[string]blueprint, len(r.connectors))
+	for moduleName, conn := range r.connectors {
+		factory := newDispenserFactory(conn, r.service)
+
+		specs, err := getSpecification(moduleName, factory, buildInfo)
+		if err != nil {
+			// stop initialization if a built-in plugin is misbehaving
+			panic(err)
+		}
+
+		versionMap := plugins[specs.Name]
+		if versionMap == nil {
+			versionMap = make(map[string]blueprint)
+			plugins[specs.Name] = versionMap
+		}
+
+		fullName := newFullName(specs.Name, specs.Version)
+		if _, ok := versionMap[specs.Version]; ok {
+			panic(cerrors.Errorf("plugin %q already registered", fullName))
+		}
+
+		bp := blueprint{
+			fullName:         fullName,
+			dispenserFactory: factory,
+			specification:    specs,
+		}
+		versionMap[specs.Version] = bp
+
+		latestBp, ok := versionMap[plugin.PluginVersionLatest]
+		if !ok || fullName.PluginVersionGreaterThan(latestBp.fullName) {
+			versionMap[plugin.PluginVersionLatest] = bp
+		}
+	}
+	return plugins
+}
+
+func getSpecification(moduleName string, factory dispenserFactory, buildInfo *debug.BuildInfo) (pconnector.Specification, error) {
+	dispenser := factory("", pconnector.PluginConfig{}, log.CtxLogger{}, hostpolicy.Policy{})
+	specPlugin, err := dispenser.DispenseSpecifier()
+	if err != nil {
+		return pconnector.Specification{}, cerrors.Errorf("could not dispense specifier for built in plugin: %w", err)
+	}
+	resp, err := specPlugin.Specify(context.Background(), pconnector.SpecifierSpecifyRequest{})
+	if err != nil {
+		return pconnector.Specification{}, cerrors.Errorf("could not get specs for built in plugin: %w", err)
+	}
+
+	if version := getModuleVersion(buildInfo.Deps, moduleName); version != "" {
+		// overwrite version with the import version
+		resp.Specification.Version = version
+	}
+
+	return resp.Specification, nil
+}
+
+func getModuleVersion(deps []*debug.Module, moduleName string) string {
+	for _, dep := range deps {
+		if dep.Path == moduleName {
+			if dep.Replace != nil {
+				return dep.Replace.Version
+			}
+			return dep.Version
+		}
+	}
+	return ""
+}
+
+func newFullName(pluginName, pluginVersion string) plugin.FullName {
+	return plugin.NewFullName(plugin.PluginTypeBuiltin, pluginName, pluginVersion)
+}
+
+func (r *Registry) NewDispenser(logger log.CtxLogger, fullName plugin.FullName, cfg pconnector.PluginConfig) (connector.Dispenser, error) {
+	versionMap, ok := r.plugins[fullName.PluginName()]
+	if !ok {
+		// Invariant: errors.Is(err, plugin.ErrPluginNotFound) still holds — the
+		// sentinel is wrapped, and the ConduitError adds the machine-actionable code.
+		err := conduiterr.Wrap(
+			conduiterr.CodeConnectorPluginNotFound,
+			fmt.Sprintf("builtin connector plugin %q not found", fullName.PluginName()),
+			plugin.ErrPluginNotFound,
+		)
+		err.Suggestion = "run `conduit connectors list` to see available built-in connectors"
+		return nil, err
+	}
+	b, ok := versionMap[fullName.PluginVersion()]
+	if !ok {
+		availableVersions := make([]string, 0, len(versionMap))
+		for k := range versionMap {
+			availableVersions = append(availableVersions, k)
+		}
+		err := conduiterr.Wrap(
+			conduiterr.CodeConnectorPluginNotFound,
+			fmt.Sprintf("builtin connector plugin %q not found; available versions: %v", fullName, availableVersions),
+			plugin.ErrPluginNotFound,
+		)
+		err.Suggestion = "check the plugin version, or omit it to use the latest"
+		return nil, err
+	}
+
+	// Invariant (ambient credentials): the policy is bound here, by the engine,
+	// to this connector instance; nothing in cfg or the pipeline config feeds it.
+	d := b.dispenserFactory(fullName, cfg, logger, r.policyFor(fullName.PluginName(), cfg.ConnectorID))
+	if bd, ok := d.(*Dispenser); ok {
+		bd.decorate = r.decorators[fullName.PluginName()]
+		// The specification of the version resolved above, so the engine
+		// reads the defaults of the plugin it will run (#3321).
+		bd.spec, bd.hasSpec = b.specification, true
+	}
+	return d, nil
+}
+
+func (r *Registry) List() map[plugin.FullName]pconnector.Specification {
+	specs := make(map[plugin.FullName]pconnector.Specification, len(r.plugins))
+	for _, versions := range r.plugins {
+		for version, bp := range versions {
+			if version == plugin.PluginVersionLatest {
+				continue // skip latest versions
+			}
+			specs[bp.fullName] = bp.specification
+		}
+	}
+	return specs
+}

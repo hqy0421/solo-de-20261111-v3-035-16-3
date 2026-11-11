@@ -1,0 +1,105 @@
+// Copyright © 2024 Meroxa, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package run
+
+import (
+	"testing"
+
+	"github.com/conduitio/ecdysis"
+	"github.com/matryer/is"
+	"github.com/spf13/pflag"
+)
+
+func TestRunCommandFlags(t *testing.T) {
+	is := is.New(t)
+
+	wantFlags := []struct {
+		longName   string
+		shortName  string
+		usage      string
+		persistent bool
+	}{
+		{longName: "config.path", usage: "global conduit configuration file"},
+		{longName: "db.type", usage: "database type; accepts badger,postgres,inmemory,sqlite"},
+		{longName: "db.badger.path", usage: "path to badger DB"},
+		{longName: "db.postgres.connection-string", usage: "postgres connection string, may be a database URL or in PostgreSQL keyword/value format"},
+		{longName: "db.postgres.table", usage: "postgres table in which to store data (will be created if it does not exist)"},
+		{longName: "db.sqlite.path", usage: "path to sqlite3 DB"},
+		{longName: "db.sqlite.table", usage: "sqlite3 table in which to store data (will be created if it does not exist)"},
+		{longName: "api.enabled", usage: "enable HTTP and gRPC API"},
+		{longName: "api.http.address", usage: "address for serving the HTTP API; defaults to loopback, a non-loopback address requires api.token or api.token-file"},
+		{longName: "api.http.allowed-hosts", usage: "extra Host header names (no port) accepted on a loopback bind, besides localhost, 127.0.0.1 and [::1]; repeatable"},
+		{longName: "api.grpc.address", usage: "address for serving the gRPC API; defaults to loopback, a non-loopback address requires api.token or api.token-file"},
+		{longName: "api.token", usage: "bearer token required by the HTTP and gRPC APIs; prefer api.token-file or the CONDUIT_API_TOKEN environment variable over this flag, which is visible in the process list"},
+		{longName: "api.token-file", usage: "path to a file containing the bearer token required by the HTTP and gRPC APIs; also used by CLI commands that talk to the API (CONDUIT_API_TOKEN_FILE)"},
+		{longName: "log.level", usage: "sets logging level; accepts debug, info, warn, error, trace"},
+		{longName: "log.format", usage: "sets the format of the logging; accepts json, cli"},
+		{longName: "connectors.path", usage: "path to standalone connectors' directory"},
+		{longName: "processors.path", usage: "path to standalone processors' directory"},
+		{longName: "pipelines.path", usage: "path to a pipelines' directory or a pipeline configuration file"},
+		{longName: "pipelines", usage: "alias for --pipelines.path: path to a pipelines' directory or a pipeline configuration file"},
+		{longName: "pipelines.exit-on-degraded", usage: "exit Conduit if a pipeline is degraded"},
+		{longName: "pipelines.error-recovery.min-delay", usage: "minimum delay before restart"},
+		{longName: "pipelines.error-recovery.max-delay", usage: "maximum delay before restart"},
+		{longName: "pipelines.error-recovery.backoff-factor", usage: "backoff factor applied to the last delay"},
+		{longName: "pipelines.error-recovery.max-retries", usage: "maximum number of retries"},
+		{longName: "pipelines.error-recovery.max-retries-window", usage: "amount of time running without any errors after which a pipeline is considered healthy"},
+		{longName: "schema-registry.type", usage: "schema registry type; accepts builtin,confluent"},
+		{longName: "schema-registry.confluent.connection-string", usage: "confluent schema registry connection string"},
+		{longName: "schema.avro.max-elements", usage: "maximum elements in one Avro array or map decoded in-process (built-in processors and connectors); larger payloads fail with schema.avro.limit_exceeded; 0 = no limit"},
+		{longName: "preview.pipeline-arch-v2", usage: "enables the preview pipeline engine (architecture v2). Required for pipelines with a processor that splits one record into several (record fan-out, e.g. ai.chunk, split, clone), including the postgres-pgvector-rag template: the classic default engine cannot run them and stops with pipeline.fanout_requires_arch_v2. Known limit: a split record whose pieces are cut across a multi-destination fan-out fails with pipeline.split_run_straddles_fanout. v2 batches a destination itself with its effective sdk.batch.size and sdk.batch.delay (the pipeline config, else the connector's own defaults) and configures the connector not to batch as well; sdk.batch.delay bounds how long a partial batch waits before it is written; with sdk.batch.size alone a partial batch waits for more records or a stop, and the start logs pipeline.archv2_destination_batch_unbounded_wait. A dead-letter queue with sdk.batch.size above 1 or sdk.batch.delay above 0 is refused at start with pipeline.archv2_destination_batching_unsupported, because v2 waits for every ack before the next read. A destination or dead-letter-queue sdk.batch.* value must be a literal: an environment reference is refused with pipeline.archv2_destination_batching_not_literal. This flag is temporary: a single pipeline engine that supports record fan-out is planned, and the flag will then be deprecated"},
+		{longName: "preview.pipeline-arch-v2-disable-metrics", usage: "disables metrics about amount of data (in bytes) moved in pipeline architecture v2 (increases performance)"},
+		{longName: "dev.cpuprofile", usage: "write CPU profile to file"},
+		{longName: "dev.memprofile", usage: "write memory profile to file"},
+		{longName: "dev.blockprofile", usage: "write block profile to file"},
+		{longName: "dev.enabled", usage: "watch pipelines.path and hot-reload changes into the running engine (see 'conduit run --dev')"},
+		{longName: "dev.json", usage: "emit dev-watcher apply events as JSON lines instead of human-readable text"},
+		{longName: "dev", usage: "alias for --dev.enabled: watch pipelines.path and hot-reload changes into the running engine"},
+	}
+
+	e := ecdysis.New()
+	c := e.MustBuildCobraCommand(&RunCommand{})
+
+	persistentFlags := c.PersistentFlags()
+	cmdFlags := c.Flags()
+
+	for _, wantFlag := range wantFlags {
+		var cf *pflag.Flag
+
+		if wantFlag.persistent {
+			cf = persistentFlags.Lookup(wantFlag.longName)
+		} else {
+			cf = cmdFlags.Lookup(wantFlag.longName)
+		}
+		if cf == nil {
+			// Errorf + continue, not Fatalf: the explicit continue is the
+			// point. Any "stop here" that relies on the analyser knowing a
+			// testing.T method never returns (FailNow, Fatalf) leaves
+			// staticcheck free to treat cf as possibly-nil below and report
+			// SA5011 — which it does intermittently, because golangci-lint's
+			// parallel package loading does not reliably give it the IR it
+			// would need to infer that. continue needs no inference: there is
+			// no path from here to the dereferences.
+			//
+			// Reporting rather than aborting is also better for a table test
+			// over ~30 flags: one missing flag no longer hides the rest.
+			t.Errorf("flag %q expected, but not found", wantFlag.longName)
+			continue
+		}
+		is.Equal(wantFlag.longName, cf.Name)
+		is.Equal(wantFlag.shortName, cf.Shorthand)
+		is.Equal(cf.Usage, wantFlag.usage)
+	}
+}

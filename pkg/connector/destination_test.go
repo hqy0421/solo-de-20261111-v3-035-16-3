@@ -1,0 +1,388 @@
+// Copyright © 2022 Meroxa, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package connector
+
+import (
+	"context"
+	"testing"
+	"time"
+
+	"github.com/conduitio/conduit-commons/database/inmemory"
+	"github.com/conduitio/conduit-commons/opencdc"
+	"github.com/conduitio/conduit-connector-protocol/pconnector"
+	"github.com/conduitio/conduit/pkg/foundation/cerrors"
+	"github.com/conduitio/conduit/pkg/foundation/log"
+	"github.com/conduitio/conduit/pkg/plugin/connector/builtin"
+	"github.com/conduitio/conduit/pkg/plugin/connector/mock"
+	"github.com/matryer/is"
+	"go.uber.org/mock/gomock"
+)
+
+func TestDestination_NoLifecycleEvent(t *testing.T) {
+	is := is.New(t)
+	ctx := context.Background()
+	ctrl := gomock.NewController(t)
+
+	dest, destinationMock := newTestDestination(ctx, t, ctrl)
+
+	// assume that the same config was already active last time
+	dest.Instance.LastActiveConfig = dest.Instance.Config
+
+	_ = expectDestinationOpen(dest, destinationMock)
+
+	// destination should not trigger any lifecycle event, because the config did not change
+
+	err := dest.Open(ctx)
+	is.NoErr(err)
+
+	// after plugin is started the last active config is still the same
+	is.Equal(dest.Instance.LastActiveConfig, dest.Instance.Config)
+}
+
+func TestDestination_LifecycleOnCreated_Success(t *testing.T) {
+	is := is.New(t)
+	ctx := context.Background()
+	ctrl := gomock.NewController(t)
+
+	dest, destinationMock := newTestDestination(ctx, t, ctrl)
+
+	// before plugin is started we expect LastActiveConfig to be empty
+	is.Equal(dest.Instance.LastActiveConfig, Config{})
+
+	_ = expectDestinationOpen(dest, destinationMock)
+
+	// destination should know it's the first run and trigger LifecycleOnCreated
+	destinationMock.EXPECT().LifecycleOnCreated(
+		gomock.Any(),
+		pconnector.DestinationLifecycleOnCreatedRequest{Config: dest.Instance.Config.Settings},
+	).Return(pconnector.DestinationLifecycleOnCreatedResponse{}, nil)
+
+	err := dest.Open(ctx)
+	is.NoErr(err)
+
+	// after plugin is started we expect LastActiveConfig to be set to Config
+	is.Equal(dest.Instance.LastActiveConfig, dest.Instance.Config)
+}
+
+func TestDestination_LifecycleOnUpdated_Success(t *testing.T) {
+	is := is.New(t)
+	ctx := context.Background()
+	ctrl := gomock.NewController(t)
+
+	dest, destinationMock := newTestDestination(ctx, t, ctrl)
+
+	// assume that there was a config already active, but with different settings
+	dest.Instance.LastActiveConfig.Settings = map[string]string{"last-active": "yes"}
+
+	_ = expectDestinationOpen(dest, destinationMock)
+
+	// destination should know it was already run once with a different config and trigger LifecycleOnUpdated
+	destinationMock.EXPECT().LifecycleOnUpdated(
+		gomock.Any(),
+		pconnector.DestinationLifecycleOnUpdatedRequest{
+			ConfigBefore: dest.Instance.LastActiveConfig.Settings,
+			ConfigAfter:  dest.Instance.Config.Settings,
+		},
+	).Return(pconnector.DestinationLifecycleOnUpdatedResponse{}, nil)
+
+	err := dest.Open(ctx)
+	is.NoErr(err)
+
+	// after plugin is started we expect LastActiveConfig to be set to Config
+	is.Equal(dest.Instance.LastActiveConfig, dest.Instance.Config)
+}
+
+func TestDestination_LifecycleOnCreated_Error(t *testing.T) {
+	is := is.New(t)
+	ctx := context.Background()
+	ctrl := gomock.NewController(t)
+
+	dest, destinationMock := newTestDestination(ctx, t, ctrl)
+
+	// before plugin is started we expect LastActiveConfig to be empty
+	is.Equal(dest.Instance.LastActiveConfig, Config{})
+
+	destinationMock.EXPECT().Configure(
+		gomock.Any(),
+		pconnector.DestinationConfigureRequest{Config: dest.Instance.Config.Settings},
+	).Return(pconnector.DestinationConfigureResponse{}, nil)
+
+	// destination should know it's the first run and trigger LifecycleOnCreated, but it fails
+	want := cerrors.New("whoops")
+	destinationMock.EXPECT().LifecycleOnCreated(
+		gomock.Any(),
+		pconnector.DestinationLifecycleOnCreatedRequest{Config: dest.Instance.Config.Settings},
+	).Return(pconnector.DestinationLifecycleOnCreatedResponse{}, want)
+
+	// destination should terminate plugin in case of an error
+	destinationMock.EXPECT().Teardown(gomock.Any(), pconnector.DestinationTeardownRequest{}).Return(pconnector.DestinationTeardownResponse{}, nil)
+
+	err := dest.Open(ctx)
+	is.True(cerrors.Is(err, want))
+
+	// after plugin is started we expect LastActiveConfig to be left unchanged
+	is.Equal(dest.Instance.LastActiveConfig, Config{})
+}
+
+func TestDestination_LifecycleOnDeleted_Success(t *testing.T) {
+	is := is.New(t)
+	ctx := context.Background()
+	ctrl := gomock.NewController(t)
+
+	dest, destinationMock := newTestDestination(ctx, t, ctrl)
+
+	// assume that there was a config already active, but with different settings
+	dest.Instance.LastActiveConfig.Settings = map[string]string{"last-active": "yes"}
+
+	destinationMock.EXPECT().LifecycleOnDeleted(
+		gomock.Any(),
+		pconnector.DestinationLifecycleOnDeletedRequest{Config: dest.Instance.LastActiveConfig.Settings},
+	).Return(pconnector.DestinationLifecycleOnDeletedResponse{}, nil)
+
+	destinationMock.EXPECT().Teardown(gomock.Any(), pconnector.DestinationTeardownRequest{}).Return(pconnector.DestinationTeardownResponse{}, nil)
+
+	err := dest.OnDelete(ctx)
+	is.NoErr(err)
+}
+
+func TestDestination_LifecycleOnCreated_BackwardsCompatibility(t *testing.T) {
+	is := is.New(t)
+	ctx := context.Background()
+	ctrl := gomock.NewController(t)
+
+	dest, destinationMock := newTestDestination(ctx, t, ctrl)
+
+	// before plugin is started we expect LastActiveConfig to be empty
+	is.Equal(dest.Instance.LastActiveConfig, Config{})
+
+	_ = expectDestinationOpen(dest, destinationMock)
+
+	// An older connector that predates lifecycle events returns
+	// pconnector.ErrUnimplemented (the "Unimplemented" gRPC status, unwrapped by
+	// the protocol client). Conduit must treat this as backwards compatible and
+	// open the destination without a fatal error. Regression test for #1999 —
+	// this is the exact path (created event during Open) that was crashing real
+	// pipelines against older connectors.
+	destinationMock.EXPECT().LifecycleOnCreated(
+		gomock.Any(),
+		pconnector.DestinationLifecycleOnCreatedRequest{Config: dest.Instance.Config.Settings},
+	).Return(pconnector.DestinationLifecycleOnCreatedResponse{}, pconnector.ErrUnimplemented)
+
+	err := dest.Open(ctx)
+	is.NoErr(err)
+}
+
+func TestDestination_LifecycleOnDeleted_BackwardsCompatibility(t *testing.T) {
+	is := is.New(t)
+	ctx := context.Background()
+	ctrl := gomock.NewController(t)
+
+	dest, destinationMock := newTestDestination(ctx, t, ctrl)
+
+	// assume that there was a config already active, but with different settings
+	dest.Instance.LastActiveConfig.Settings = map[string]string{"last-active": "yes"}
+
+	// we should ignore the error if the plugin does not implement lifecycle
+	// events. Older connectors surface this as pconnector.ErrUnimplemented (see
+	// the trigger in destination.go and issue #1999).
+	destinationMock.EXPECT().LifecycleOnDeleted(
+		gomock.Any(),
+		pconnector.DestinationLifecycleOnDeletedRequest{Config: dest.Instance.LastActiveConfig.Settings},
+	).Return(pconnector.DestinationLifecycleOnDeletedResponse{}, pconnector.ErrUnimplemented)
+
+	destinationMock.EXPECT().Teardown(gomock.Any(), pconnector.DestinationTeardownRequest{}).Return(pconnector.DestinationTeardownResponse{}, nil)
+
+	err := dest.OnDelete(ctx)
+	is.NoErr(err)
+}
+
+func TestDestination_LifecycleOnDeleted_Skip(t *testing.T) {
+	is := is.New(t)
+	ctx := context.Background()
+	ctrl := gomock.NewController(t)
+
+	dest, _ := newTestDestination(ctx, t, ctrl)
+
+	// assume that no config was active before, in that case deleted event
+	// should be skipped
+	dest.Instance.LastActiveConfig = Config{}
+
+	err := dest.OnDelete(ctx)
+	is.NoErr(err)
+}
+
+// TestDestination_PluginBatchingOverrides (#3321): when the arch-v2 engine
+// batches a destination it lists the sdk.batch.* keys whose effective value
+// would turn the connector SDK's batcher on, and configure hands the plugin
+// "0" for them. Deleting them (what main did) let the SDK apply the
+// connector's own default, so S3 batched 1000 / 1 s behind the engine. With no
+// overrides (the classic engine, or nothing to neutralise) the settings reach
+// Configure verbatim.
+func TestDestination_PluginBatchingOverrides(t *testing.T) {
+	for name, tc := range map[string]struct {
+		settings  map[string]string
+		overrides []string
+		want      map[string]string
+	}{
+		"values replaced": {
+			settings:  map[string]string{"foo": "bar", "sdk.batch.size": "100", "sdk.batch.delay": "10ms"},
+			overrides: []string{"sdk.batch.size", "sdk.batch.delay"},
+			want:      map[string]string{"foo": "bar", "sdk.batch.size": "0", "sdk.batch.delay": "0"},
+		},
+		"absent keys added (spec default batches)": {
+			settings:  map[string]string{"foo": "bar"},
+			overrides: []string{"sdk.batch.size", "sdk.batch.delay"},
+			want:      map[string]string{"foo": "bar", "sdk.batch.size": "0", "sdk.batch.delay": "0"},
+		},
+		"padded key replaced, no second key": {
+			//nolint:gocritic // the padded key is the point
+			settings:  map[string]string{"foo": "bar", " sdk.batch.size ": "100"},
+			overrides: []string{"sdk.batch.size"},
+			//nolint:gocritic // the padded key is the point
+			want: map[string]string{"foo": "bar", " sdk.batch.size ": "0"},
+		},
+		"only listed keys": {
+			settings:  map[string]string{"foo": "bar", "sdk.batch.size": "lots", "sdk.batch.delay": "10ms"},
+			overrides: []string{"sdk.batch.delay"},
+			want:      map[string]string{"foo": "bar", "sdk.batch.size": "lots", "sdk.batch.delay": "0"},
+		},
+		"no overrides: verbatim (classic engine)": {
+			settings: map[string]string{"foo": "bar", "sdk.batch.size": "100", "sdk.batch.delay": "10ms"},
+			want:     map[string]string{"foo": "bar", "sdk.batch.size": "100", "sdk.batch.delay": "10ms"},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			is := is.New(t)
+			ctx := context.Background()
+			ctrl := gomock.NewController(t)
+
+			dest, destinationMock := newTestDestination(ctx, t, ctrl)
+			dest.Instance.Config.Settings = tc.settings
+			dest.Instance.LastActiveConfig = dest.Instance.Config
+			if tc.overrides != nil {
+				dest.SetPluginBatchingOverrides(tc.overrides...)
+			}
+
+			destinationMock.EXPECT().Configure(gomock.Any(), pconnector.DestinationConfigureRequest{
+				Config: tc.want,
+			}).Return(pconnector.DestinationConfigureResponse{}, nil)
+			destinationMock.EXPECT().Open(gomock.Any(), pconnector.DestinationOpenRequest{}).Return(pconnector.DestinationOpenResponse{}, nil)
+			stream := &builtin.InMemoryDestinationRunStream{}
+			destinationMock.EXPECT().NewStream().Return(stream)
+			destinationMock.EXPECT().Run(gomock.Any(), stream).DoAndReturn(func(ctx context.Context, _ pconnector.DestinationRunStream) error {
+				stream.Init(ctx)
+				return nil
+			})
+
+			is.NoErr(dest.Open(ctx))
+			// The stored config is untouched: only the copy handed to the
+			// plugin carries the overrides.
+			is.Equal(dest.Instance.Config.Settings, tc.settings)
+		})
+	}
+}
+
+// TestApplyPluginBatchingOverrides_NilSettings: a destination with no
+// stored settings still gets the injected keys (no nil-map write).
+func TestApplyPluginBatchingOverrides_NilSettings(t *testing.T) {
+	is := is.New(t)
+	is.Equal(applyPluginBatchingOverrides(nil, []string{"sdk.batch.size"}), map[string]string{"sdk.batch.size": "0"})
+	is.Equal(applyPluginBatchingOverrides(nil, nil), map[string]string(nil))
+}
+
+func newTestDestination(ctx context.Context, t *testing.T, ctrl *gomock.Controller) (*Destination, *mock.DestinationPlugin) {
+	is := is.New(t)
+	logger := log.Nop()
+	db := &inmemory.DB{}
+	persister := NewPersister(logger, db, DefaultPersisterDelayThreshold, 1)
+
+	instance := &Instance{
+		ID:   "test-connector-id",
+		Type: TypeDestination,
+		Config: Config{
+			Name: "test-name",
+			Settings: map[string]string{
+				"foo": "bar",
+			},
+		},
+		PipelineID:    "test-pipeline-id",
+		Plugin:        "test-plugin",
+		ProvisionedBy: ProvisionTypeAPI,
+	}
+	instance.Init(logger, persister)
+
+	destinationMock := mock.NewDestinationPlugin(ctrl)
+	pluginDispenser := mock.NewDispenser(ctrl)
+	pluginDispenser.EXPECT().DispenseDestination().Return(destinationMock, nil).AnyTimes()
+
+	conn, err := instance.Connector(ctx, fakePluginFetcher{instance.Plugin: pluginDispenser})
+	is.NoErr(err)
+	dest, ok := conn.(*Destination)
+	is.True(ok)
+	return dest, destinationMock
+}
+
+func expectDestinationOpen(dest *Destination, destinationMock *mock.DestinationPlugin) *builtin.InMemoryDestinationRunStream {
+	stream := &builtin.InMemoryDestinationRunStream{}
+
+	destinationMock.EXPECT().Configure(
+		gomock.Any(),
+		pconnector.DestinationConfigureRequest{
+			Config: dest.Instance.Config.Settings,
+		},
+	).Return(pconnector.DestinationConfigureResponse{}, nil)
+	destinationMock.EXPECT().Open(gomock.Any(), pconnector.DestinationOpenRequest{}).Return(pconnector.DestinationOpenResponse{}, nil)
+	destinationMock.EXPECT().NewStream().Return(stream)
+	destinationMock.EXPECT().Run(gomock.Any(), stream).DoAndReturn(func(ctx context.Context, _ pconnector.DestinationRunStream) error {
+		stream.Init(ctx)
+		return nil
+	})
+
+	return stream
+}
+
+// TestDestination_Ack_HonoursOwnContext: Ack used to ignore its ctx and block in
+// stream.Recv until the stream's own (Open) context ended. It must return when
+// its ctx ends, and the abandoned receive must not swallow the next response.
+func TestDestination_Ack_HonoursOwnContext(t *testing.T) {
+	is := is.New(t)
+	ctx := context.Background()
+	ctrl := gomock.NewController(t)
+
+	dest, destinationMock := newTestDestination(ctx, t, ctrl)
+	dest.Instance.LastActiveConfig = dest.Instance.Config // no lifecycle event
+	stream := expectDestinationOpen(dest, destinationMock)
+	is.NoErr(dest.Open(ctx))
+	defer func() {
+		destinationMock.EXPECT().Teardown(gomock.Any(), gomock.Any()).Return(pconnector.DestinationTeardownResponse{}, nil)
+		_ = dest.Teardown(ctx)
+	}()
+
+	ackCtx, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
+	defer cancel()
+	_, err := dest.Ack(ackCtx)
+	is.True(cerrors.Is(err, context.DeadlineExceeded)) // returned on its own ctx, not blocked on the stream
+
+	// The receive abandoned above is picked up by the next Ack.
+	go func() {
+		_ = stream.Server().Send(pconnector.DestinationRunResponse{
+			Acks: []pconnector.DestinationRunResponseAck{{Position: opencdc.Position("p1")}},
+		})
+	}()
+	acks, err := dest.Ack(ctx)
+	is.NoErr(err)
+	is.Equal(len(acks), 1)
+	is.Equal(acks[0].Position, opencdc.Position("p1"))
+}

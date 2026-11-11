@@ -1,0 +1,437 @@
+// Copyright © 2026 Meroxa, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// These are the full-stack integration tests for `conduit doctor`: they
+// build the real cobra command (via ecdysis, exactly like cmd/conduit/cli
+// does) and drive it through cmd.ExecuteC(), asserting on both the
+// process-level exit code (via cecdysis.ResultExitCode, mirroring what
+// cmd/conduit/cli itself reads) and the rendered output — proving the
+// decorator/exit-code wiring described in cecdysis.CommandWithResultExitCode
+// actually behaves as designed for a real multi-result command, not just
+// the throwaway test command in cecdysis's own tests.
+package doctor_test
+
+import (
+	"bytes"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/conduitio/conduit/cmd/conduit/cecdysis"
+	"github.com/conduitio/conduit/cmd/conduit/internal/testutils"
+	"github.com/conduitio/conduit/cmd/conduit/root/doctor"
+	"github.com/conduitio/conduit/cmd/conduit/root/doctor/doctorcheck"
+	"github.com/conduitio/ecdysis"
+	json "github.com/goccy/go-json"
+	"github.com/matryer/is"
+	"github.com/spf13/cobra"
+)
+
+// buildDoctorCmdEnv wires a fresh DoctorCommand through the same decorator
+// cmd/conduit/cli uses for every CommandWithResult command, standalone
+// (not under the full root tree — root.go's own wiring is a one-line
+// registration, not doctor-specific behavior).
+func buildDoctorCmdEnv(t *testing.T, environ func() []string) *cobra.Command {
+	t.Helper()
+	e := ecdysis.New(ecdysis.WithDecorators(cecdysis.CommandWithResultDecorator{}))
+	return e.MustBuildCobraCommand(&doctor.DoctorCommand{Environ: environ})
+}
+
+// runDoctor runs cmd with args and returns stdout+stderr combined, the leaf
+// *cobra.Command (for ResultExitCode), and any hard-failure error.
+func runDoctor(t *testing.T, args ...string) (output string, leaf *cobra.Command, err error) {
+	t.Helper()
+	// An empty fake environment: tests that do not care about
+	// plugins.standalone_env must not depend on the machine's environment.
+	return runDoctorEnv(t, func() []string { return []string{} }, args...)
+}
+
+// runDoctorEnv is runDoctor with a fixed fake environment (see buildDoctorCmdEnv).
+func runDoctorEnv(t *testing.T, environ func() []string, args ...string) (output string, leaf *cobra.Command, err error) {
+	t.Helper()
+	cmd := buildDoctorCmdEnv(t, environ)
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetErr(&out)
+	cmd.SetArgs(args)
+
+	leaf, err = cmd.ExecuteC()
+	return out.String(), leaf, err
+}
+
+// tempConfigArgs creates a fresh, isolated temp directory (with the
+// "pipelines" subdirectory Config.Validate() requires — see
+// doctorcheck_test.go's validConfig for why) and returns the flags needed
+// to point a doctor run at it instead of the developer's real
+// conduit.yaml / conduit.db / bound ports.
+func tempConfigArgs(t *testing.T) (args []string, dir string) {
+	t.Helper()
+	dir = t.TempDir()
+	is.New(t).NoErr(os.MkdirAll(filepath.Join(dir, "pipelines"), 0o755))
+	return []string{
+		"--config.path=" + filepath.Join(dir, "conduit.yaml"),
+		"--db.badger.path=" + filepath.Join(dir, "conduit.db"),
+		"--pipelines.path=" + filepath.Join(dir, "pipelines"),
+		"--connectors.path=" + filepath.Join(dir, "connectors"),
+		"--processors.path=" + filepath.Join(dir, "processors"),
+		"--api.grpc.address=127.0.0.1:0",
+		"--api.http.address=127.0.0.1:0",
+	}, dir
+}
+
+// TestDoctor_AllGood_JSON_ExitCode0 exercises the full pipeline end to end:
+// a valid, isolated config should produce ok:true, error:null, and exit 0.
+func TestDoctor_AllGood_JSON_ExitCode0(t *testing.T) {
+	is := is.New(t)
+	args, _ := tempConfigArgs(t)
+	args = append(args, "--json")
+
+	out, leaf, err := runDoctor(t, args...)
+	is.NoErr(err)
+
+	code, hasCode := cecdysis.ResultExitCode(leaf)
+	if hasCode {
+		is.Equal(code, 0) // an explicit annotation, if any, must be OK
+	}
+
+	// Family A golden fixture (v0.19 workstream 8 — cli-contract.md §6 AC-3):
+	// doctor's real --json output must validate against the shared envelope
+	// schema; see cmd/conduit/cli/schema_golden_test.go's completeness walk.
+	is.NoErr(testutils.ValidateEnvelope([]byte(out)))
+
+	var got cecdysis.Result
+	is.NoErr(json.Unmarshal([]byte(out), &got))
+	is.Equal(got.Command, "doctor")
+	is.True(got.OK)
+	is.True(got.Error == nil)
+}
+
+// TestDoctor_InvalidLogLevel_JSON_ExitCode2 is the doctor-level version of
+// acceptance criterion 5, driven through the real cobra command: an
+// invalid config field fails config.validate, and — critically — the
+// domain finding still yields exit code 2 despite ExecuteWithResult
+// returning a nil error (see cecdysis.CommandWithResultExitCode's doc for
+// why this needs its own test, not just a check-level one).
+func TestDoctor_InvalidLogLevel_JSON_ExitCode2(t *testing.T) {
+	is := is.New(t)
+	args, _ := tempConfigArgs(t)
+	args = append(args, "--json", "--log.level=bogus", "--check", doctorcheck.NameConfigValidate)
+
+	out, leaf, err := runDoctor(t, args...)
+	is.NoErr(err) // a domain finding is not a HARD failure
+
+	code, ok := cecdysis.ResultExitCode(leaf)
+	is.True(ok)
+	is.Equal(code, 2)
+
+	var got cecdysis.Result
+	is.NoErr(json.Unmarshal([]byte(out), &got))
+	is.Equal(got.Command, "doctor")
+	is.True(!got.OK)
+	is.True(got.Error == nil) // domain finding, not a HARD failure — envelope error stays null
+
+	result, ok := got.Result.(map[string]any)
+	is.True(ok)
+	checks, ok := result["checks"].([]any)
+	is.True(ok)
+	is.Equal(len(checks), 1) // --check filtered to exactly one
+	first, ok := checks[0].(map[string]any)
+	is.True(ok)
+	is.Equal(first["status"], "fail")
+	is.Equal(first["configPath"], "log.level")
+}
+
+// TestDoctor_UnknownCheckName_HardFailure_Exit2 is acceptance criterion 8:
+// an unknown --check name is a HARD command failure (envelope error set),
+// exit 2, listing valid names.
+func TestDoctor_UnknownCheckName_HardFailure_Exit2(t *testing.T) {
+	is := is.New(t)
+	args, _ := tempConfigArgs(t)
+	args = append(args, "--json", "--check", "bogus.check")
+
+	out, _, err := runDoctor(t, args...)
+	is.True(err != nil)
+
+	var got cecdysis.Result
+	is.NoErr(json.Unmarshal([]byte(out), &got))
+	is.True(!got.OK)
+	is.True(got.Error != nil)
+	is.Equal(got.Error.Code, "common.invalid_argument")
+	is.True(len(got.Error.Suggestion) > 0) // lists valid names
+}
+
+// TestDoctor_StandaloneCompatWithoutDeep_HardFailure asserts selecting the
+// --deep-gated check without --deep is rejected up front with a clear
+// message, rather than silently running zero checks.
+func TestDoctor_StandaloneCompatWithoutDeep_HardFailure(t *testing.T) {
+	is := is.New(t)
+	args, _ := tempConfigArgs(t)
+	args = append(args, "--check", doctorcheck.NamePluginsStandaloneCompat)
+
+	_, _, err := runDoctor(t, args...)
+	is.True(err != nil)
+}
+
+// TestDoctor_CheckFilter_RunsExactlyOne asserts --check narrows the run to
+// only the named check (acceptance criterion 8, the filtering half).
+func TestDoctor_CheckFilter_RunsExactlyOne(t *testing.T) {
+	is := is.New(t)
+	args, _ := tempConfigArgs(t)
+	args = append(args, "--json", "--check", doctorcheck.NamePluginsBuiltin)
+
+	out, _, err := runDoctor(t, args...)
+	is.NoErr(err)
+
+	var got cecdysis.Result
+	is.NoErr(json.Unmarshal([]byte(out), &got))
+	result, ok := got.Result.(map[string]any)
+	is.True(ok)
+	checks, ok := result["checks"].([]any)
+	is.True(ok)
+	is.Equal(len(checks), 1)
+	first, ok := checks[0].(map[string]any)
+	is.True(ok)
+	is.Equal(first["name"], doctorcheck.NamePluginsBuiltin)
+}
+
+// TestDoctor_Quiet_SuppressesPassButNotWarn exercises the human-readable
+// render path with --quiet: a passing check's line disappears, a warning's
+// does not.
+func TestDoctor_Quiet_SuppressesPassButNotWarn(t *testing.T) {
+	is := is.New(t)
+	args, _ := tempConfigArgs(t)
+	args = append(args, "--quiet", "--check", doctorcheck.NamePluginsBuiltin, "--check", doctorcheck.NamePluginsConnectorsDir)
+
+	out, _, err := runDoctor(t, args...)
+	is.NoErr(err)
+
+	// plugins.builtin passes and must be suppressed by --quiet...
+	is.True(!strings.Contains(out, doctorcheck.NamePluginsBuiltin))
+	// ...but plugins.connectors_dir (missing dir, a Warn) must still show.
+	is.True(strings.Contains(out, doctorcheck.NamePluginsConnectorsDir))
+}
+
+// TestDoctor_NoDBDirLeftBehind_EndToEnd is acceptance criterion 11 (no side
+// effects) driven through the real command, not just doctorcheck directly.
+func TestDoctor_NoDBDirLeftBehind_EndToEnd(t *testing.T) {
+	is := is.New(t)
+	args, dir := tempConfigArgs(t)
+	dbPath := filepath.Join(dir, "fresh-subdir", "conduit.db")
+
+	_, statErr := os.Stat(dbPath)
+	is.True(os.IsNotExist(statErr))
+
+	// Override the --db.badger.path tempConfigArgs already set, to point at
+	// the not-yet-existing path this test actually checks.
+	args = append(args, "--db.badger.path="+dbPath, "--check", doctorcheck.NameStoreReachable)
+	_, _, err := runDoctor(t, args...)
+	is.NoErr(err)
+
+	_, statErr = os.Stat(dbPath)
+	is.True(os.IsNotExist(statErr)) // still doesn't exist after the run
+}
+
+// fakeEnv is the fixed environment the standalone_env tests classify. Every
+// value is a sentinel that must never appear in any output. The flagged names
+// are chosen so that the first and the last in sorted order are both covered:
+// "AAA_..." sorts before everything else and "zzz_..." (lower case) after.
+func fakeEnv() (environ func() []string, sentinels []string) {
+	kv := [][2]string{
+		{"AAA_FIRST_TOKEN", "VALUE-MUST-NOT-APPEAR-1"},
+		{"AWS_SECRET_ACCESS_KEY", "VALUE-MUST-NOT-APPEAR-2"},
+		{"SENTINEL_API_TOKEN", "VALUE-MUST-NOT-APPEAR-3"},
+		{"POSTGRES_URL", "VALUE-MUST-NOT-APPEAR-4"},
+		{"zzz_last_password", "VALUE-MUST-NOT-APPEAR-5"},
+		{"PATH", "VALUE-MUST-NOT-APPEAR-6"},
+		{"HOME", "VALUE-MUST-NOT-APPEAR-7"},
+	}
+	env := make([]string, 0, len(kv))
+	for _, e := range kv {
+		env = append(env, e[0]+"="+e[1])
+		sentinels = append(sentinels, e[1])
+	}
+	return func() []string { return env }, sentinels
+}
+
+// standaloneEnvFinding runs only plugins.standalone_env with --json against
+// the fake environment and returns its decoded check entry plus the raw output.
+func standaloneEnvFinding(t *testing.T, args []string) (map[string]any, string) {
+	t.Helper()
+	is := is.New(t)
+	args = append(args, "--json", "--check", doctorcheck.NamePluginsStandaloneEnv)
+
+	environ, sentinels := fakeEnv()
+	out, _, err := runDoctorEnv(t, environ, args...)
+	is.NoErr(err)
+	is.NoErr(testutils.ValidateEnvelope([]byte(out)))
+	for _, s := range sentinels {
+		is.True(!strings.Contains(out, s))
+	}
+
+	var got cecdysis.Result
+	is.NoErr(json.Unmarshal([]byte(out), &got))
+	result, ok := got.Result.(map[string]any)
+	is.True(ok)
+	checks, ok := result["checks"].([]any)
+	is.True(ok)
+	is.Equal(len(checks), 1)
+	first, ok := checks[0].(map[string]any)
+	is.True(ok)
+	is.Equal(first["name"], doctorcheck.NamePluginsStandaloneEnv)
+	return first, out
+}
+
+func installFakePlugin(t *testing.T, dir string) {
+	t.Helper()
+	is := is.New(t)
+	is.NoErr(os.MkdirAll(filepath.Join(dir, "connectors"), 0o755))
+	is.NoErr(os.WriteFile(filepath.Join(dir, "connectors", "conduit-connector-fake"), []byte("#!/bin/sh\n"), 0o755))
+}
+
+// TestDoctor_StandaloneEnv_JSON asserts the finding carries the stable code and
+// the variable NAMES, and never their values. It runs against a fixed fake
+// environment, so it does not depend on the machine it runs on.
+func TestDoctor_StandaloneEnv_JSON(t *testing.T) {
+	is := is.New(t)
+	args, dir := tempConfigArgs(t)
+	installFakePlugin(t, dir)
+	for _, n := range []string{"AAA_FIRST_TOKEN", "AWS_SECRET_ACCESS_KEY", "SENTINEL_API_TOKEN", "POSTGRES_URL", "zzz_last_password"} {
+		args = append(args, "--connectors.standalone.env.allow", n) // only allowlisted names are passed, so only they are reported
+	}
+
+	finding, out := standaloneEnvFinding(t, args) // also asserts no sentinel value appears in out
+	is.Equal(finding["status"], "warn")
+	is.Equal(finding["code"], "plugin.standalone_env_passed")
+	is.Equal(finding["configPath"], "connectors.standalone.env-warning")
+	msg, _ := finding["message"].(string)
+	for _, name := range []string{"AAA_FIRST_TOKEN", "AWS_SECRET_ACCESS_KEY", "SENTINEL_API_TOKEN", "POSTGRES_URL", "zzz_last_password"} {
+		is.True(strings.Contains(msg, name))
+	}
+	is.True(strings.Contains(msg, "5 host environment variable(s)"))
+	is.True(!strings.Contains(out, "HOME")) // benign names are neither flagged nor echoed
+}
+
+// Without an allowlist nothing sensitive is passed, so the finding passes.
+func TestDoctor_StandaloneEnv_NothingPassedByDefault(t *testing.T) {
+	is := is.New(t)
+	args, dir := tempConfigArgs(t)
+	installFakePlugin(t, dir)
+
+	finding, _ := standaloneEnvFinding(t, args)
+	is.Equal(finding["status"], "pass")
+	msg, _ := finding["message"].(string)
+	is.True(strings.Contains(msg, "no sensitive host environment variables are passed"))
+}
+
+func TestDoctor_StandaloneEnv_Silenced(t *testing.T) {
+	is := is.New(t)
+	args, dir := tempConfigArgs(t)
+	installFakePlugin(t, dir)
+	args = append(args, "--connectors.standalone.env-warning=false")
+
+	finding, _ := standaloneEnvFinding(t, args)
+	is.Equal(finding["status"], "pass")
+	_, hasCode := finding["code"]
+	is.True(!hasCode)
+}
+
+func TestDoctor_StandaloneEnv_NoPluginsInstalled(t *testing.T) {
+	is := is.New(t)
+	args, _ := tempConfigArgs(t)
+
+	finding, _ := standaloneEnvFinding(t, args)
+	is.Equal(finding["status"], "pass")
+}
+
+// TestDoctor_StandaloneEnv_DefaultEnvironIsProcessEnvironment pins the
+// production default: with no injected environment, doctor classifies the
+// process environment. The sentinel and its fake value come from t.Setenv.
+func TestDoctor_StandaloneEnv_DefaultEnvironIsProcessEnvironment(t *testing.T) {
+	is := is.New(t)
+	const name, value = "SENTINEL_DEFAULT_SEAM_TOKEN", "FAKE-VALUE-MUST-NOT-APPEAR-DEFAULT"
+	t.Setenv(name, value)
+	args, dir := tempConfigArgs(t)
+	installFakePlugin(t, dir)
+	args = append(args, "--connectors.standalone.env.allow", name, "--json", "--check", doctorcheck.NamePluginsStandaloneEnv)
+
+	out, _, err := runDoctorEnv(t, nil, args...)
+	is.NoErr(err)
+	is.True(strings.Contains(out, name))
+	is.True(!strings.Contains(out, value))
+}
+
+// ambientFinding runs only connectors.ambient_credentials with --json against a
+// fixed environment and returns its decoded entry and the exit code.
+func ambientFinding(t *testing.T, env []string, extra ...string) (map[string]any, string, int) {
+	t.Helper()
+	is := is.New(t)
+	args, _ := tempConfigArgs(t)
+	args = append(args, extra...)
+	args = append(args, "--json", "--check", doctorcheck.NameConnectorsAmbientCredentials)
+	out, leaf, err := runDoctorEnv(t, func() []string { return env }, args...)
+	is.NoErr(err)
+	is.NoErr(testutils.ValidateEnvelope([]byte(out)))
+	var got cecdysis.Result
+	is.NoErr(json.Unmarshal([]byte(out), &got))
+	result, ok := got.Result.(map[string]any)
+	is.True(ok)
+	checks, ok := result["checks"].([]any)
+	is.True(ok)
+	is.Equal(len(checks), 1)
+	first, ok := checks[0].(map[string]any)
+	is.True(ok)
+	code, _ := cecdysis.ResultExitCode(leaf)
+	return first, out, code
+}
+
+func TestDoctor_AmbientCredentials(t *testing.T) {
+	t.Run("default is off and passes", func(t *testing.T) {
+		is := is.New(t)
+		f, _, code := ambientFinding(t, nil)
+		is.Equal(f["status"], "pass")
+		is.Equal(code, 0)
+	})
+	t.Run("enabled shows the effective policy", func(t *testing.T) {
+		is := is.New(t)
+		f, _, code := ambientFinding(t, nil,
+			"--connectors.ambient-credentials.enabled=true",
+			"--connectors.ambient-credentials.allow-resources", "acme-ingest-prod",
+			"--connectors.ambient-credentials.allow-endpoints", "https://minio.internal:9000")
+		is.Equal(f["status"], "pass")
+		is.Equal(code, 0)
+		msg, _ := f["message"].(string)
+		is.True(strings.Contains(msg, "acme-ingest-prod"))
+		is.True(strings.Contains(msg, "https://minio.internal:9000"))
+	})
+	t.Run("enabled without resources fails like conduit run would", func(t *testing.T) {
+		is := is.New(t)
+		f, _, code := ambientFinding(t, nil, "--connectors.ambient-credentials.enabled=true")
+		is.Equal(f["status"], "fail")
+		is.Equal(f["code"], "common.invalid_argument")
+		is.Equal(f["configPath"], "connectors.ambient-credentials.allow-resources")
+		is.Equal(code, 2)
+	})
+	t.Run("proxy variable without allow-proxy fails and never prints the value", func(t *testing.T) {
+		is := is.New(t)
+		f, out, code := ambientFinding(t, []string{"HTTPS_PROXY=http://user:VALUE-MUST-NOT-APPEAR@proxy:3128"},
+			"--connectors.ambient-credentials.enabled=true",
+			"--connectors.ambient-credentials.allow-resources", "acme-ingest-prod")
+		is.Equal(f["status"], "fail")
+		is.Equal(f["code"], "config.ambient_proxy_env")
+		is.True(code != 0)
+		is.True(strings.Contains(out, "HTTPS_PROXY"))
+		is.True(!strings.Contains(out, "VALUE-MUST-NOT-APPEAR"))
+	})
+}

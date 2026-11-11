@@ -1,0 +1,176 @@
+// Copyright © 2025 Meroxa, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package funnel
+
+import (
+	"strings"
+	"time"
+
+	"github.com/conduitio/conduit-commons/opencdc"
+	"github.com/conduitio/conduit/pkg/connector"
+	"github.com/conduitio/conduit/pkg/foundation/metrics"
+	"github.com/conduitio/conduit/pkg/foundation/metrics/measure"
+)
+
+type ConnectorMetrics interface {
+	Observe(records []opencdc.Record, start time.Time)
+	// ObserveError records a read/write/ack failure this connector returned.
+	// It deliberately does not record the error message or code: those are
+	// unbounded in cardinality and would explode the Prometheus label space.
+	// Operators who need the message get it from the pipeline error surfaced
+	// through the API and logs.
+	ObserveError()
+}
+
+type NoOpConnectorMetrics struct{}
+
+func (m NoOpConnectorMetrics) Observe([]opencdc.Record, time.Time) {}
+func (m NoOpConnectorMetrics) ObserveError()                       {}
+
+type ConnectorMetricsImpl struct {
+	timer     metrics.Timer
+	histogram metrics.RecordBytesHistogram
+	records   metrics.Counter
+	errors    metrics.Counter
+}
+
+// NewConnectorMetrics builds the shared connector throughput/latency metrics
+// for one connector instance. componentID is the connector's instance ID
+// (same ID space as the topology nodes and the conduit_inspector_* metrics),
+// recorded via the component_id label so per-node dashboards can attribute
+// throughput to a specific connector instance.
+func NewConnectorMetrics(pipelineName, pluginName string, connType connector.Type, componentID string) ConnectorMetricsImpl {
+	connTypeName := strings.ToLower(connType.String())
+
+	timer := measure.ConnectorExecutionDurationTimer.WithValues(
+		pipelineName,
+		pluginName,
+		connTypeName,
+		componentID,
+	)
+
+	histogram := measure.ConnectorBytesHistogram.WithValues(
+		pipelineName,
+		pluginName,
+		connTypeName,
+		componentID,
+	)
+
+	records := measure.ConnectorRecordsCounter.WithValues(
+		pipelineName,
+		pluginName,
+		connTypeName,
+		componentID,
+	)
+
+	errors := measure.ConnectorErrorsCounter.WithValues(
+		pipelineName,
+		pluginName,
+		connTypeName,
+		componentID,
+	)
+
+	return ConnectorMetricsImpl{
+		timer:     timer,
+		histogram: metrics.NewRecordBytesHistogram(histogram),
+		records:   records,
+		errors:    errors,
+	}
+}
+
+func (m ConnectorMetricsImpl) ObserveError() {
+	m.errors.Inc()
+}
+
+func (m ConnectorMetricsImpl) Observe(records []opencdc.Record, start time.Time) {
+	// Precalculate sizes so that we don't need to hold a reference to records
+	// and observations can happen in a goroutine.
+	// An empty batch is legal and reachable, so guard before dividing by the
+	// count. time.Duration(0) makes the division below an integer
+	// divide-by-zero, which PANICS on the worker's own goroutine — not inside
+	// the goroutine spawned below — and a panic on the data path is
+	// unrecoverable: it takes down the whole Conduit process, every pipeline
+	// in it, not just this one.
+	//
+	// Both call sites can pass an empty slice:
+	//   - SourceTask.Do observes whatever source.Read returned, and
+	//     connector.Source.Read does not reject an empty Records slice. The Go
+	//     SDK happens to skip empties, but a non-Go plugin (e.g. the Python
+	//     SDK) is not bound by that.
+	//   - DestinationTask.Do observes records[ackCount:ackCount+len(acks)] and
+	//     validateAcks explicitly permits len(acks) == 0.
+	//
+	// ProcessorTask.Do already guards its own equivalent; the connector path
+	// did not. Nothing to observe means nothing to record — return early.
+	if len(records) == 0 {
+		return
+	}
+
+	// The record counter is incremented synchronously, before the goroutine
+	// below observes bytes and latency: it is the one observation that must
+	// not be lost if the process is killed mid-batch (a counter is cheap and
+	// carries no per-record work), and recording it before the goroutine keeps
+	// the "N records processed" signal exact.
+	m.records.Inc(float64(len(records)))
+
+	sizes := make([]float64, len(records))
+	for i, rec := range records {
+		sizes[i] = m.histogram.SizeOf(rec)
+	}
+	tookPerRecord := time.Since(start) / time.Duration(len(sizes))
+	go func() {
+		for i := range len(sizes) {
+			m.timer.Update(tookPerRecord)
+			m.histogram.H.Observe(sizes[i])
+		}
+	}()
+}
+
+// flushTriggers is every FlushTrigger, in a fixed order.
+var flushTriggers = []FlushTrigger{
+	FlushTriggerSize, FlushTriggerBytes, FlushTriggerDeadlineArrival, FlushTriggerDeadlineTimer,
+	FlushTriggerAckQueue, FlushTriggerDrain, FlushTriggerClose,
+}
+
+// FlushMetricsImpl backs FlushMetrics with conduit_funnel_destination_flushes_total
+// and conduit_funnel_destination_flush_linger_seconds for one destination.
+type FlushMetricsImpl struct {
+	flushes map[FlushTrigger]metrics.Counter
+	linger  metrics.Timer
+}
+
+// NewFlushMetrics builds the flush metrics of one batching destination
+// connector instance. The per-trigger counters are resolved once here, not on
+// every flush.
+func NewFlushMetrics(pipelineName, pluginName, componentID string) FlushMetricsImpl {
+	flushes := make(map[FlushTrigger]metrics.Counter, len(flushTriggers))
+	for _, tr := range flushTriggers {
+		flushes[tr] = measure.FunnelDestinationFlushesCounter.WithValues(pipelineName, pluginName, componentID, string(tr))
+	}
+	return FlushMetricsImpl{
+		flushes: flushes,
+		linger:  measure.FunnelDestinationFlushLingerTimer.WithValues(pipelineName, pluginName, componentID),
+	}
+}
+
+func (m FlushMetricsImpl) ObserveFlush(trigger FlushTrigger) {
+	if c, ok := m.flushes[trigger]; ok {
+		c.Inc()
+	}
+}
+
+func (m FlushMetricsImpl) ObserveLinger(linger time.Duration) {
+	m.linger.Update(linger)
+}

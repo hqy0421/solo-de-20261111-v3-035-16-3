@@ -1,0 +1,219 @@
+// Copyright © 2022 Meroxa, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package measure
+
+import (
+	"github.com/conduitio/conduit/pkg/foundation/metrics"
+	"github.com/conduitio/conduit/pkg/foundation/metrics/prometheus"
+)
+
+// Metric label names, defined as constants to avoid typos and repetition across
+// the metric definitions below.
+const (
+	labelPipelineName = "pipeline_name"
+	labelType         = "type"
+	labelPlugin       = "plugin"
+	labelOutcome      = "outcome"
+	// labelComponentID is the ID of the pipeline component (connector or
+	// processor) a metric belongs to. It uses the same ID space as the
+	// topology nodes and as the existing conduit_inspector_sessions /
+	// conduit_inspector_dropped_records_total metrics (see
+	// pkg/inspector.Inspector.NewSession), so per-node dashboards can join
+	// across all of these metrics on this label.
+	labelComponentID = "component_id"
+	// labelTrigger is what took a batching destination's buffer for writing
+	// (see FunnelDestinationFlushesCounter). It has a fixed set of values.
+	labelTrigger = "trigger"
+)
+
+// Any changes in metrics defined below should also be reflected in the metrics documentation.
+var (
+	ConduitInfo = metrics.NewLabeledGauge("conduit_info",
+		"Information about Conduit.",
+		[]string{"version"})
+
+	PipelinesGauge = metrics.NewLabeledGauge("conduit_pipelines",
+		"Number of pipelines by status.",
+		[]string{"status"})
+	PipelineStatusGauge = metrics.NewLabeledGauge(
+		"conduit_pipeline_status",
+		"A pipeline's status (as specified in the gRPC API: https://buf.build/conduitio/conduit/docs/main:api.v1#api.v1.Pipeline.State).",
+		[]string{labelPipelineName},
+	)
+	PipelineRecoveringCount = metrics.NewLabeledCounter(
+		"pipeline_recovering_count",
+		"Number of times a pipeline have been recovering (by pipeline name)",
+		[]string{labelPipelineName},
+	)
+	// PipelineStatusPersistFailures counts pipeline status writes that did
+	// not reach the pipeline store (#2898). A run keeps going when its status
+	// write fails, so this counter is how an operator sees that the stored
+	// status, which decides what the next boot starts, lags the live one.
+	PipelineStatusPersistFailures = metrics.NewLabeledCounter(
+		"conduit_pipeline_status_persist_failures_total",
+		"Number of pipeline status writes that failed to reach the pipeline store (by pipeline name).",
+		[]string{labelPipelineName},
+	)
+	// AmbientCredentialsCounter counts built-in connector decisions about the
+	// host's ambient cloud credentials, by plugin and outcome (used,
+	// denied_disabled, denied_endpoint, denied_redirect, denied_link_local,
+	// denied_resource, denied_proxy). Outcome values are
+	// conduit-commons/hostpolicy Outcome constants. See
+	// docs/operations/ambient-credentials.md.
+	AmbientCredentialsCounter = metrics.NewLabeledCounter(
+		"conduit_connector_ambient_credentials_total",
+		"Number of built-in connector decisions about ambient cloud credentials (by plugin and outcome).",
+		[]string{labelPlugin, labelOutcome},
+	)
+	// ConnectorForceDeletesCounter counts connectors deleted with force while
+	// their settings no longer resolved, so the plugin's deletion hook was
+	// skipped (by connector type). Each one may have left plugin-side state
+	// behind, for example a Postgres replication slot.
+	ConnectorForceDeletesCounter = metrics.NewLabeledCounter(
+		"conduit_connector_force_deletes_total",
+		"Number of connectors deleted with force whose deletion hook was skipped because their settings no longer resolved (by connector type).",
+		[]string{labelType},
+	)
+	ConnectorsGauge = metrics.NewLabeledGauge("conduit_connectors",
+		"Number of connectors by type.",
+		[]string{labelType})
+	ProcessorsGauge = metrics.NewLabeledGauge("conduit_processors",
+		"Number of processors by type.",
+		[]string{labelType})
+	InspectorsGauge = metrics.NewLabeledGauge(
+		"conduit_inspector_sessions",
+		"Number of inspector sessions by ID of pipeline component (connector or processor)",
+		[]string{labelComponentID},
+	)
+	// _total suffix per Prometheus counter convention; this is a new metric with
+	// no consumer yet, so the name is fixed correctly now rather than matching the
+	// repo's older, suffix-less counters.
+	InspectorDroppedRecordsCounter = metrics.NewLabeledCounter(
+		"conduit_inspector_dropped_records_total",
+		"Number of records dropped by inspector sessions because the session buffer was full, "+
+			"by ID of pipeline component (summed across all sessions on that component).",
+		[]string{labelComponentID},
+	)
+
+	// ConnectorBytesHistogram carries a component_id label in addition to the
+	// original pipeline_name/plugin/type labels (added for P7, additive: no
+	// existing label was removed). component_id is the connector's instance
+	// ID, letting the UI attribute throughput to a specific node. Scraping
+	// dashboards that only key on the original three labels keep working
+	// unchanged (Prometheus aggregates across component_id values unless a
+	// query explicitly groups by it); per-node granularity is opt-in.
+	ConnectorBytesHistogram = metrics.NewLabeledHistogram("conduit_connector_bytes",
+		"Number of bytes a connector processed by pipeline name, plugin, type (source, destination) and component ID.",
+		[]string{labelPipelineName, labelPlugin, labelType, labelComponentID},
+		// buckets from 1KiB to 2MiB
+		prometheus.HistogramOpts{Buckets: []float64{1024, 1024 << 1, 1024 << 2, 1024 << 3, 1024 << 4, 1024 << 5, 1024 << 6, 1024 << 7, 1024 << 8, 1024 << 9, 1024 << 10, 1024 << 11}},
+	)
+	DLQBytesHistogram = metrics.NewLabeledHistogram("conduit_dlq_bytes",
+		"Number of bytes a DLQ connector processed per pipeline and plugin.",
+		[]string{labelPipelineName, labelPlugin},
+		// buckets from 1KiB to 2MiB
+		prometheus.HistogramOpts{Buckets: []float64{1024, 1024 << 1, 1024 << 2, 1024 << 3, 1024 << 4, 1024 << 5, 1024 << 6, 1024 << 7, 1024 << 8, 1024 << 9, 1024 << 10, 1024 << 11}},
+	)
+	PipelineExecutionDurationTimer = metrics.NewLabeledTimer("conduit_pipeline_execution_duration_seconds",
+		"Amount of time records spent in a pipeline.",
+		[]string{labelPipelineName},
+		prometheus.HistogramOpts{Buckets: []float64{.001, .0025, .005, .01, .025, .05, .1, .25, .5, 1, 2.5, 5}},
+	)
+	// ConnectorExecutionDurationTimer carries a component_id label in addition
+	// to the original labels, see the comment on ConnectorBytesHistogram for
+	// the additive-contract rationale (same for both metrics below).
+	ConnectorExecutionDurationTimer = metrics.NewLabeledTimer("conduit_connector_execution_duration_seconds",
+		"Amount of time spent reading or writing records per pipeline, plugin, connector type (source, destination) and component ID.",
+		[]string{labelPipelineName, labelPlugin, labelType, labelComponentID},
+		prometheus.HistogramOpts{Buckets: []float64{.001, .0025, .005, .01, .025, .05, .1, .25, .5, 1, 2.5, 5}},
+	)
+	ProcessorExecutionDurationTimer = metrics.NewLabeledTimer("conduit_processor_execution_duration_seconds",
+		"Amount of time spent on processing records per pipeline, processor and component ID.",
+		[]string{labelPipelineName, "processor", labelComponentID},
+		prometheus.HistogramOpts{Buckets: []float64{.001, .0025, .005, .01, .025, .05, .1, .25, .5, 1, 2.5, 5}},
+	)
+	DLQExecutionDurationTimer = metrics.NewLabeledTimer("conduit_dlq_execution_duration_seconds",
+		"Amount of time spent writing records to DLQ connector per pipeline and plugin.",
+		[]string{labelPipelineName, labelPlugin},
+		prometheus.HistogramOpts{Buckets: []float64{.001, .0025, .005, .01, .025, .05, .1, .25, .5, 1, 2.5, 5}},
+	)
+
+	// ConnectorRecordsCounter and ConnectorErrorsCounter are the record-level
+	// throughput and failure signals for one connector instance (connector
+	// observability lane #3013). They share the
+	// pipeline_name/plugin/type/component_id label set with
+	// ConnectorBytesHistogram and ConnectorExecutionDurationTimer, so a
+	// dashboard can join records, bytes, latency and errors on component_id.
+	// Both are monotonic counters and carry the _total suffix per Prometheus
+	// convention. The error counter deliberately records only *that* an error
+	// occurred, not the error message or code: those are unbounded in
+	// cardinality and would explode the label space; operators who need the
+	// message get it from the pipeline error in the API and logs.
+	ConnectorRecordsCounter = metrics.NewLabeledCounter(
+		"conduit_connector_records_total",
+		"Number of records a connector processed by pipeline name, plugin, type (source, destination) and component ID.",
+		[]string{labelPipelineName, labelPlugin, labelType, labelComponentID},
+	)
+	ConnectorErrorsCounter = metrics.NewLabeledCounter(
+		"conduit_connector_errors_total",
+		"Number of errors a connector returned by pipeline name, plugin, type (source, destination) and component ID.",
+		[]string{labelPipelineName, labelPlugin, labelType, labelComponentID},
+	)
+	DLQRecordsCounter = metrics.NewLabeledCounter(
+		"conduit_dlq_records_total",
+		"Number of records a DLQ connector processed per pipeline and plugin.",
+		[]string{labelPipelineName, labelPlugin},
+	)
+	DLQErrorsCounter = metrics.NewLabeledCounter(
+		"conduit_dlq_errors_total",
+		"Number of errors a DLQ connector returned per pipeline and plugin.",
+		[]string{labelPipelineName, labelPlugin},
+	)
+
+	// FunnelDestinationFlushesCounter and FunnelDestinationFlushLingerTimer
+	// observe the arch-v2 engine's destination batching (#3231): every time a
+	// batching destination's buffer is taken for writing, by what (trigger:
+	// size, bytes, deadline_arrival, deadline_timer, ack_queue, drain, close),
+	// and how old its oldest record was. deadline_timer is "partial batch
+	// flushed by the sdk.batch.delay timer". A linger p99 above twice
+	// sdk.batch.delay means the timer, the flush queue or, on fan-out, the
+	// passes it waits behind are not keeping up. See
+	// docs/operations/archv2-destination-batching.md.
+	FunnelDestinationFlushesCounter = metrics.NewLabeledCounter(
+		"conduit_funnel_destination_flushes_total",
+		"Number of times an arch-v2 batching destination's buffer was taken for writing, by pipeline name, plugin, component ID and trigger.",
+		[]string{labelPipelineName, labelPlugin, labelComponentID, labelTrigger},
+	)
+	// FunnelDestinationPluginBatchingNeutralisedCounter counts arch-v2
+	// destination (and DLQ) builds where at least one sdk.batch.* key was
+	// configured "0" in the plugin because its effective value, from the
+	// pipeline config or the connector's spec default, would have turned the
+	// plugin's own batcher on (#3321). Destinations with nothing to neutralise
+	// (file, kafka, log, postgres at their defaults) are not counted. A
+	// destination that is slow behind a 1-record source and is not counted
+	// here may batch inside its plugin without declaring sdk.batch.*; see
+	// docs/operations/archv2-destination-batching.md.
+	FunnelDestinationPluginBatchingNeutralisedCounter = metrics.NewLabeledCounter(
+		"conduit_funnel_destination_plugin_batching_neutralised_total",
+		"Number of arch-v2 destination builds whose plugin was configured with sdk.batch.size or sdk.batch.delay 0 so it does not batch behind the engine, by pipeline name, plugin and component ID.",
+		[]string{labelPipelineName, labelPlugin, labelComponentID},
+	)
+	FunnelDestinationFlushLingerTimer = metrics.NewLabeledTimer(
+		"conduit_funnel_destination_flush_linger_seconds",
+		"Age of the oldest buffered record when an arch-v2 batching destination's buffer was taken for writing, by pipeline name, plugin and component ID.",
+		[]string{labelPipelineName, labelPlugin, labelComponentID},
+		prometheus.HistogramOpts{Buckets: []float64{.001, .005, .01, .05, .1, .25, .5, 1, 2.5, 5, 10, 30, 60}},
+	)
+)

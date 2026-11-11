@@ -1,0 +1,1096 @@
+// Copyright © 2026 Meroxa, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package chaos
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"os/signal"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"syscall"
+	"time"
+
+	"github.com/conduitio/conduit-commons/database"
+	"github.com/conduitio/conduit-commons/database/badger"
+	"github.com/conduitio/conduit-commons/opencdc"
+	"github.com/conduitio/conduit/pkg/connector"
+	"github.com/conduitio/conduit/pkg/foundation/cerrors"
+	"github.com/conduitio/conduit/pkg/foundation/log"
+	connectorPlugin "github.com/conduitio/conduit/pkg/plugin/connector"
+	"github.com/rs/zerolog"
+)
+
+// Environment variables the parent test process (harness.go) uses to
+// configure a child run. This is a test-only, out-of-band protocol between
+// this package's own test binary re-executing itself - it never touches
+// conduit run's actual config surface (see doc.go / the design doc's
+// observability section on this exact point).
+const (
+	envChild          = "CONDUIT_CHAOS_CHILD"
+	envDBDir          = "CONDUIT_CHAOS_DB_DIR"
+	envUpstreamDir    = "CONDUIT_CHAOS_UPSTREAM_DIR"
+	envPrune          = "CONDUIT_CHAOS_PRUNE"
+	envPaceMS         = "CONDUIT_CHAOS_PACE_MS"
+	envPersistDelayMS = "CONDUIT_CHAOS_PERSIST_DELAY_MS"
+	envHoldAt         = "CONDUIT_CHAOS_HOLD_AT"
+	envStoreFailAfter = "CONDUIT_CHAOS_STORE_FAIL_AFTER"
+	envTotal          = "CONDUIT_CHAOS_TOTAL"
+	envSnapshotK      = "CONDUIT_CHAOS_SNAPSHOT_K"
+	envSnapshotPaceMS = "CONDUIT_CHAOS_SNAPSHOT_PACE_MS"
+	envNumKeys        = "CONDUIT_CHAOS_NUM_KEYS"
+	envDriftAt        = "CONDUIT_CHAOS_DRIFT_AT"
+	envSigtermMode    = "CONDUIT_CHAOS_SIGTERM_MODE"
+	instanceID        = "chaos-source"
+	instancePlugin    = "chaos-plugin"
+	instancePipe      = "chaos-pipeline"
+	markerOpenGap     = "OPEN_GAP_ERROR"
+	markerDone        = "DONE"
+	markerFatal       = "FATAL"
+	markerCorruptPo   = "CORRUPT_POSITION"
+	markerHandoff     = "HANDOFF"   // Property 1/2: producer crossed the snapshot->stream boundary, see upstream.go/produceLoop
+	markerHeld        = "HELD"      // production ceiling reached, see chaosPlugin.holdAt (upstream.go)
+	markerAckOrder    = "ACK_ORDER" // Property 3: per-key ack delivery ledger, see upstream.go/ackLoop
+	// markerSigtermDone is the SIGTERM/invariant-7 case's completion marker
+	// (sigterm_test.go, runChildSigterm) - deliberately distinct from
+	// markerDone, which means "ran to cfg.total and tore down at the natural
+	// end of the run". This marker means "a SIGTERM arrived mid-run and
+	// Source.Teardown's flush-and-wait-then-stopStream ordering
+	// (source.go:249-326) completed" - a graceful stop, not a completed run.
+	markerSigtermDone = "SIGTERM_TEARDOWN_OK"
+
+	// envValueTrue is the string childConfig.env() writes (via
+	// strconv.FormatBool) for boolean env flags (envPrune, envSigtermMode) -
+	// named so the comparisons in parseChildEnv/TestMain share one constant
+	// instead of repeating the literal (goconst).
+	envValueTrue = "true"
+)
+
+// exitCode values the child uses. The parent (harness.go's waitExit) only
+// distinguishes zero from non-zero; these codes and the stderr marker lines
+// that accompany them are what actually carry the diagnosis. An OPEN_GAP_ERROR
+// (chaosPlugin.Open refusing a stale resume) exits with exitOK: it is a
+// clean, expected-shape outcome for the pruning-upstream scenario, and the
+// printed marker line - not the exit code - is what carries the verdict.
+const (
+	exitOK             = 0
+	exitOpenOtherError = 4
+	exitCorruptState   = 3
+	exitBadArgs        = 2
+
+	// exitDrainStalled and exitDrainTooSlow are deliberately NOT
+	// exitOpenOtherError: neither says anything about Open, and reporting a
+	// drain problem as an Open error sent an investigation looking for a
+	// resume defect. An exit code is a diagnosis; a wrong one costs more than
+	// no code at all.
+	//
+	// They are also deliberately distinct from each other, because they mean
+	// opposite things and only one of them is benign:
+	//
+	//   exitDrainStalled  - commits STOPPED advancing. The ack path is
+	//                       wedged. This is a real defect and must be
+	//                       investigated, not re-run.
+	//   exitDrainTooSlow  - commits were still advancing when the absolute
+	//                       cap expired. Genuinely a pacing problem.
+	//
+	// Collapsing them into one code (or into one "this is a pacing failure"
+	// message) is how a wedge gets dismissed as slowness.
+	exitDrainStalled = 6
+	exitDrainTooSlow = 5
+)
+
+// isChildInvocation reports whether this process invocation should behave as
+// a chaos child runner instead of running the package's actual Go tests -
+// the standard "re-exec the test binary as a helper process" pattern (used
+// by, e.g., the Go standard library's own os/exec tests).
+func isChildInvocation() bool {
+	return os.Getenv(envChild) == "1"
+}
+
+// childEnv holds the parsed configuration a parent test process passes to a
+// chaos child via environment variables (see childConfig.env in harness.go).
+type childEnv struct {
+	dbDir       string
+	upstreamDir string
+	prune       bool
+	paceMS      int
+	// persistDelayMS overrides the persister debounce; 0 = default. See
+	// childConfig.persistDelayMS in harness.go for why this is configurable.
+	persistDelayMS int
+
+	// holdAt caps how far this process's source may ever produce, making a
+	// mid-run SIGKILL's landing point bounded BY CONSTRUCTION instead of by
+	// the parent winning a race. Once position holdAt has been sent, the
+	// producer prints markerHeld and stops for good (it never reaches total),
+	// so no matter how long the parent is descheduled between deciding to
+	// kill and the signal actually landing, the durable committed watermark
+	// this process can leave behind is <= holdAt. See childConfig.holdAt in
+	// harness.go and chaosPlugin.holdAt in upstream.go for the full story.
+	//
+	// 0 (the default, and the value every scenario that does not need a
+	// bound leaves it at) disables the cap entirely - the producer behaves
+	// exactly as it did before this seam existed.
+	holdAt uint64
+	total  uint64
+
+	// snapshotK/snapshotPaceMS: Property 1/2's two-phase producer knobs.
+	// snapshotK == 0 means "no distinct snapshot phase" (DBZ-1's original
+	// single-phase behavior) - see chaosPlugin's type doc (upstream.go).
+	snapshotK      uint64
+	snapshotPaceMS int
+
+	// numKeys: Property 3's multi-key knob. numKeys <= 1 means "single,
+	// unkeyed position space" (DBZ-1's original behavior) - see
+	// chaosPlugin's type doc (upstream.go).
+	numKeys int
+
+	// driftAt: Property 4's synthetic drift/poison-marker knob. 0 (the
+	// default) means no record in this run carries the marker - see
+	// chaosPlugin.driftAt's field doc (upstream.go).
+	driftAt uint64
+
+	// sigtermMode: if true, runChildSigterm runs instead of runChild - an
+	// unbounded read/ack loop that waits for SIGTERM and drives
+	// Source.Teardown's flush-and-wait-then-stopStream ordering
+	// (source.go:249-326) explicitly, rather than tearing down at the
+	// natural end of a total-bounded run. See sigterm_test.go.
+	sigtermMode bool
+
+	// storeFailAfter: store fault injection (storefault_test.go, #2925). 0
+	// (the default) disables it. N > 0 lets the first N connector-state
+	// writes reach badger and fails every later one, the way badger fails a
+	// write with ErrTxnTooBig while leaving the transaction committable.
+	storeFailAfter int
+}
+
+// parseChildEnv reads and validates the child's environment. Any failure
+// here is a test-harness misconfiguration, not a scenario under test, so it
+// exits immediately with exitBadArgs.
+func parseChildEnv() childEnv {
+	var cfg childEnv
+	cfg.dbDir = os.Getenv(envDBDir)
+	cfg.upstreamDir = os.Getenv(envUpstreamDir)
+	cfg.prune = os.Getenv(envPrune) == envValueTrue
+
+	paceMS, err := strconv.Atoi(os.Getenv(envPaceMS))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%s: invalid %s: %v\n", markerFatal, envPaceMS, err)
+		os.Exit(exitBadArgs)
+	}
+	cfg.paceMS = paceMS
+
+	// Optional: 0/unset means use connector.DefaultPersisterDelayThreshold.
+	if v := os.Getenv(envPersistDelayMS); v != "" {
+		d, err := strconv.Atoi(v)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "%s: invalid %s: %v\n", markerFatal, envPersistDelayMS, err)
+			os.Exit(exitBadArgs)
+		}
+		cfg.persistDelayMS = d
+	}
+
+	holdAt, err := strconv.ParseUint(os.Getenv(envHoldAt), 10, 64)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%s: invalid %s: %v\n", markerFatal, envHoldAt, err)
+		os.Exit(exitBadArgs)
+	}
+	cfg.holdAt = holdAt
+
+	if v := os.Getenv(envStoreFailAfter); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 0 {
+			fmt.Fprintf(os.Stderr, "%s: invalid %s: %q\n", markerFatal, envStoreFailAfter, v)
+			os.Exit(exitBadArgs)
+		}
+		cfg.storeFailAfter = n
+	}
+
+	total, err := strconv.ParseUint(os.Getenv(envTotal), 10, 64)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%s: invalid %s: %v\n", markerFatal, envTotal, err)
+		os.Exit(exitBadArgs)
+	}
+	cfg.total = total
+
+	// snapshotK/snapshotPaceMS/numKeys default to 0 (via strconv's error
+	// return on an empty string) when the parent didn't opt into Property
+	// 1/2's two-phase producer or Property 3's multi-key mode - childConfig.env
+	// always sets these explicitly (defaulting to "0"), so an empty/unparseable
+	// value here IS a harness misconfiguration, not a legitimate "unset".
+	snapshotK, err := strconv.ParseUint(os.Getenv(envSnapshotK), 10, 64)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%s: invalid %s: %v\n", markerFatal, envSnapshotK, err)
+		os.Exit(exitBadArgs)
+	}
+	cfg.snapshotK = snapshotK
+
+	snapshotPaceMS, err := strconv.Atoi(os.Getenv(envSnapshotPaceMS))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%s: invalid %s: %v\n", markerFatal, envSnapshotPaceMS, err)
+		os.Exit(exitBadArgs)
+	}
+	cfg.snapshotPaceMS = snapshotPaceMS
+
+	numKeys, err := strconv.Atoi(os.Getenv(envNumKeys))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%s: invalid %s: %v\n", markerFatal, envNumKeys, err)
+		os.Exit(exitBadArgs)
+	}
+	cfg.numKeys = numKeys
+
+	driftAt, err := strconv.ParseUint(os.Getenv(envDriftAt), 10, 64)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%s: invalid %s: %v\n", markerFatal, envDriftAt, err)
+		os.Exit(exitBadArgs)
+	}
+	cfg.driftAt = driftAt
+
+	cfg.sigtermMode = os.Getenv(envSigtermMode) == envValueTrue
+
+	if cfg.dbDir == "" || cfg.upstreamDir == "" {
+		fmt.Fprintf(os.Stderr, "%s: %s and %s are required\n", markerFatal, envDBDir, envUpstreamDir)
+		os.Exit(exitBadArgs)
+	}
+
+	// A cap at or above total bounds nothing - the producer stops at total on
+	// its own, so the cap would never be reached. The only legitimate use of
+	// a cap is strictly below total, where the child is crashable-only by
+	// design: it never reaches total, so the read loop never terminates and
+	// the process must be SIGKILLed (the same contract #2835's recovery
+	// child gives its holdAt seam). Any other combination could only surface
+	// as an opaque timeout or a silently pointless knob - fail loudly and
+	// immediately instead, like every other misconfiguration here.
+	if cfg.holdAt > 0 && cfg.total > 0 && cfg.holdAt >= cfg.total {
+		fmt.Fprintf(os.Stderr, "%s: %s (%d) must be below %s (%d) to bound anything\n", markerFatal, envHoldAt, cfg.holdAt, envTotal, cfg.total)
+		os.Exit(exitBadArgs)
+	}
+	return cfg
+}
+
+// loadOrCreateInstance loads the connector.Instance persisted by a previous
+// (possibly SIGKILL'd) run of this same chaos-source ID, or creates a fresh
+// one if none exists yet. It exits the process directly (exitCorruptState)
+// if the persisted state exists but fails to deserialize — per invariant 2,
+// that is itself a failing outcome for this test, never silently treated as
+// "fresh start".
+func loadOrCreateInstance(ctx context.Context, store *connector.Store) *connector.Instance {
+	instance, err := store.Get(ctx, instanceID)
+	switch {
+	case err == nil:
+		return instance // resumed from a previous (possibly killed) run's persisted state
+	case cerrors.Is(err, database.ErrKeyNotExist):
+		return &connector.Instance{
+			ID:            instanceID,
+			Type:          connector.TypeSource,
+			Config:        connector.Config{Name: instanceID, Settings: map[string]string{}},
+			PipelineID:    instancePipe,
+			Plugin:        instancePlugin,
+			ProvisionedBy: connector.ProvisionTypeAPI,
+		}
+	default:
+		fmt.Printf("%s: %v\n", markerCorruptPo, err)
+		os.Exit(exitCorruptState)
+		return nil // unreachable
+	}
+}
+
+// printResumePosition emits the diagnostic line the parent test relies on to
+// learn exactly where Conduit persisted state says this run is about to
+// resume from — printed unconditionally (fresh start included, where it's
+// the empty position) so the parent can compare it against the upstream's
+// independently-read committed watermark without opening the badger DB
+// itself.
+func printResumePosition(instance *connector.Instance) {
+	if src, ok := instance.State.(connector.SourceState); ok {
+		fmt.Printf("RESUME_POSITION %s\n", src.Position)
+		return
+	}
+	fmt.Printf("RESUME_POSITION %s\n", opencdc.Position(nil))
+}
+
+// runReadAckLoop reads and immediately acks records one batch at a time
+// until termination, then returns. It exits the process directly on any
+// Read/Ack error.
+//
+// Termination is decided one of two ways, selected by keyed:
+//   - keyed == false (Property 1/2, single global position space): decode
+//     the last acked position and stop once it reaches total. This is what
+//     makes RESTART termination correct - a resumed run only reads/acks the
+//     REMAINING positions (resume+1..total), so a plain records-processed
+//     count would stop too early.
+//   - keyed == true (Property 3, multi-key "k<i>:<seq>" positions): stop
+//     once the total NUMBER of records processed in this run reaches total.
+//     Property 3 never restarts (see chaosPlugin's type doc, upstream.go),
+//     so there is no resume offset to account for, and the keyed position
+//     encoding isn't a single monotone counter decodePosition could compare
+//     against total in the first place.
+func runReadAckLoop(ctx context.Context, src *connector.Source, total uint64, keyed bool) {
+	var processed uint64
+	for {
+		recs, err := src.Read(ctx)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "%s: read failed: %v\n", markerFatal, err)
+			os.Exit(exitOpenOtherError)
+		}
+
+		positions := make([]opencdc.Position, len(recs))
+		for i, r := range recs {
+			positions[i] = r.Position
+		}
+		if err := src.Ack(ctx, positions); err != nil {
+			fmt.Fprintf(os.Stderr, "%s: ack failed: %v\n", markerFatal, err)
+			os.Exit(exitOpenOtherError)
+		}
+
+		if total == 0 {
+			continue
+		}
+		if keyed {
+			processed += uint64(len(recs))
+			if processed >= total {
+				return
+			}
+			continue
+		}
+		last, _ := decodePosition(positions[len(positions)-1])
+		if last >= total {
+			return
+		}
+	}
+}
+
+// childBuilt bundles the real engine pieces buildChild wires together for a
+// single child run: a real *connector.Source, backed by a real on-disk
+// badger DB and connector.Persister, driven by an in-process chaosPlugin.
+// Factored out of runChild so Property 4's in-process funnel integration
+// (property4_test.go) can build and drive the IDENTICAL construction through
+// a real funnel.Worker instead of runReadAckLoop's direct src.Read/src.Ack
+// calls - see doc.go's note on why the direct loop bypasses the
+// funnel/DLQ/destination entirely, which is exactly the gap Property 4
+// closes.
+type childBuilt struct {
+	logger    log.CtxLogger
+	persister *connector.Persister
+	store     *connector.Store
+	instance  *connector.Instance
+	upstream  *upstreamStore
+	plugin    *chaosPlugin
+	src       *connector.Source
+}
+
+// buildChild opens (or creates) the badger DB at cfg.dbDir and the
+// upstreamStore at cfg.upstreamDir, then constructs a real *connector.Source
+// around an in-process chaosPlugin configured per cfg - the exact
+// construction runChild used inline before this refactor. Every error here is
+// a test-harness misconfiguration (bad dirs, unexpected connector type), not
+// a scenario under test, mirroring the exitBadArgs treatment the inline code
+// gave each of these failures.
+func buildChild(ctx context.Context, cfg childEnv) (*childBuilt, error) {
+	logger := log.New(zerolog.Nop()) // keep stdout clean; it is our progress-line channel
+
+	bdb, err := badger.New(zerolog.Nop(), cfg.dbDir)
+	if err != nil {
+		return nil, fmt.Errorf("open badger db: %w", err)
+	}
+	var db database.DB = bdb
+	if cfg.storeFailAfter > 0 {
+		db = &storeFaultDB{DB: bdb, allowed: int64(cfg.storeFailAfter)}
+	}
+
+	persistDelay := effectivePersistDelay(cfg)
+	persister := connector.NewPersister(logger, db, persistDelay, connector.DefaultPersisterBundleCountThreshold)
+	store := connector.NewStore(db, logger)
+
+	instance := loadOrCreateInstance(ctx, store)
+	instance.Init(logger, persister)
+
+	upstream, err := openUpstreamStore(cfg.upstreamDir, cfg.prune)
+	if err != nil {
+		return nil, err
+	}
+	plugin := &chaosPlugin{
+		store:          upstream,
+		total:          cfg.total,
+		paceMS:         cfg.paceMS,
+		snapshotK:      cfg.snapshotK,
+		snapshotPaceMS: cfg.snapshotPaceMS,
+		numKeys:        cfg.numKeys,
+		driftAt:        cfg.driftAt,
+		holdAt:         cfg.holdAt,
+	}
+
+	fetcher := staticFetcher{instance.Plugin: staticDispenser{source: plugin}}
+	c, err := instance.Connector(ctx, fetcher)
+	if err != nil {
+		return nil, fmt.Errorf("build connector: %w", err)
+	}
+	src, ok := c.(*connector.Source)
+	if !ok {
+		return nil, fmt.Errorf("unexpected connector type %T", c)
+	}
+
+	return &childBuilt{
+		logger:    logger,
+		persister: persister,
+		store:     store,
+		instance:  instance,
+		upstream:  upstream,
+		plugin:    plugin,
+		src:       src,
+	}, nil
+}
+
+// runChild is the entire child-process program: build a real
+// pkg/connector.Source, backed by a real on-disk badger DB (the same
+// production persister backend, via connector.NewPersister) and the
+// in-process chaosPlugin, then read+ack records sequentially until `total`
+// is reached. It never returns - it always calls os.Exit.
+//
+// This process is expected to be killed with SIGKILL by the parent test at
+// an arbitrary point; no cleanup on that path is possible or intended - that
+// is the entire point of the test (see doc.go).
+func runChild() {
+	ctx := context.Background()
+	cfg := parseChildEnv()
+
+	built, err := buildChild(ctx, cfg)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%s: %v\n", markerFatal, err)
+		os.Exit(exitBadArgs)
+	}
+	printResumePosition(built.instance)
+
+	src := built.src
+	persister := built.persister
+	upstream := built.upstream
+	plugin := built.plugin
+
+	if err := src.Open(ctx); err != nil {
+		if containsGapMarker(err) {
+			// This IS the scenario this test exists to surface (see doc.go):
+			// on a pruning upstream, Conduit's persisted position lagged
+			// behind what was already durably committed at the moment of the
+			// kill, and the upstream can no longer supply the gap. Print the
+			// marker so the parent test can assert on it; this is an
+			// expected, clean exit for that scenario, not a
+			// test-infrastructure failure.
+			fmt.Printf("%s: %v\n", markerOpenGap, err)
+			os.Exit(exitOK)
+		}
+		fmt.Fprintf(os.Stderr, "%s: source open failed: %v\n", markerFatal, err)
+		os.Exit(exitOpenOtherError)
+	}
+
+	keyed := cfg.numKeys > 1
+	runReadAckLoop(ctx, src, cfg.total, keyed)
+
+	// src.Ack only guarantees the ack was HANDED OFF to the plugin
+	// (stream.Send rendezvous with the plugin's Recv) - it does not wait for
+	// chaosPlugin.ackLoop's subsequent side effects to finish. Without
+	// waiting here, this process could os.Exit before those side effects
+	// land, truncating the run by one position and producing a
+	// false-positive gap/missing-ledger-entry that has nothing to do with
+	// the engine code under test. This wait is test-harness synchronization
+	// only - it has no analog in (and makes no claim about) production code.
+	//
+	// Property 3 (keyed) has no single upstream watermark to wait on (see
+	// ackLoop) - it waits on chaosPlugin.ackedCount instead, which tracks
+	// exactly the same thing (every ACK_ORDER line has actually been
+	// printed) via a different signal.
+	if keyed {
+		// NOT a flat wall clock, despite waiting on an in-memory atomic
+		// counter with no fsync of its own: p.ackedCount.Add(1) only runs
+		// when server.Recv() delivers an ack, and acks only reach the
+		// stream via onPersistFlushed, which releases them on the SAME
+		// persister flush that gates the unkeyed path (upstream.go). So
+		// this counter is gated on a badger write too, one hop removed -
+		// it just doesn't pay the per-position fsync cost the unkeyed
+		// path's watermark does. The budget has to clear that debounce for
+		// exactly the same reason drainStallBudget exists at all.
+		ackedCountBudget := drainStallBudget(effectivePersistDelay(cfg))
+		if !plugin.waitForAckedCount(cfg.total, ackedCountBudget) {
+			// Print how far it actually got. Without it a reader cannot tell
+			// 0/20 from 19/20 - which is exactly the wedge-vs-slowness
+			// distinction this change exists to preserve, on a required check.
+			//
+			// Be honest about the shape too: unlike the unkeyed path, this is
+			// still a flat wall clock from entry, not a progress bound. It is
+			// strictly weaker than main's (flat 5s -> debounce + 5s), so it is
+			// not a regression, but it does mean the exitDrainStalled below is
+			// a weaker claim here than on the unkeyed path. The counter is a
+			// monotonic watermark and could go through drainTracker; that is a
+			// follow-up, not a silent inconsistency.
+			fmt.Fprintf(os.Stderr, "%s: timed out after %s waiting for plugin to ack %d "+
+				"positions (reached %d). This waits on an in-memory counter - no fsync per "+
+				"position - but the counter still only advances when an ack reaches the stream "+
+				"via onPersistFlushed, so it is gated on the same persister flush the unkeyed "+
+				"path is.\n",
+				markerFatal, ackedCountBudget, cfg.total, plugin.ackedCount.Load())
+			os.Exit(exitDrainStalled)
+		}
+	} else {
+		waitForUpstreamCommitted(upstream, cfg.total, effectivePersistDelay(cfg))
+	}
+
+	// Graceful path: only reached when this run was allowed to finish
+	// (the parent didn't SIGKILL it). Tear down cleanly so the final
+	// persisted position is flushed and observable by the parent's
+	// post-run assertions.
+	if err := src.Teardown(ctx); err != nil {
+		fmt.Fprintf(os.Stderr, "%s: teardown failed: %v\n", markerFatal, err)
+		os.Exit(exitOpenOtherError)
+	}
+	persister.WaitPendingWrites()
+
+	fmt.Println(markerDone)
+	os.Exit(exitOK)
+}
+
+// runChildSigterm is runChild's counterpart for the SIGTERM/invariant-7 case
+// (sigterm_test.go). Unlike runChild, it does not run to cfg.total and tear
+// down at the natural end of the run - it runs the read/ack loop
+// indefinitely in the background and waits for a SIGTERM, then drives
+// Source.Teardown's flush-and-wait-then-stopStream ordering
+// (source.go:249-326) explicitly: invariant 7 requires that the ack deferred
+// at the moment the signal lands is actually SENT to the plugin (and, per
+// Ack's own invariant 1, only sent once the resulting position is durably
+// flushed) before the stream is torn down - the graceful-path complement to
+// sigkill_test.go's/property2_test.go's SIGKILL cases, which instead prove
+// "eventually safe after a restart".
+//
+// Prints markerSigtermDone (never markerDone, which means "reached cfg.total
+// and tore down normally") once Teardown has confirmed the deferred ack was
+// drained, so the parent test can tell this exit apart from both a normal
+// completed run and a crash.
+func runChildSigterm() {
+	ctx := context.Background()
+	cfg := parseChildEnv()
+
+	built, err := buildChild(ctx, cfg)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%s: %v\n", markerFatal, err)
+		os.Exit(exitBadArgs)
+	}
+	printResumePosition(built.instance)
+
+	src := built.src
+	if err := src.Open(ctx); err != nil {
+		fmt.Fprintf(os.Stderr, "%s: source open failed: %v\n", markerFatal, err)
+		os.Exit(exitOpenOtherError)
+	}
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGTERM)
+
+	// stopping + processingMu mirror funnel.Worker.Stop's own
+	// stop-flag-plus-processingLock discipline (worker.go's Stop and doTask):
+	// Source.Teardown's own doc comment explicitly relies on "no new Ack call
+	// can start once a Teardown has begun" being guaranteed by the CALLER,
+	// not by Teardown itself. In production that guarantee comes from
+	// funnel.Worker's processingLock; this child has no funnel.Worker (see
+	// property4_test.go's package doc for why Property 4 is the one that
+	// needs a real Worker - this SIGTERM case does not), so it must
+	// reconstruct the same discipline directly: processingMu is held for
+	// exactly one Read+Ack cycle at a time, and the signal handler
+	// synchronizes on it before calling Teardown, guaranteeing no cycle is
+	// in flight (and none will start) once Teardown begins. Without this,
+	// a late Ack racing Teardown's own forced flush could register a
+	// position that never gets flushed before the process exits - not a
+	// bug in Source.Teardown, but exactly the caller-side race its doc
+	// comment warns about.
+	var stopping atomic.Bool
+	var processingMu sync.Mutex
+	readLoopDone := make(chan struct{})
+	go func() {
+		defer close(readLoopDone)
+		for {
+			processingMu.Lock()
+			if stopping.Load() {
+				processingMu.Unlock()
+				return
+			}
+
+			recs, err := src.Read(ctx)
+			if err != nil {
+				processingMu.Unlock()
+				if stopping.Load() {
+					return // expected: Teardown's stopStream unblocked this Read
+				}
+				fmt.Fprintf(os.Stderr, "%s: read failed: %v\n", markerFatal, err)
+				os.Exit(exitOpenOtherError)
+			}
+
+			positions := make([]opencdc.Position, len(recs))
+			for i, r := range recs {
+				positions[i] = r.Position
+			}
+			ackErr := src.Ack(ctx, positions)
+			processingMu.Unlock()
+			if ackErr != nil {
+				if stopping.Load() {
+					return // expected: the stream closed while Teardown was tearing it down
+				}
+				fmt.Fprintf(os.Stderr, "%s: ack failed: %v\n", markerFatal, ackErr)
+				os.Exit(exitOpenOtherError)
+			}
+		}
+	}()
+
+	<-sigCh
+	stopping.Store(true)
+	// Block until no Read+Ack cycle is in flight (see the goroutine's own
+	// comment above) - after this returns, the reader goroutine is
+	// guaranteed to observe stopping==true and exit without starting
+	// another cycle, so no Ack can race what follows.
+	processingMu.Lock()
+	processingMu.Unlock() //nolint:staticcheck // deliberate lock/unlock handshake, not a no-op - see comment above
+
+	// Invariant 7, the property this entire case exists to pin: Teardown
+	// forces the pending flush and waits (bounded) for its resulting
+	// deferred ack to actually be SENT to the plugin - which, per Ack's own
+	// invariant-1 ordering, only happens once that flush's write is durably
+	// confirmed - BEFORE stopping the stream (source.go:249-326). Only once
+	// this returns is it safe to treat whatever was in flight at signal-time
+	// as drained, not dropped.
+	if err := src.Teardown(ctx); err != nil {
+		fmt.Fprintf(os.Stderr, "%s: teardown failed: %v\n", markerFatal, err)
+		os.Exit(exitOpenOtherError)
+	}
+	<-readLoopDone
+
+	built.persister.WaitPendingWrites() // belt-and-suspenders; Teardown's own wait already covers this (see its doc comment)
+
+	// Teardown's (and WaitPendingWrites') guarantee only reaches as far as
+	// "the deferred ack was HANDED OFF to the plugin" (stream.Send
+	// rendezvous with chaosPlugin.ackLoop's Recv) - exactly like
+	// runReadAckLoop's own tail comment explains, it does not wait for
+	// ackLoop's subsequent side effect (upstreamStore.Commit) to finish.
+	// Without this wait, this process could exit while that commit is still
+	// in flight, making the parent test observe a stale upstream watermark
+	// that has nothing to do with whether Teardown actually drained the
+	// deferred ack - see waitForUpstreamAtLeast.
+	finalPos := readPersistedPosition(ctx, built.store)
+	if !waitForUpstreamAtLeast(built.upstream, finalPos, 5*time.Second) {
+		fmt.Fprintf(os.Stderr, "%s: timed out waiting for upstream to catch up to persisted position %d\n", markerFatal, finalPos)
+		os.Exit(exitOpenOtherError)
+	}
+
+	fmt.Println(markerSigtermDone)
+	os.Exit(exitOK)
+}
+
+// readPersistedPosition reads Conduit's own durably-persisted resume
+// position directly from the store (a fresh round-trip through
+// connector.Store.Get/decode, not the in-memory Instance this process
+// already holds), mirroring printResumePosition's own durability check.
+// Returns 0 if nothing has been acked/persisted yet.
+func readPersistedPosition(ctx context.Context, store *connector.Store) uint64 {
+	instance, err := store.Get(ctx, instanceID)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%s: read persisted position: %v\n", markerFatal, err)
+		os.Exit(exitOpenOtherError)
+	}
+	state, ok := instance.State.(connector.SourceState)
+	if !ok {
+		return 0
+	}
+	pos, err := decodePosition(state.Position)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%s: decode persisted position: %v\n", markerFatal, err)
+		os.Exit(exitOpenOtherError)
+	}
+	return pos
+}
+
+// waitForUpstreamAtLeast blocks (polling) until the upstream store reports at
+// least target positions committed, or returns false once timeout has
+// elapsed. See runChildSigterm's call site for why this - not just
+// Persister.WaitPendingWrites - is needed to bridge the "handed off to the
+// plugin" vs. "the plugin's side effect actually landed" gap.
+func waitForUpstreamAtLeast(upstream *upstreamStore, target uint64, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		committed, err := upstream.Committed()
+		if err == nil && committed >= target {
+			return true
+		}
+		time.Sleep(time.Millisecond)
+	}
+	committed, err := upstream.Committed()
+	return err == nil && committed >= target
+}
+
+// Drain bounds. These are NOT a per-position budget: the point of the loop
+// below is that it does not need one.
+//
+// The previous implementation was a flat wall-clock deadline, and the first
+// attempt to fix it merely made the wall clock a function of total. Both are
+// guesses about how fast a machine is, and both share the defect that
+// matters: a drain that has STOPPED and a drain that is merely SLOW expire
+// the same deadline and produce the same message. That is precisely the
+// distinction anyone reading a chaos failure needs.
+//
+// What actually costs time here is upstreamStore.Commit: open + write +
+// fsync + rename, once per position, serialized inside chaosPlugin.ackLoop.
+// 500 positions is 500 sequential fsyncs. That is why this is invisible on a
+// local NVMe and flaky on a CI runner's filesystem, and it is why no
+// per-position constant derived on one machine transfers to the other.
+//
+// Bounding on lack of forward progress removes the machine-speed dependency
+// entirely: a slow disk still advances, so it is tolerated for as long as it
+// keeps advancing; a wedged ack path advances not at all and is caught in
+// five seconds regardless of hardware.
+const (
+	// ackDrainStallBudget is how long the committed watermark may fail to
+	// move AT ALL before this is called a wedge rather than slowness.
+	ackDrainStallBudget = 5 * time.Second
+
+	// ackDrainHardCap bounds even a continuously-advancing drain, so a
+	// pathologically slow run fails here with a precise message rather than
+	// hitting the parent's waitExit timeout, which reports only "timed out
+	// waiting for child to exit" and loses the child's diagnosis.
+	// Deliberately well under the parent's parentWaitExit (harness.go),
+	// with headroom for the child's own read loop (which runs before the
+	// drain even starts) plus Teardown/WaitPendingWrites/process exit - see
+	// TestAckDrainHardCap_StaysUnderTheParentWaitExitTimeout, which models
+	// all three rather than just subtracting this from the parent timeout.
+	ackDrainHardCap = 20 * time.Second
+
+	// ackDrainPollInterval is how often the drain loop re-reads the
+	// committed watermark. Not 1ms: upstreamStore.Committed() takes the
+	// same mutex Commit holds across open+write+fsync+rename, so a
+	// too-tight poll contends with the exact I/O path being measured -
+	// worse now that a stalled drain can poll for up to ackDrainHardCap
+	// instead of the old flat 5s. 10-25ms is frequent enough to keep the
+	// stall/tooSlow verdicts precise without that contention.
+	ackDrainPollInterval = 15 * time.Millisecond
+)
+
+// drainVerdict is the decision the drain loop makes on each poll. Split out
+// from the loop so the decision is unit-testable without a real upstream
+// store, a real ack loop, or real elapsed time.
+type drainVerdict int
+
+const (
+	drainContinue drainVerdict = iota
+	drainDone
+	drainStalled
+	drainTooSlow
+)
+
+// classifyDrain decides whether a drain is finished, wedged, too slow, or
+// simply still working.
+//
+// Order matters and is load-bearing: done is checked before stalled so a
+// drain that completes on the same poll it would otherwise be judged on is
+// never reported as wedged, and stalled is checked before tooSlow so a wedge
+// that happens to coincide with the hard cap is reported as a wedge - the
+// more serious of the two diagnoses wins.
+//
+// That ordering only works if stallBudget itself stays under ackDrainHardCap:
+// since sinceProgress <= sinceStart always (drainTracker.observe never lets
+// progress get ahead of start), a stallBudget larger than the hard cap makes
+// sinceStart reach the cap before sinceProgress could ever reach the budget,
+// so the stalled branch below would never fire - a real wedge reported as
+// pacing, the false-exoneration mirror of a false wedge, and worse, because
+// it dismisses a real defect instead of merely misnaming a benign one. The
+// only production caller (drainStallBudget) already clamps before calling
+// this, but the invariant is enforced here too, defensively, because this is
+// the one place it actually has to hold.
+func classifyDrain(committed, total uint64, sinceProgress, sinceStart, stallBudget time.Duration) drainVerdict {
+	if stallBudget > ackDrainHardCap {
+		stallBudget = ackDrainHardCap
+	}
+	switch {
+	case committed >= total:
+		return drainDone
+	case sinceProgress >= stallBudget:
+		return drainStalled
+	case sinceStart >= ackDrainHardCap:
+		return drainTooSlow
+	default:
+		return drainContinue
+	}
+}
+
+// effectivePersistDelay is the debounce this child's persister actually uses.
+// Shared by buildChild and by the drain wait, so the stall budget is derived
+// from the same value rather than assuming the default.
+func effectivePersistDelay(cfg childEnv) time.Duration {
+	if cfg.persistDelayMS > 0 {
+		return time.Duration(cfg.persistDelayMS) * time.Millisecond
+	}
+	return connector.DefaultPersisterDelayThreshold
+}
+
+// drainStallBudget is how long the committed watermark may fail to move
+// before the drain is called wedged, for a child with the given persister
+// debounce.
+//
+// Clamped to just under ackDrainHardCap. An unclamped budget derived from an
+// unusually long debounce (mid-snapshot's KILLED child sets persistDelayMS
+// to 600_000, though that child never reaches this drain at all - it gets
+// SIGKILLed first; see this PR's own description for the correction) would
+// exceed the hard cap and make classifyDrain's stalled branch unreachable,
+// reporting a real wedge as pacing instead. The clamp trades a slightly
+// optimistic stall budget, for the case of a debounce this large actually
+// reaching the drain, for keeping the wedge/slow distinction meaningful at
+// all - which is the entire point of this change. classifyDrain enforces the
+// same invariant defensively on its own, in case a future caller forgets to
+// clamp.
+//
+// Extracted so the derivation itself is testable. Inlined as
+// `persistDelay + ackDrainStallBudget` at the call site it was invisible to
+// tests: a mutation dropping the persistDelay term left every test green
+// while restoring the false-wedge bug this term exists to prevent.
+func drainStallBudget(persistDelay time.Duration) time.Duration {
+	budget := persistDelay + ackDrainStallBudget
+	if clamp := ackDrainHardCap - time.Second; budget > clamp {
+		return clamp
+	}
+	return budget
+}
+
+// drainBudgetsAreCoherent reports whether this child's debounce is short
+// enough for the wedge/slow distinction to survive the clamp.
+//
+// The clamp above buys that distinction for short debounces by capping the
+// budget, but it inverts past a threshold: once persistDelay reaches
+// ackDrainHardCap-1s, the budget is no longer greater than the debounce, so
+// a HEALTHY child is guaranteed to be called wedged before its own first
+// flush - the exact false accusation the derivation exists to prevent, made
+// certain rather than merely possible. Silently clamping into that regime
+// would hand the engine an exitDrainStalled ("a real defect, must be
+// investigated, not re-run") for what is actually a harness
+// misconfiguration.
+//
+// Not reachable today - the largest debounce reaching this drain is the
+// drain probe's 6s (drain_test.go); every scenario child uses the 1s
+// default - so this is a guard on a hypothetical, which is precisely why it
+// should refuse loudly rather than
+// wait to be discovered as a mystery wedge.
+func drainBudgetsAreCoherent(persistDelay time.Duration) bool {
+	return drainStallBudget(persistDelay) > persistDelay
+}
+
+// drainTracker holds the mutable bookkeeping the drain loop needs, so the
+// decision AND the state feeding it are both testable.
+//
+// Splitting this out is not tidiness. Round 2 of this PR had the state inline
+// in the loop, and deleting the single line that refreshed lastProgress
+// collapsed sinceProgress into sinceStart - silently restoring the flat wall
+// clock this change exists to remove. All three tests still passed, because
+// they only ever exercised the pure classifier. That is the same "the test
+// asserted the bug and nobody noticed" failure this PR is on its third
+// attempt to stop making.
+type drainTracker struct {
+	start        time.Time
+	lastProgress time.Time
+	last         uint64
+	stallBudget  time.Duration
+}
+
+func newDrainTracker(now time.Time, stallBudget time.Duration) *drainTracker {
+	return &drainTracker{start: now, lastProgress: now, stallBudget: stallBudget}
+}
+
+// observe records a committed watermark reading and returns the verdict.
+// Takes now explicitly so tests can drive it with a fake clock.
+func (d *drainTracker) observe(committed, total uint64, now time.Time) drainVerdict {
+	if committed > d.last {
+		d.last = committed
+		d.lastProgress = now
+	}
+	return classifyDrain(committed, total, now.Sub(d.lastProgress), now.Sub(d.start), d.stallBudget)
+}
+
+// drainLoop is waitForUpstreamCommitted's decision loop with the upstream
+// read and the clock injected, so the WIRING - not just the classifier
+// (classifyDrain) and the derivation (drainStallBudget) - is testable.
+// waitForUpstreamCommitted itself becomes a thin adapter that supplies the
+// real upstream/clock, then formats and exits on the verdict this returns.
+//
+// This seam exists because neither of those unit-level tests can catch a
+// wiring bug: a mutation that computes stallBudget from ackDrainStallBudget
+// alone (dropping the persistDelay term drainStallBudget exists to add)
+// leaves TestDrainStallBudget_IncludesThePersisterDebounce and every
+// classifyDrain/drainTracker test green, because none of them ever call
+// this function - they hand classifyDrain or drainTracker.observe an
+// already-computed budget instead of letting this loop compute one itself.
+// Only a test that drives drainLoop end to end can catch that.
+//
+// read reports the current committed watermark. Its error handling is the
+// caller's responsibility, not this loop's: in production,
+// waitForUpstreamCommitted's read closure prints the FATAL marker and
+// os.Exit(exitCorruptState)s itself before ever returning an error here -
+// exactly as this code did before this seam existed - so a non-nil error
+// reaching drainLoop only happens with a test double that chooses to return
+// one, which none of this PR's tests do. now reports the current time
+// (time.Now in production). Returns once a terminal verdict is reached
+// (drainDone, drainStalled, or drainTooSlow - drainContinue never escapes
+// the loop), plus the tracker that produced it, so the caller can report the
+// actual elapsed times it measured rather than the budget/cap constants.
+func drainLoop(read func() (uint64, error), now func() time.Time, total uint64, persistDelay time.Duration) (drainVerdict, *drainTracker) {
+	if !drainBudgetsAreCoherent(persistDelay) {
+		fmt.Fprintf(os.Stderr, "%s: HARNESS MISCONFIGURATION, not an engine fault: this child's "+
+			"persister debounce is %s, but the drain's hard cap is %s, so the stall budget clamps "+
+			"to %s - at or below the debounce. A healthy child commits nothing until its first "+
+			"flush, so it would be reported as wedged every time. Raise ackDrainHardCap or lower "+
+			"this scenario's persistDelayMS; do not read the resulting failure as an ack-path "+
+			"defect.\n",
+			markerFatal, persistDelay, ackDrainHardCap, drainStallBudget(persistDelay))
+		os.Exit(exitBadArgs)
+	}
+
+	stallBudget := drainStallBudget(persistDelay)
+	tracker := newDrainTracker(now(), stallBudget)
+	for {
+		committed, err := read()
+		if err != nil {
+			// Still consult the clock on the error path. main's version
+			// polled against a deadline, so a persistent read error there
+			// eventually terminated; observing with the last known watermark
+			// keeps the stall budget and hard cap bounding this loop instead
+			// of spinning forever. Unreachable in production - the closure
+			// os.Exits on error first - but an unbounded loop in a harness
+			// whose job is to bound things is worth not writing.
+			if verdict := tracker.observe(tracker.last, total, now()); verdict != drainContinue {
+				return verdict, tracker
+			}
+		} else if verdict := tracker.observe(committed, total, now()); verdict != drainContinue {
+			return verdict, tracker
+		}
+		time.Sleep(ackDrainPollInterval)
+	}
+}
+
+// waitForUpstreamCommitted blocks until the upstream store reports total
+// positions committed, so this process doesn't exit while
+// chaosPlugin.ackLoop's goroutine still has in-flight, not-yet-durable
+// commits. A no-op when total is 0 (unbounded runs never reach this
+// graceful-exit path in the first place).
+//
+// The stall budget (see drainStallBudget) must clear the persister's
+// debounce, because deferred acks are not released until the persister
+// flushes: for one debounce period after the read loop ends, a perfectly
+// healthy child commits NOTHING. With the 1s default that idle window
+// measures 390-485ms; deriving the bound from the child's own delay removes
+// that coupling instead of hoping nobody trips it.
+//
+// Exits rather than returning on any non-success, because falling through
+// would let the caller proceed to Teardown/DONE while commits are still in
+// flight, silently undermining the "committed == total" guarantee the
+// parent's duplicate-not-gap assertion depends on.
+func waitForUpstreamCommitted(upstream *upstreamStore, total uint64, persistDelay time.Duration) {
+	if total == 0 {
+		return
+	}
+	read := func() (uint64, error) {
+		committed, err := upstream.Committed()
+		if err != nil {
+			// Commit and Committed share u.mu and the rename is atomic, so a
+			// torn read is not reachable and a parse failure here really does
+			// mean corruption. Other errno values (EMFILE, EIO) are possible
+			// and are NOT corruption - the errno is printed so an investigator
+			// can tell, but the exit code cannot distinguish them.
+			fmt.Fprintf(os.Stderr, "%s: upstream commit marker unreadable while draining: %v\n",
+				markerFatal, err)
+			os.Exit(exitCorruptState)
+		}
+		return committed, nil
+	}
+
+	verdict, tracker := drainLoop(read, time.Now, total, persistDelay)
+	now := time.Now()
+	switch verdict {
+	case drainDone:
+		return
+	case drainStalled:
+		// States the evidence, not a conclusion. Two reachable causes
+		// produce this without the engine being wedged at all - a
+		// persister debounce longer than the budget, and a harness bug in
+		// the progress bookkeeping - so telling the reader to stop
+		// looking would be the same mistake the tooSlow branch was
+		// already corrected for.
+		fmt.Fprintf(os.Stderr, "%s: ack drain made NO progress for %s, stuck at %d/%d "+
+			"(persister debounce for this child is %s; the budget is %s). "+
+			"A wedge is the likeliest explanation: start with the unbuffered errs channel "+
+			"in pkg/connector/source.go, which this harness never reads. If the debounce "+
+			"printed here is not the one this child's persister actually uses, that alone "+
+			"explains it.\n",
+			markerFatal, now.Sub(tracker.lastProgress), tracker.last, total, persistDelay, tracker.stallBudget)
+		os.Exit(exitDrainStalled)
+	case drainTooSlow:
+		// This branch CAN assert pacing, and here is why: drainStalled is
+		// evaluated first, so reaching the cap means the watermark
+		// advanced within the last stallBudget of the run. Progress was
+		// measured, not assumed.
+		fmt.Fprintf(os.Stderr, "%s: ack drain still advancing at %d/%d after %s, but past "+
+			"the hard cap. Progress was observed within the last %s, so this is pacing, not "+
+			"a wedge. Each position costs an fsync (upstreamStore.Commit), so a slow or "+
+			"contended filesystem is the first thing to check.\n",
+			markerFatal, tracker.last, total, now.Sub(tracker.start), tracker.stallBudget)
+		os.Exit(exitDrainTooSlow)
+	case drainContinue:
+		// Unreachable: drainLoop never returns this verdict (see its doc).
+		panic("waitForUpstreamCommitted: drainLoop returned drainContinue")
+	}
+}
+
+// containsGapMarker reports whether err is (or wraps) the specific,
+// structural gap chaosPlugin.Open (upstream.go) returns when a pruning
+// upstream can no longer supply data behind its already-committed watermark.
+// pkg/connector.Source.open wraps that error ("could not open source
+// connector plugin: %w"), so a substring check - not a prefix check - is
+// needed. A substring check on a plain fmt.Errorf (rather than a typed
+// sentinel) is enough here: this is test-only harness code checking
+// test-only harness output, not a production error contract.
+func containsGapMarker(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "GAP:")
+}
+
+// staticDispenser and staticFetcher wire a single, already-constructed
+// chaosPlugin into pkg/connector's plugin-dispensing machinery
+// (connector.PluginDispenserFetcher -> connectorPlugin.Dispenser ->
+// connectorPlugin.SourcePlugin), mirroring the same pattern
+// pkg/connector's own tests use (fakePluginFetcher in instance_test.go).
+type staticDispenser struct {
+	source connectorPlugin.SourcePlugin
+}
+
+func (d staticDispenser) DispenseSpecifier() (connectorPlugin.SpecifierPlugin, error) {
+	return nil, cerrors.New("staticDispenser: DispenseSpecifier not implemented")
+}
+
+func (d staticDispenser) DispenseSource() (connectorPlugin.SourcePlugin, error) {
+	return d.source, nil
+}
+
+func (d staticDispenser) DispenseDestination() (connectorPlugin.DestinationPlugin, error) {
+	return nil, cerrors.New("staticDispenser: DispenseDestination not implemented")
+}
+
+type staticFetcher map[string]connectorPlugin.Dispenser
+
+func (f staticFetcher) NewDispenser(_ log.CtxLogger, name string, _ string) (connectorPlugin.Dispenser, error) {
+	d, ok := f[name]
+	if !ok {
+		return nil, cerrors.Errorf("staticFetcher: no dispenser registered for plugin %q", name)
+	}
+	return d, nil
+}

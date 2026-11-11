@@ -1,0 +1,290 @@
+// Copyright © 2026 Meroxa, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package index_test
+
+import (
+	"bytes"
+	"os"
+	"path/filepath"
+	"runtime"
+	"testing"
+
+	"github.com/santhosh-tekuri/jsonschema/v6"
+
+	json "github.com/goccy/go-json"
+	"github.com/matryer/is"
+)
+
+// frozenSchemaPath resolves docs/design-documents/registry-index/index-schema.json
+// relative to THIS source file (via runtime.Caller), not the test binary's cwd —
+// the same pattern cmd/conduit/internal/testutils/envelope.go uses to load a
+// fixture living outside the calling package's own tree. The frozen JSON Schema
+// is the on-disk/served-shape contract (index-CI linting + fixture testing); the
+// R-1 schema doc claims "sample-index.json validates against index-schema.json"
+// but nothing in-repo enforced it until this test. PR-A adds processors[] to
+// both, so this is now a live regression guard that the two stay in lockstep.
+func frozenSchemaPath(t *testing.T) string {
+	t.Helper()
+	_, thisFile, _, ok := runtime.Caller(0)
+	is.New(t).True(ok)
+	// pkg/registry/index -> repo root is three parents up.
+	return filepath.Join(filepath.Dir(thisFile), "..", "..", "..",
+		"docs", "design-documents", "registry-index", "index-schema.json")
+}
+
+func compileFrozenSchema(t *testing.T) *jsonschema.Schema {
+	t.Helper()
+	is := is.New(t)
+	c := jsonschema.NewCompiler()
+	sch, err := c.Compile(frozenSchemaPath(t))
+	is.NoErr(err)
+	return sch
+}
+
+func validateAgainstFrozenSchema(t *testing.T, sch *jsonschema.Schema, raw []byte) error {
+	t.Helper()
+	inst, err := jsonschema.UnmarshalJSON(bytes.NewReader(raw))
+	is.New(t).NoErr(err)
+	return sch.Validate(inst)
+}
+
+// TestFrozenSchema_ValidatesSampleIndex is the R-1-doc-promised check, now
+// automated: the processor-bearing sample envelope validates against the frozen
+// Draft 2020-12 schema. If a future edit adds a field to sample-index.json the
+// schema doesn't declare (additionalProperties:false everywhere), or a processor
+// entry that violates the arch-neutral (wasip1/wasm/wasm-processor) constraint,
+// this fails.
+func TestFrozenSchema_ValidatesSampleIndex(t *testing.T) {
+	is := is.New(t)
+	sch := compileFrozenSchema(t)
+
+	raw, err := os.ReadFile("testdata/sample-index.json")
+	is.NoErr(err)
+
+	is.NoErr(validateAgainstFrozenSchema(t, sch, raw))
+}
+
+// TestFrozenSchema_ValidatesConnectorOnlyIndex proves the additive change is
+// backward-compatible at the schema level: an index with NO processors[] key at
+// all (the pre-processor shape) still validates, because processors[] is not in
+// payload.required.
+func TestFrozenSchema_ValidatesConnectorOnlyIndex(t *testing.T) {
+	is := is.New(t)
+	sch := compileFrozenSchema(t)
+
+	raw, err := os.ReadFile("testdata/sample-index-connectors-only.json")
+	is.NoErr(err)
+
+	is.NoErr(validateAgainstFrozenSchema(t, sch, raw))
+}
+
+// TestFrozenSchema_RejectsHostTargetedProcessorArtifact is the schema-level
+// counterpart to SelectProcessorArtifact's runtime refusal (design doc D2,
+// failure mode 3): a processor artifact carrying a host os/arch instead of the
+// fixed wasip1/wasm must be a schema violation, not a valid-but-skipped entry.
+// This is what makes "a host os/arch is a malformed/spoofed entry" enforceable
+// by index-CI linting, not only at install time.
+// TestFrozenSchema_AcceptsDottedProcessorName proves the processor name pattern
+// permits dots. Real standalone-processor names are namespaced (ai.chunk,
+// ai.embed) and the resolver exact-matches them against the WASM's own
+// Specification().Name, so the schema MUST accept them. The pattern originally
+// reused the connector rule (no dots), which would have failed every real
+// processor entry at schema-validation time — a latent bug this test locks out.
+func TestFrozenSchema_AcceptsDottedProcessorName(t *testing.T) {
+	is := is.New(t)
+	sch := compileFrozenSchema(t)
+
+	raw, err := os.ReadFile("testdata/sample-index.json")
+	is.NoErr(err)
+
+	var env map[string]any
+	is.NoErr(json.Unmarshal(raw, &env))
+	proc := env["payload"].(map[string]any)["processors"].([]any)[0].(map[string]any)
+
+	// A dotted name must validate.
+	proc["name"] = "ai.chunk"
+	mutated, err := json.Marshal(env)
+	is.NoErr(err)
+	is.NoErr(validateAgainstFrozenSchema(t, sch, mutated))
+
+	// The pattern still enforces the rest of the rule (lowercase only) — an
+	// uppercase name is rejected, so widening to allow dots didn't loosen it into
+	// accepting arbitrary names.
+	proc["name"] = "AI.Chunk"
+	mutatedBad, err := json.Marshal(env)
+	is.NoErr(err)
+	is.True(validateAgainstFrozenSchema(t, sch, mutatedBad) != nil)
+}
+
+func TestFrozenSchema_RejectsHostTargetedProcessorArtifact(t *testing.T) {
+	is := is.New(t)
+	sch := compileFrozenSchema(t)
+
+	raw, err := os.ReadFile("testdata/sample-index.json")
+	is.NoErr(err)
+
+	// Rewrite the single processor artifact's os/arch to a host platform.
+	var env map[string]any
+	is.NoErr(json.Unmarshal(raw, &env))
+	payload := env["payload"].(map[string]any)
+	procs := payload["processors"].([]any)
+	art := procs[0].(map[string]any)["versions"].([]any)[0].(map[string]any)["artifact"].(map[string]any)
+	art["os"] = "linux"
+	art["arch"] = "amd64"
+
+	mutated, err := json.Marshal(env)
+	is.NoErr(err)
+
+	// Must now FAIL: processorArtifact.os is const "wasip1", arch const "wasm".
+	is.True(validateAgainstFrozenSchema(t, sch, mutated) != nil)
+}
+
+// TestFrozenSchema_RejectsProcessorArtifactsList proves a processor version
+// cannot smuggle a connector-shaped per-host "artifacts" array in place of the
+// single arch-neutral "artifact" object (design doc D1/D2). additionalProperties
+// is false on processorVersion, and "artifact" is required, so an "artifacts"
+// key is rejected.
+func TestFrozenSchema_RejectsProcessorArtifactsList(t *testing.T) {
+	is := is.New(t)
+	sch := compileFrozenSchema(t)
+
+	raw, err := os.ReadFile("testdata/sample-index.json")
+	is.NoErr(err)
+
+	var env map[string]any
+	is.NoErr(json.Unmarshal(raw, &env))
+	payload := env["payload"].(map[string]any)
+	ver := payload["processors"].([]any)[0].(map[string]any)["versions"].([]any)[0].(map[string]any)
+	// Replace the single "artifact" with a connector-style "artifacts" list.
+	ver["artifacts"] = []any{ver["artifact"]}
+	delete(ver, "artifact")
+
+	mutated, err := json.Marshal(env)
+	is.NoErr(err)
+
+	is.True(validateAgainstFrozenSchema(t, sch, mutated) != nil)
+}
+
+// setLicenseAndTier loads the sample index, sets license and tier on its first
+// connector and first processor, and returns the re-marshaled envelope.
+func setLicenseAndTier(t *testing.T, license, tier any) []byte {
+	t.Helper()
+	is := is.New(t)
+	raw, err := os.ReadFile("testdata/sample-index.json")
+	is.NoErr(err)
+
+	var env map[string]any
+	is.NoErr(json.Unmarshal(raw, &env))
+	payload := env["payload"].(map[string]any)
+	for _, coll := range []string{"connectors", "processors"} {
+		entry := payload[coll].([]any)[0].(map[string]any)
+		entry["license"] = license
+		entry["tier"] = tier
+	}
+	out, err := json.Marshal(env)
+	is.NoErr(err)
+	return out
+}
+
+// TestFrozenSchema_AcceptsLicenseAndTier proves the additive fields validate
+// on both connector and processor entries, for every tier and for SPDX
+// identifiers and simple expressions.
+func TestFrozenSchema_AcceptsLicenseAndTier(t *testing.T) {
+	sch := compileFrozenSchema(t)
+	for _, tier := range []string{"certified", "verified", "adapter", "community"} {
+		for _, license := range []string{"Apache-2.0", "MIT", "Apache-2.0 OR MIT", "GPL-2.0-only WITH Classpath-exception-2.0"} {
+			t.Run(tier+"/"+license, func(t *testing.T) {
+				is.New(t).NoErr(validateAgainstFrozenSchema(t, sch, setLicenseAndTier(t, license, tier)))
+			})
+		}
+	}
+}
+
+// TestFrozenSchema_RejectsBadLicenseAndTier proves the schema still constrains
+// the new fields: tier is a closed enum and license must look like an SPDX
+// identifier or expression.
+func TestFrozenSchema_RejectsBadLicenseAndTier(t *testing.T) {
+	sch := compileFrozenSchema(t)
+	testCases := []struct {
+		name    string
+		license any
+		tier    any
+	}{
+		{"unknown tier", "Apache-2.0", "gold"},
+		{"uppercase tier", "Apache-2.0", "Community"},
+		{"empty tier", "Apache-2.0", ""},
+		{"non-string tier", "Apache-2.0", 1},
+		{"empty license", "", "community"},
+		{"free-text license", "Apache License 2.0", "community"},
+		{"non-string license", 2, "community"},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			is.New(t).True(validateAgainstFrozenSchema(t, sch, setLicenseAndTier(t, tc.license, tc.tier)) != nil)
+		})
+	}
+}
+
+// TestFrozenSchema_ValidatesLiveRegistryIndex validates a copy of the index
+// actually served by ConduitIO/conduit-connector-registry (index/index.json on
+// main as of 2026-10-09, unmodified) against the frozen schema. Every published
+// version string there carries a leading "v" ("v0.9.4"), which the client has
+// always accepted (registry.NormalizeVersion) but the schema's version pattern
+// rejected, so the served index did not validate against its own schema. This
+// test keeps the two in agreement.
+func TestFrozenSchema_ValidatesLiveRegistryIndex(t *testing.T) {
+	is := is.New(t)
+	sch := compileFrozenSchema(t)
+
+	raw, err := os.ReadFile("testdata/live-registry-index-20261009.json")
+	is.NoErr(err)
+
+	is.NoErr(validateAgainstFrozenSchema(t, sch, raw))
+}
+
+// TestFrozenSchema_VersionPattern pins what the version pattern accepts after
+// allowing an optional leading "v": exactly one lowercase "v", then semver.
+func TestFrozenSchema_VersionPattern(t *testing.T) {
+	sch := compileFrozenSchema(t)
+	raw, err := os.ReadFile("testdata/sample-index.json")
+	is.New(t).NoErr(err)
+
+	testCases := []struct {
+		version string
+		valid   bool
+	}{
+		{"0.14.0", true},
+		{"v0.14.0", true},
+		{"v1.2.3-rc.1+build.5", true},
+		{"vv0.14.0", false},
+		{"V0.14.0", false},
+		{"v0.14", false},
+		{"version0.14.0", false},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.version, func(t *testing.T) {
+			is := is.New(t)
+			var env map[string]any
+			is.NoErr(json.Unmarshal(raw, &env))
+			payload := env["payload"].(map[string]any)
+			payload["connectors"].([]any)[0].(map[string]any)["versions"].([]any)[0].(map[string]any)["version"] = tc.version
+			payload["processors"].([]any)[0].(map[string]any)["versions"].([]any)[0].(map[string]any)["version"] = tc.version
+			mutated, err := json.Marshal(env)
+			is.NoErr(err)
+			err = validateAgainstFrozenSchema(t, sch, mutated)
+			is.Equal(err == nil, tc.valid)
+		})
+	}
+}

@@ -1,0 +1,287 @@
+// Copyright © 2022 Meroxa, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package orchestrator
+
+import (
+	"context"
+	"fmt"
+
+	"github.com/conduitio/conduit-commons/rollback"
+	"github.com/conduitio/conduit/pkg/connector"
+	"github.com/conduitio/conduit/pkg/foundation/cerrors"
+	"github.com/conduitio/conduit/pkg/foundation/cerrors/conduiterr"
+	"github.com/conduitio/conduit/pkg/foundation/env"
+	"github.com/conduitio/conduit/pkg/inspector"
+	"github.com/conduitio/conduit/pkg/pipeline"
+	"github.com/google/uuid"
+)
+
+type ConnectorOrchestrator base
+
+func (c *ConnectorOrchestrator) Inspect(ctx context.Context, id string) (*inspector.Session, error) {
+	conn, err := c.Get(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+
+	return conn.Inspect(ctx), nil
+}
+
+func (c *ConnectorOrchestrator) Create(
+	ctx context.Context,
+	t connector.Type,
+	plugin string,
+	pipelineID string,
+	config connector.Config,
+) (*connector.Instance, error) {
+	var mark mutationMark
+	defer mark.release()
+	var r rollback.R
+	defer r.MustExecute()
+
+	txn, ctx, err := c.db.NewTransaction(ctx, true)
+	if err != nil {
+		return nil, cerrors.Errorf("could not create db transaction: %w", err)
+	}
+	r.AppendPure(txn.Discard)
+
+	pl, err := c.pipelines.Get(ctx, pipelineID)
+	if err != nil {
+		return nil, cerrors.Errorf("couldn't get pipeline: %w", err)
+	}
+
+	if pl.ProvisionedBy != pipeline.ProvisionTypeAPI {
+		// Invariant: errors.Is(err, ErrImmutableProvisionedByConfig) still holds —
+		// sentinel wrapped, ConduitError adds the code.
+		return nil, immutableProvisionedByConfigErr(fmt.Sprintf("cannot add a connector to the pipeline %q", pl.ID))
+	}
+	// Invariant 2: admitted by run liveness, not status (#2899 item 2): a
+	// starting or recovering run counts.
+	if c.lifecycle.IsActive(pl.ID) {
+		// Invariant: errors.Is(err, ErrPipelineRunning) still holds — sentinel
+		// wrapped, ConduitError adds the code.
+		return nil, pipelineRunningErr("cannot create connector: " + pipeline.ErrPipelineRunning.Error())
+	}
+
+	// Nothing is stored yet, so "***" (the API's redaction placeholder) has
+	// no value to keep; storing it literally would break the setting (#2913).
+	if err := RefuseRedactedSettings(config.Settings, "/config/settings"); err != nil {
+		return nil, err
+	}
+
+	err = c.Validate(ctx, t, plugin, config)
+	if err != nil {
+		return nil, err
+	}
+	// #2961: Validate may start a plugin process, so it runs before the mark.
+	// The IsActive test above is the early refusal; this is the authoritative
+	// one, atomic with the mark that excludes Start until the writes finish.
+	if err := mark.acquire(c.lifecycle, pl.ID, "cannot create connector: "+pipeline.ErrPipelineRunning.Error()); err != nil {
+		return nil, err
+	}
+
+	conn, err := c.connectors.Create(ctx, uuid.NewString(), t, plugin, pl.ID, config, connector.ProvisionTypeAPI)
+	if err != nil {
+		return nil, err
+	}
+	r.Append(func() error { return c.connectors.Delete(ctx, conn.ID, c.connectorPlugins) })
+
+	_, err = c.pipelines.AddConnector(ctx, pl.ID, conn.ID)
+	if err != nil {
+		return nil, cerrors.Errorf("couldn't add connector %v to pipeline %v: %w", conn.ID, pl.ID, err)
+	}
+	r.Append(func() error {
+		_, err := c.pipelines.RemoveConnector(ctx, pl.ID, conn.ID)
+		return err
+	})
+
+	err = txn.Commit()
+	if err != nil {
+		return nil, cerrors.Errorf("could not commit db transaction: %w", err)
+	}
+
+	r.Skip()
+	return conn, nil
+}
+
+func (c *ConnectorOrchestrator) List(ctx context.Context) map[string]*connector.Instance {
+	return c.connectors.List(ctx)
+}
+
+func (c *ConnectorOrchestrator) Get(ctx context.Context, id string) (*connector.Instance, error) {
+	return c.connectors.Get(ctx, id)
+}
+
+func (c *ConnectorOrchestrator) Delete(ctx context.Context, id string) error {
+	var mark mutationMark
+	defer mark.release()
+	var r rollback.R
+	defer r.MustExecute()
+	txn, ctx, err := c.db.NewTransaction(ctx, true)
+	if err != nil {
+		return cerrors.Errorf("could not create db transaction: %w", err)
+	}
+	r.AppendPure(txn.Discard)
+	conn, err := c.connectors.Get(ctx, id)
+	if err != nil {
+		return err
+	}
+	if conn.ProvisionedBy != connector.ProvisionTypeAPI {
+		// Invariant: errors.Is(err, ErrImmutableProvisionedByConfig) still holds —
+		// sentinel wrapped, ConduitError adds the code.
+		return immutableProvisionedByConfigErr(fmt.Sprintf("connector %q cannot be deleted", conn.ID))
+	}
+	if len(conn.ProcessorIDs) != 0 {
+		// Invariant: errors.Is(err, ErrConnectorHasProcessorsAttached) still holds —
+		// sentinel wrapped, ConduitError adds the code.
+		err := conduiterr.Wrap(CodeConnectorHasProcessorsAttached, ErrConnectorHasProcessorsAttached.Error(), ErrConnectorHasProcessorsAttached)
+		err.Suggestion = "remove the connector's processors first, then delete the connector"
+		return err
+	}
+	pl, err := c.pipelines.Get(ctx, conn.PipelineID)
+	if err != nil {
+		return err
+	}
+	// Invariant 2: admitted by run liveness, not status (#2899 item 2): a
+	// starting or recovering run counts.
+	// #2961: the check and the mark are one step under the lifecycle's
+	// admission lock; Start is refused until the delete is written.
+	if err := mark.acquire(c.lifecycle, pl.ID, pipeline.ErrPipelineRunning.Error()); err != nil {
+		return err
+	}
+	err = c.connectors.Delete(ctx, id, c.connectorPlugins)
+	if err != nil {
+		return err
+	}
+	// Invariant 2 (#3137): roll back by putting the same instance back, not a
+	// fresh one, position included. If Delete already ran the plugin's delete
+	// hook, which may have released what the position points into, the
+	// instance stays marked and its next start is refused with
+	// connector.delete_hook_ran (invariant 3: fail closed). ctx carries txn,
+	// so Restore only touches memory: the transaction is discarded and the
+	// store keeps the original record.
+	r.Append(func() error {
+		return c.connectors.Restore(ctx, conn)
+	})
+	_, err = c.pipelines.RemoveConnector(ctx, pl.ID, id)
+	if err != nil {
+		return err
+	}
+	r.Append(func() error {
+		_, err := c.pipelines.AddConnector(ctx, pl.ID, id)
+		return err
+	})
+	err = txn.Commit()
+	if err != nil {
+		return cerrors.Errorf("could not commit db transaction: %w", err)
+	}
+	r.Skip()
+	return nil
+}
+
+func (c *ConnectorOrchestrator) Update(ctx context.Context, id string, plugin string, config connector.Config) (*connector.Instance, error) {
+	var mark mutationMark
+	defer mark.release()
+	var r rollback.R
+	defer r.MustExecute()
+	txn, ctx, err := c.db.NewTransaction(ctx, true)
+	if err != nil {
+		return nil, cerrors.Errorf("could not create db transaction: %w", err)
+	}
+	r.AppendPure(txn.Discard)
+	conn, err := c.connectors.Get(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if conn.ProvisionedBy != connector.ProvisionTypeAPI {
+		// Invariant: errors.Is(err, ErrImmutableProvisionedByConfig) still holds —
+		// sentinel wrapped, ConduitError adds the code.
+		return nil, immutableProvisionedByConfigErr(fmt.Sprintf("connector %q cannot be updated", conn.ID))
+	}
+
+	pl, err := c.pipelines.Get(ctx, conn.PipelineID)
+	if err != nil {
+		return nil, err
+	}
+	// Invariant 2: admitted by run liveness, not status (#2899 item 2): a
+	// starting or recovering run counts.
+	if c.lifecycle.IsActive(pl.ID) {
+		// Invariant: errors.Is(err, ErrPipelineRunning) still holds — sentinel
+		// wrapped, ConduitError adds the code.
+		return nil, pipelineRunningErr(pipeline.ErrPipelineRunning.Error())
+	}
+
+	// "***" (the API's redaction placeholder) keeps the stored value, so a
+	// redacted GET -> UPDATE round trip does not overwrite credentials (#2913).
+	// Before Validate, so the plugin validates the real values.
+	config.Settings, err = restoreRedactedSettingsForPlugin(conn.Plugin, plugin, conn.Config.Settings, config.Settings, "/config/settings")
+	if err != nil {
+		return nil, err
+	}
+
+	err = c.Validate(ctx, conn.Type, conn.Plugin, config)
+	if err != nil {
+		return nil, err
+	}
+	// #2961: Validate may start a plugin process, so it runs before the mark;
+	// the IsActive test above is the early refusal, this the authoritative one.
+	if err := mark.acquire(c.lifecycle, pl.ID, pipeline.ErrPipelineRunning.Error()); err != nil {
+		return nil, err
+	}
+
+	oldConfig := conn.Config
+	conn, err = c.connectors.Update(ctx, id, plugin, config)
+	if err != nil {
+		return nil, err
+	}
+	r.Append(func() error {
+		_, err = c.connectors.Update(ctx, id, conn.Plugin, oldConfig)
+		return err
+	})
+	err = txn.Commit()
+	if err != nil {
+		return nil, cerrors.Errorf("could not commit db transaction: %w", err)
+	}
+	r.Skip()
+	return conn, nil
+}
+
+func (c *ConnectorOrchestrator) Validate(
+	ctx context.Context,
+	t connector.Type,
+	plugin string,
+	config connector.Config,
+) error {
+	// The plugin validates the text it will get at runtime, where the "$$"
+	// escape is already a literal "$" (a Go template written {{ $$x }} is
+	// {{ $x }} by then). References are not expanded here: validation must not
+	// read the environment. The stored settings keep the escape.
+	settings := env.CollapseSettingEscapes(config.Settings)
+	var err error
+	switch t {
+	case connector.TypeSource:
+		err = c.connectorPlugins.ValidateSourceConfig(ctx, plugin, settings)
+	case connector.TypeDestination:
+		err = c.connectorPlugins.ValidateDestinationConfig(ctx, plugin, settings)
+	default:
+		return cerrors.New("invalid connector type")
+	}
+
+	if err != nil {
+		return cerrors.Errorf("invalid connector config: %w", err)
+	}
+
+	return nil
+}

@@ -1,0 +1,764 @@
+// Copyright © 2024 Meroxa, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//go:generate stringer -type=RecordFlag -linecomment
+
+package funnel
+
+import (
+	"fmt"
+	"slices"
+
+	"github.com/conduitio/conduit-commons/opencdc"
+)
+
+// Batch represents a batch of records that are processed together. It keeps
+// track of the status of each record in the batch, and provides methods to
+// update the status of records.
+type Batch struct {
+	// records holds all records in the batch, including filtered ones. Use
+	// ActiveRecords to get the records that are not filtered.
+	records []opencdc.Record
+	// recordsShared reports whether records still aliases the caller's backing
+	// array (the source connector's read slice). Mutators clone on first write
+	// so the common no-mutation path avoids the copy (see ensureOwnedRecords).
+	recordsShared bool
+	// recordStatuses holds the status of each record in the batch. The status
+	// is used to determine if the record was acked, nacked, filtered or marked
+	// for retrial.
+	recordStatuses []RecordStatus
+	// positions is a slice of positions for the records in the batch. The
+	// positions are used to ack or nack records in the source. If a record
+	// was split, its position is nil. Split records are always consecutive, so
+	// we can use the first record's position to ack or nack the split records.
+	positions []opencdc.Position
+
+	// filterCount is updated any time a record is marked as filtered, to make it
+	// easier to construct the set of active records.
+	filterCount int
+
+	// If a batch is tainted it means that parts need to be either nacked or
+	// retried. Such a batch needs to be split into multiple batches, each
+	// containing only records with the same status (filtered counts as acked).
+	tainted bool
+
+	// splitRecords is a map of split records, where the key is the record's
+	// ORIGINAL source position (b.positions[i], see #2730 below) converted to
+	// a string. The value is the original record itself. This is used to keep
+	// track of the original record when splitting it into multiple records.
+	// The position is nil for split records, except the first record, which
+	// contains the position of the original record.
+	splitRecords map[string]opencdc.Record
+
+	// runs tracks, for every currently-live record in the batch, which split
+	// run (if any) it belongs to. runs[i] is nil for a record that was never
+	// split (the common case). For a record that WAS split, every piece
+	// descended from it - the head at the position it originally occupied,
+	// and every tail piece produced by SplitRecord, however many rounds of
+	// further splitting happen to any of them - shares the exact same *splitRun
+	// pointer.
+	//
+	// This is what lets runAckNacker (run_ledger.go) recognize that two pieces
+	// of one run arriving in two SEPARATE Ack/Nack calls - possibly far apart
+	// in time, via the RecordFlagRetry recursion in Worker.doTask - are the
+	// same run, even though by then they may be sitting in totally different
+	// *Batch values produced by sub() (see #2723). Looking this up via
+	// splitRecords/positions alone does not work for a sub-batch that holds
+	// only nil-position tail pieces with no head present: sub()'s own
+	// splitRecords-carry-forward logic keys on position bytes, and nil never
+	// matches a real key, so a pure-tail sub-batch always loses that map
+	// entry. runs is a dedicated, position-independent parallel array kept in
+	// lockstep with records/recordStatuses/positions specifically so tail-only
+	// slices don't lose the association.
+	//
+	// nil (rather than an empty slice) is the zero value for a *Batch created
+	// directly as a struct literal instead of through NewBatch - every
+	// consumer of this field (sub, clone, SplitRecord, runAckNacker.vote)
+	// treats a nil runs slice as "no run tracking available, every record is
+	// standalone", which is exactly correct for those hand-built batches (e.g.
+	// multiAckNacker's ackBatch/nackBatch, or splitRun's own ackBatch/nackBatch
+	// below): they represent an already-fully-resolved position, with nothing
+	// left to track.
+	runs []*splitRun
+}
+
+// NewBatch creates a new batch that takes OWNERSHIP of the records it is
+// given: the records slice is cloned so the batch's in-place mutations
+// (SetRecords, SplitRecord) can never write into the caller's backing array.
+//
+// Invariant 6 (enforcement site): this ownership boundary matters at the
+// source. SourceTask.Do hands NewBatch the exact slice the source connector
+// returned, and the connector SDK's read goroutine still reads that slice
+// after sending it (sourcePluginAdapter.runRead stores the last record's
+// position from recs[len(recs)-1]). Sharing the array made SetRecords'
+// copy(b.records[i:], recs) race with that read - the RAG template e2e hit
+// exactly this as a data race, a torn read of the source's last-sent position
+// without the race detector. A shallow clone is sufficient because the funnel
+// only ever REPLACES whole record structs (copy/append) and never mutates a
+// record's fields in place (see TestNewBatch_OwnsRecords).
+func NewBatch(records []opencdc.Record) *Batch {
+	// Store positions separately, as we need the original positions when acking
+	// records in the source, in case a processor tries to change the position.
+	positions := make([]opencdc.Position, len(records))
+	for i, r := range records {
+		positions[i] = r.Position
+	}
+
+	return &Batch{
+		records:        records,
+		recordsShared:  true,
+		recordStatuses: make([]RecordStatus, len(records)),
+		positions:      positions,
+		runs:           make([]*splitRun, len(records)),
+		filterCount:    0,
+		tainted:        false,
+	}
+}
+
+// ensureOwnedRecords clones the records slice on first mutation so SetRecords
+// and SplitRecord can write in place without racing the source connector's
+// read goroutine (which still reads its slice after handing it to the funnel).
+// The common no-mutation path never clones, so it pays nothing (Invariant 6).
+func (b *Batch) ensureOwnedRecords() {
+	if b.recordsShared {
+		b.records = slices.Clone(b.records)
+		b.recordsShared = false
+	}
+}
+
+// Ack marks the record at index i as acked. If a second index is provided, all
+// records between i (included) and j (excluded) are marked as acked. If multiple
+// indices are provided, the method panics.
+// Records are marked as acked by default, so this method is only useful when
+// reprocessing records marked to be retried.
+//
+// Note that the indices i and j point to the slice returned by ActiveRecords.
+// If the slice contains filtered records, the filtered records are skipped and
+// not marked as acked.
+func (b *Batch) Ack(i int, j ...int) {
+	b.setFlagNoErr(RecordFlagAck, i, j...)
+}
+
+// Nack marks the record at index i as nacked. If multiple errors are provided,
+// they are assigned to the records starting at index i.
+//
+// Note that the indices i and j point to the slice returned by ActiveRecords.
+// If the slice contains filtered records, the filtered records are skipped and
+// not marked as nacked.
+func (b *Batch) Nack(i int, errs ...error) {
+	b.setFlagWithErr(RecordFlagNack, i, errs)
+	b.tainted = true
+}
+
+// Retry marks the record at index i to be retried. If a second index is
+// provided, all records between i (included) and j (excluded) are marked to be
+// retried. If multiple indices are provided, the method panics.
+//
+// Note that the indices i and j point to the slice returned by ActiveRecords.
+// If the slice contains filtered records, the filtered records are skipped and
+// not marked to be retried.
+func (b *Batch) Retry(i int, j ...int) {
+	b.setFlagNoErr(RecordFlagRetry, i, j...)
+	b.tainted = true
+}
+
+// Filter marks the record at index i as filtered out. If a second index is
+// provided, all records between i (included) and j (excluded) are marked as
+// filtered. If multiple indices are provided, the method panics.
+// Once a record is filtered, it is kept in the batch as to not split the batch
+// into multiple batches. It's not returned in the active records and its status
+// can't be changed anymore, however, it is included when acking the batch.
+//
+// Note that the indices i and j point to the slice returned by ActiveRecords.
+// If the slice contains filtered records, the filtered records are skipped and
+// not marked to be retried.
+func (b *Batch) Filter(i int, j ...int) {
+	b.setFlagNoErr(RecordFlagFilter, i, j...)
+	end := i + 1
+	if len(j) == 1 {
+		end = j[0]
+	}
+	b.filterCount += end - i
+}
+
+// SetRecords replaces the records in the batch starting at index i with the
+// provided records. If recs contains n records, indices i to i+n-1 are replaced.
+//
+// i is an index into the ACTIVE (non-filtered) view of the batch - the same
+// index space returned by ActiveRecords - never a raw index into b.records.
+// SetRecords REPLACES records in place; it deliberately does NOT grow the
+// batch (that is SplitRecord's job, which must also extend positions,
+// recordStatuses and runs to keep them in lockstep with records). A caller
+// that asks to replace past the end of the active view is therefore a bug:
+// without this guard the filtered path panicked with an opaque slice-bounds
+// error and the unfiltered path silently truncated recs via copy - data loss
+// (invariant 6). Reject the overrun loudly instead of mangling either way.
+func (b *Batch) SetRecords(i int, recs []opencdc.Record) {
+	b.ensureOwnedRecords()
+	// TODO: we should not have to recalculate the active record indices every time.
+	activeIndices := b.activeRecordIndices()
+
+	// activeCount is the size of the index space i addresses: the whole batch
+	// when nothing is filtered, or the active view when records are filtered.
+	activeCount := len(b.records)
+	if activeIndices != nil {
+		activeCount = len(activeIndices)
+	}
+	if i < 0 || i > activeCount || len(recs) > activeCount-i {
+		panic(fmt.Sprintf(
+			"(bug) SetRecords: cannot replace %d record(s) starting at active index %d in a batch with %d active record(s): "+
+				"the processor returned more records than it received (use MultiRecord to split a record instead of returning extra records)",
+			len(recs), i, activeCount,
+		))
+	}
+
+	if activeIndices == nil {
+		// No records are filtered, we can use the original indices.
+		copy(b.records[i:], recs)
+		return
+	}
+
+	// We have filtered records, so we need to use the active indices.
+	from := i
+	for len(recs) > 0 {
+		activeFrom := activeIndices[from]
+		to := b.findTo(from, from+len(recs), func(idx int) bool {
+			return activeIndices[idx]-activeFrom == idx-from
+		})
+		activeTo := activeIndices[to]
+		copy(b.records[activeFrom:activeTo+1], recs[:to-from+1])
+		recs = recs[to-from+1:]
+		from = to + 1
+	}
+}
+
+// findTo implements a dichotomic search function. It finds the highest index t
+// in the range [l, r) such that check(t) is true. The check function is called
+// with the index t, and if it returns true, the index is returned. If check(t)
+// returns false, the search continues in the range [l, t). The search stops
+// when the range is empty or when check(t) returns true.
+func (b *Batch) findTo(l, r int, check func(int) bool) int {
+	// Precondition
+	if !check(l) {
+		panic("precondition failed: check(l) must be true")
+	}
+
+	maxIdxTrue := l  // highest known integer which satisfies check(idx) == true
+	minIdxFalse := r // lowest known integer which satisfies check(idx) == false
+
+	for maxIdxTrue+1 < minIdxFalse {
+		midIdx := (maxIdxTrue + minIdxFalse) / 2
+
+		if check(midIdx) {
+			maxIdxTrue = midIdx
+		} else {
+			minIdxFalse = midIdx
+		}
+	}
+
+	return maxIdxTrue
+}
+
+// SplitRecord splits the record at index i into the provided records. The
+// records replace the record at the index i, and the rest of the records are
+// shifted to the right.
+//
+// # #2730: run membership keys on b.positions[i], not b.records[i].Position
+//
+// b.records[i].Position is the record's OWN Position field, which a processor
+// upstream of this call may have rewritten. b.positions[i] is Batch's own,
+// separately-tracked original source position (see the positions field doc),
+// never touched by a processor. Keying splitRecords (and, below, the run
+// ledger) on the record's current position meant a processor that rewrote a
+// position before a later processor split it broke run membership entirely:
+// groupFlagAt/checkEdge in the two rejected fixes for #2723 looked up
+// b.positions[idx], which no longer matched the key SplitRecord had written,
+// so the run was silently treated as a single ordinary record. Keying on
+// b.positions[i] here (which every consumer already used) closes that gap.
+func (b *Batch) SplitRecord(i int, recs []opencdc.Record) {
+	b.ensureOwnedRecords()
+	// TODO: we should not have to recalculate the active record indices every time.
+	activeIndices := b.activeRecordIndices()
+	if activeIndices != nil {
+		// We have filtered records, use the active index instead.
+		i = activeIndices[i]
+	}
+
+	origPos := b.positions[i]
+
+	var run *splitRun
+	if b.runs != nil {
+		run = b.runs[i]
+	}
+
+	if run == nil {
+		// First time this record is being split.
+		if origPos == nil {
+			// i is itself a nil-position (tail) member of an existing run
+			// whose head - and therefore whose *splitRun - lives at a lower
+			// index. sub() is responsible for carrying b.runs forward
+			// alongside positions/recordStatuses so this is always resolved
+			// above; reaching here means that invariant broke.
+			panic("(bug) SplitRecord: record has a nil position but no known split run")
+		}
+
+		if b.splitRecords == nil {
+			b.splitRecords = make(map[string]opencdc.Record)
+		}
+		origRecord := b.records[i]
+		if existing, ok := b.splitRecords[origPos.String()]; ok {
+			// Should not normally happen (origPos == nil check above already
+			// implies this is the first split for this position), but prefer
+			// whatever was already recorded if it exists.
+			origRecord = existing
+		} else {
+			// We're splitting an original record, so we need to store it in the
+			// split records map. If any of the split records get nacked, we need
+			// to send the original to the DLQ.
+			b.splitRecords[origPos.String()] = origRecord
+		}
+
+		// total starts at 1 (the single existing member - index i itself -
+		// that this call is about to replace), so that "run.total +=
+		// len(recs)-1" below lands on exactly len(recs), not len(recs)-1.
+		run = &splitRun{origPos: origPos, origRecord: origRecord, total: 1}
+		if b.runs == nil {
+			b.runs = make([]*splitRun, len(b.records))
+		}
+		b.runs[i] = run
+	}
+	// run.total tracks every CURRENTLY LIVE member of the run. This split
+	// replaces one live member (index i) with len(recs) new ones, so the net
+	// change is len(recs)-1 - not len(recs), which would double-count i itself
+	// on every split after the first. See splitRun's doc comment for why this
+	// must be able to grow after some sibling members have already gone
+	// terminal.
+	run.mu.Lock()
+	run.total += len(recs) - 1
+	run.mu.Unlock()
+
+	b.records = append(b.records[:i], append(recs, b.records[i+1:]...)...)
+
+	// Extend the record statuses slice to accommodate the new records. By
+	// default the new records are marked as acked (RecordStatus's zero value).
+	// This is safe under the run-ledger design even when a sibling member of
+	// the same run is currently flagged Retry: unlike the two rejected #2723
+	// fixes, nothing here relies on every member of a run sharing one flag.
+	// The ledger tracks completion via run.total/run.terminalCount, credited
+	// only when a member actually reaches an Ack/Nack call - not by reading
+	// recordStatuses - so a freshly-split piece defaulting to "no error from
+	// this task, proceed" is exactly the right behavior regardless of what
+	// flag its siblings currently carry. See TestBatch_SplitRecord_ZeroValueAck_SafeUnderRunLedger.
+	b.recordStatuses = append(
+		b.recordStatuses[:i+1],
+		append(make([]RecordStatus, len(recs)-1), b.recordStatuses[i+1:]...)...,
+	)
+
+	// Extend the positions slice to accommodate the new records. The new records
+	// get a nil position, which indicates that they were split from the original
+	// record.
+	b.positions = append(
+		b.positions[:i+1],
+		append(make([]opencdc.Position, len(recs)-1), b.positions[i+1:]...)...,
+	)
+
+	// Extend runs the same way: every new piece belongs to the same run as
+	// the record it replaced.
+	newRuns := make([]*splitRun, 0, len(recs)-1)
+	for k := 0; k < len(recs)-1; k++ {
+		newRuns = append(newRuns, run)
+	}
+	b.runs = append(
+		b.runs[:i+1],
+		append(newRuns, b.runs[i+1:]...)...,
+	)
+}
+
+func (b *Batch) setFlagNoErr(f RecordFlag, i int, j ...int) {
+	// TODO: we should not have to recalculate the active record indices every time.
+	activeIndices := b.activeRecordIndices()
+	if activeIndices == nil {
+		// No records are filtered, we can use the original indices.
+		switch len(j) {
+		case 0:
+			b.recordStatuses[i].Flag = f
+		case 1:
+			if i >= j[0] {
+				panic(fmt.Sprintf("invalid range (%d >= %d)", i, j[0]))
+			}
+			for k := i; k < j[0]; k++ {
+				b.recordStatuses[k].Flag = f
+			}
+		default:
+			panic(fmt.Sprintf("too many arguments (%d)", len(j)))
+		}
+	} else {
+		// We have filtered records, so we need to use the active indices.
+		switch len(j) {
+		case 0:
+			b.recordStatuses[activeIndices[i]].Flag = f
+		case 1:
+			if i >= j[0] {
+				panic(fmt.Sprintf("invalid range (%d >= %d)", i, j[0]))
+			}
+			for k := i; k < j[0]; k++ {
+				b.recordStatuses[activeIndices[k]].Flag = f
+			}
+		default:
+			panic(fmt.Sprintf("too many arguments (%d)", len(j)))
+		}
+	}
+}
+
+// setFlagWithErr sets the flag for the record at index i to f, and sets the
+// error for the record to err. If multiple errors are provided, they are
+// assigned to the records starting at index i. If an error is assigned to a
+// split record, all records in the split record are marked with the same flag
+// and error.
+func (b *Batch) setFlagWithErr(f RecordFlag, i int, errs []error) {
+	// TODO: we should not have to recalculate the active record indices every time.
+	activeIndices := b.activeRecordIndices()
+	for k, err := range errs {
+		idx := i + k
+		if activeIndices != nil {
+			// We have filtered records, so we need to use the active index.
+			idx = activeIndices[idx]
+		}
+
+		// Set the flag and error for this record.
+		b.recordStatuses[idx].Flag = f
+		b.recordStatuses[idx].Error = err
+
+		// Handle split records when nacking.
+		if len(b.splitRecords) > 0 && f == RecordFlagNack {
+			// If the record was split, we need to set the error for all
+			// records in the split record, so they are all marked as nacked.
+			if _, ok := b.splitRecords[b.positions[idx].String()]; b.positions[idx] == nil || ok {
+				// This is a split record, we need to set the error for all
+				// records in the split record.
+				from, to := b.findSplitRecord(idx)
+				for j := from; j <= to; j++ {
+					b.recordStatuses[j].Flag = f
+					b.recordStatuses[j].Error = err
+				}
+			}
+		}
+	}
+}
+
+func (b *Batch) findSplitRecord(i int) (int, int) {
+	// Find the first record that has a position (i.e. first split record).
+	from := i
+	for from > 0 && b.positions[from] == nil {
+		from--
+	}
+	// Find the last record that has a position. (i.e. last split record).
+	to := i + 1
+	for to < len(b.positions) && b.positions[to] == nil {
+		to++
+	}
+	to-- // Adjust index to point to the last record that was split.
+
+	return from, to
+}
+
+// clone returns an independent copy of the batch, suitable for handing to a
+// concurrently-running destination branch in a fan-out (see
+// Worker.doNextTask's multi-destination case).
+//
+// records, recordStatuses and splitRecords are fully copied so a branch can
+// mutate them (Ack/Nack/Filter/Retry/SplitRecord) without affecting its
+// siblings or the original batch.
+//
+// positions is intentionally NOT deep-copied: the underlying opencdc.Position
+// values are shared by reference with the original batch across all branches
+// (cheap, and multiAckNacker's per-position tally relies on the exact same
+// position bytes to match votes across branches — see
+// docs/design-documents/20260731-archv2-multiconnector.md). What IS required
+// is that the shared backing ARRAY can never be mutated through one branch's
+// slice header and observed by another's.
+//
+// Before this fix, clone() shared b.positions verbatim (same len AND cap).
+// Batch.SplitRecord grows b.positions via
+// `append(b.positions[:i+1], newElems...)`, and Go's append reuses the
+// backing array whenever spare capacity exists past the slice's length —
+// which it always did here, because slicing to a shorter length does not
+// reduce capacity. Two branches created from the same clone() call therefore
+// shared one growable backing array: if branch A called SplitRecord first, it
+// could silently overwrite index i+1 (and beyond) of the SAME array that
+// branch B's still-unmodified `positions` slice header pointed to, corrupting
+// B's view of its own positions out from under it while B's goroutine was
+// concurrently reading them — a data race with a data-loss blast radius
+// (wrong positions reaching Source.Ack violates invariant 2). This was only
+// reachable once destination fan-out went live (clone() had no caller before
+// slice 3a), so nothing shipped was ever exposed to it, but it would have
+// been the first thing a multi-destination pipeline with a splitting
+// processor hit. slices.Clip caps the capacity to the length (no reallocation
+// happens here — it's a zero-cost 3-index reslice), so the FIRST subsequent
+// SplitRecord call on either branch is forced to allocate a fresh backing
+// array via append, leaving every sibling's slice header (and the original
+// batch) untouched. See TestBatch_Clone_PositionsAliasing.
+func (b *Batch) clone() *Batch {
+	c := b.cloneSharingRecords()
+	records := make([]opencdc.Record, len(b.records))
+	for i, r := range b.records {
+		records[i] = r.Clone()
+	}
+	c.records = records
+	c.recordsShared = false
+	return c
+}
+
+// cloneSharingRecords is clone() without the deep copy of the records: the
+// returned batch has its own recordStatuses, run ledger and splitRecords map,
+// but its records slice points at the same opencdc.Record values (and so the
+// same Metadata maps and payloads) as b.
+//
+// It exists for the fan-out case where deep-copying every record per branch
+// was the dominant cost (#2910): a branch made only of destination tasks
+// never modifies a record, it only reads it, so M such branches can read one
+// copy concurrently. That is only safe while EVERY holder of these records
+// treats them as read-only for as long as any branch is still running. The
+// caller decides that - see branchMutatesRecords and Worker.doNextTask - and
+// must use clone() for any branch that may modify a record in place.
+//
+// The records slice is clipped (len == cap), for the same reason positions is
+// in clone(): if a holder ever did append to it, the append must reallocate
+// rather than write into a backing array a sibling is reading.
+func (b *Batch) cloneSharingRecords() *Batch {
+	var splitRecords map[string]opencdc.Record
+	if len(b.splitRecords) > 0 {
+		// Copy the map (not just the reference): SplitRecord writes new
+		// entries into it, and two branches calling SplitRecord concurrently
+		// on a shared map is a concurrent map write - a fatal, unrecoverable
+		// runtime crash, not just a benign race. The stored opencdc.Record
+		// values themselves are never mutated after being stored (only read
+		// back by originalBatch), so a shallow copy - reusing the same
+		// Record values across branches - is safe.
+		splitRecords = make(map[string]opencdc.Record, len(b.splitRecords))
+		for k, v := range b.splitRecords {
+			splitRecords[k] = v
+		}
+	}
+
+	return &Batch{
+		records:        slices.Clip(b.records),
+		recordsShared:  true,
+		recordStatuses: slices.Clone(b.recordStatuses),
+		positions:      slices.Clip(b.positions),
+		runs:           cloneRuns(b.runs),
+		tainted:        b.tainted,
+		filterCount:    b.filterCount,
+		splitRecords:   splitRecords,
+	}
+}
+
+// cloneRuns deep-copies the *splitRun graph referenced by runs: every branch
+// created by clone() (see Worker.doNextTask's destination fan-out) must
+// evolve its own runs' completion tallies independently from its siblings and
+// from the batch it was cloned from - concurrent branches incrementing the
+// SAME splitRun's terminalCount would be a data race, and would also make one
+// branch's retry/filter/split decisions bleed into another's ack decisions,
+// which is exactly the kind of cross-branch interference multiAckNacker
+// exists to prevent at the position level. This mirrors why splitRecords
+// itself is deep-copied, not shared, in clone().
+//
+// Every member of one run must keep pointing at the SAME cloned *splitRun
+// (not get its own independent copy), or the tally would fragment and never
+// reach completion - the seen map ensures that.
+func cloneRuns(runs []*splitRun) []*splitRun {
+	if runs == nil {
+		return nil
+	}
+	out := make([]*splitRun, len(runs))
+	// seen is allocated on the first run actually found. Most batches carry
+	// no split runs at all (runs is all nil), and this is called once per
+	// fan-out branch per pass, so an eager map was a per-branch allocation
+	// sized to the batch for nothing (#2910).
+	var seen map[*splitRun]*splitRun
+	for i, r := range runs {
+		if r == nil {
+			continue
+		}
+		if seen == nil {
+			seen = make(map[*splitRun]*splitRun)
+		}
+		cloned, ok := seen[r]
+		if !ok {
+			r.mu.Lock()
+			cloned = &splitRun{
+				origPos: r.origPos, origRecord: r.origRecord,
+				total: r.total, terminalCount: r.terminalCount,
+				nacked: r.nacked, nackErr: r.nackErr, nackTaskID: r.nackTaskID,
+				released: r.released,
+			}
+			r.mu.Unlock()
+			seen[r] = cloned
+		}
+		out[i] = cloned
+	}
+	return out
+}
+
+func (b *Batch) sub(from, to int) *Batch {
+	filterCount := 0
+	if b.filterCount > 0 {
+		for _, status := range b.recordStatuses[from:to] {
+			if status.Flag == RecordFlagFilter {
+				filterCount++
+			}
+		}
+	}
+	var splitRecords map[string]opencdc.Record
+	if len(b.splitRecords) != 0 {
+		splitRecords = make(map[string]opencdc.Record)
+		for _, pos := range b.positions[from:to] {
+			if rec, ok := b.splitRecords[pos.String()]; ok {
+				splitRecords[pos.String()] = rec
+			}
+		}
+		if len(splitRecords) == 0 {
+			splitRecords = nil
+		}
+	}
+
+	// runs is reslice-only (not copied), same as records/recordStatuses/
+	// positions: sub-batches produced from the SAME parent batch across
+	// different doTask loop iterations (or the RecordFlagRetry recursion)
+	// must observe and mutate the SAME *splitRun for a shared run - that's
+	// the whole mechanism run_ledger.go's runAckNacker relies on to notice a
+	// run completing across calls that are far apart in time. The
+	// three-index clip prevents the aliasing bug TestBatch_Clone_PositionsAliasing
+	// guards against on positions - SplitRecord appends to runs exactly like
+	// it appends to positions, so it needs the same protection.
+	var runs []*splitRun
+	if b.runs != nil {
+		runs = b.runs[from:to:to]
+	}
+
+	// Note that we also adjust the capacity of the slices to avoid writing
+	// over the original batch when splitting records.
+	return &Batch{
+		records:        b.records[from:to:to],
+		recordStatuses: b.recordStatuses[from:to:to],
+		positions:      b.positions[from:to:to],
+		runs:           runs,
+		filterCount:    filterCount,
+		tainted:        false,
+		splitRecords:   splitRecords,
+	}
+}
+
+// HasActiveRecords returns true if the batch has any records that are not
+// filtered out.
+func (b *Batch) HasActiveRecords() bool {
+	return b.filterCount < len(b.records)
+}
+
+// ActiveRecords returns the records that are not filtered.
+func (b *Batch) ActiveRecords() []opencdc.Record {
+	if b.filterCount == 0 {
+		return b.records
+	}
+	if b.filterCount == len(b.records) {
+		return nil
+	}
+	active := make([]opencdc.Record, 0, len(b.records)-b.filterCount)
+	for i, r := range b.records {
+		if b.recordStatuses[i].Flag != RecordFlagFilter {
+			active = append(active, r)
+		}
+	}
+	return active
+}
+
+// activeRecordIndices returns the indices of the records that are not filtered.
+// If no records are filtered, it returns nil, in which case the caller should
+// use the original indices of the records. This prevents the need to
+// reallocate the slice if no records are filtered.
+func (b *Batch) activeRecordIndices() []int {
+	if b.filterCount == 0 {
+		return nil
+	}
+	active := make([]int, 0, len(b.records)-b.filterCount)
+	for i, status := range b.recordStatuses {
+		if status.Flag != RecordFlagFilter {
+			active = append(active, i)
+		}
+	}
+	return active
+}
+
+// originalBatch returns the batch in which any split records are replaced with
+// the original records. This is needed when acking or nacking records.
+// If the batch does not contain any split records, it returns the original batch.
+func (b *Batch) originalBatch() *Batch {
+	if len(b.splitRecords) == 0 {
+		// No records were split, we can return the original batch.
+		return b
+	}
+
+	records := make([]opencdc.Record, 0, len(b.records))
+	recordStatuses := make([]RecordStatus, 0, len(b.records))
+	positions := make([]opencdc.Position, 0, len(b.records))
+	for i, pos := range b.positions {
+		if pos == nil {
+			continue
+		}
+
+		records = append(records, b.records[i])
+		recordStatuses = append(recordStatuses, b.recordStatuses[i])
+		positions = append(positions, pos)
+		if rec, ok := b.splitRecords[pos.String()]; ok {
+			// If the record was split, we need to replace it with the
+			// original record.
+			records[len(records)-1] = rec
+		}
+	}
+
+	filterCount := 0
+	if b.filterCount > 0 {
+		for _, status := range recordStatuses {
+			if status.Flag == RecordFlagFilter {
+				filterCount++
+			}
+		}
+	}
+
+	return &Batch{
+		records:        records,
+		recordStatuses: recordStatuses,
+		positions:      positions,
+		runs:           make([]*splitRun, len(records)),
+		filterCount:    filterCount,
+		tainted:        false,
+		splitRecords:   nil,
+	}
+}
+
+// RecordStatus holds the status of a record in a batch. The flag indicates the
+// status of the record, and the error is set if the record was nacked.
+type RecordStatus struct {
+	Flag  RecordFlag
+	Error error
+}
+
+type RecordFlag int
+
+const (
+	RecordFlagAck    RecordFlag = iota // ack
+	RecordFlagNack                     // nack
+	RecordFlagRetry                    // retry
+	RecordFlagFilter                   // filter
+)

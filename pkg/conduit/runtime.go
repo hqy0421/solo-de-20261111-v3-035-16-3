@@ -1,0 +1,1851 @@
+// Copyright © 2022 Meroxa, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package conduit
+
+import (
+	"context"
+	"fmt"
+	"net"
+	"net/http"
+	"os"
+	"runtime"
+	"runtime/pprof"
+	"slices"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/conduitio/conduit/pkg/foundation/connegress"
+
+	"github.com/conduitio/conduit-commons/hostpolicy"
+
+	"github.com/conduitio/conduit-commons/database"
+	"github.com/conduitio/conduit-commons/database/badger"
+	"github.com/conduitio/conduit-commons/database/inmemory"
+	"github.com/conduitio/conduit-commons/database/postgres"
+	"github.com/conduitio/conduit-commons/database/sqlite"
+	pconnutils "github.com/conduitio/conduit-connector-protocol/pconnutils/v1/server"
+	connutilsv1 "github.com/conduitio/conduit-connector-protocol/proto/connutils/v1"
+	conduitschemaregistry "github.com/conduitio/conduit-schema-registry"
+	"github.com/conduitio/conduit/pkg/conduit/dev"
+	"github.com/conduitio/conduit/pkg/connector"
+	"github.com/conduitio/conduit/pkg/foundation/cerrors"
+	"github.com/conduitio/conduit/pkg/foundation/cerrors/conduiterr"
+	"github.com/conduitio/conduit/pkg/foundation/ctxutil"
+	"github.com/conduitio/conduit/pkg/foundation/grpcutil"
+	"github.com/conduitio/conduit/pkg/foundation/log"
+	"github.com/conduitio/conduit/pkg/foundation/metrics"
+	"github.com/conduitio/conduit/pkg/foundation/metrics/measure"
+	"github.com/conduitio/conduit/pkg/foundation/metrics/prometheus"
+	"github.com/conduitio/conduit/pkg/http/api"
+	"github.com/conduitio/conduit/pkg/http/apisec"
+	"github.com/conduitio/conduit/pkg/http/openapi"
+	"github.com/conduitio/conduit/pkg/lifecycle"
+	lifecycle_v2 "github.com/conduitio/conduit/pkg/lifecycle-poc"
+	"github.com/conduitio/conduit/pkg/orchestrator"
+	"github.com/conduitio/conduit/pkg/pipeline"
+	conn_plugin "github.com/conduitio/conduit/pkg/plugin/connector"
+	conn_builtin "github.com/conduitio/conduit/pkg/plugin/connector/builtin"
+	"github.com/conduitio/conduit/pkg/plugin/connector/connutils"
+	conn_standalone "github.com/conduitio/conduit/pkg/plugin/connector/standalone"
+	proc_plugin "github.com/conduitio/conduit/pkg/plugin/processor"
+	proc_builtin "github.com/conduitio/conduit/pkg/plugin/processor/builtin"
+	"github.com/conduitio/conduit/pkg/plugin/processor/procutils"
+	proc_standalone "github.com/conduitio/conduit/pkg/plugin/processor/standalone"
+	"github.com/conduitio/conduit/pkg/processor"
+	"github.com/conduitio/conduit/pkg/provisioning"
+	"github.com/conduitio/conduit/pkg/schemaregistry"
+	apiv1 "github.com/conduitio/conduit/proto/api/v1"
+	grpcruntime "github.com/grpc-ecosystem/grpc-gateway/v2/runtime"
+	"github.com/piotrkowalczuk/promgrpc/v4"
+	promclient "github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/rs/zerolog"
+	"github.com/twmb/franz-go/pkg/sr"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/health/grpc_health_v1"
+	"google.golang.org/grpc/reflection"
+	"gopkg.in/tomb.v2"
+)
+
+const (
+	exitTimeout = 30 * time.Second
+)
+
+// Runtime sets up all services for serving and monitoring a Conduit instance.
+type Runtime struct {
+	Config Config
+
+	// apiToken is the bearer token enforced on the HTTP and gRPC APIs; ""
+	// means no token is configured (only possible on loopback binds).
+	apiToken string
+
+	// apiRejections counts and logs requests refused by the API access
+	// controls; created on first use, shared by the gRPC and HTTP listeners.
+	apiRejectionsOnce sync.Once
+	apiRejectionsVal  *apisec.Rejections
+
+	DB               database.DB
+	Orchestrator     *orchestrator.Orchestrator
+	ProvisionService *provisioning.Service
+	SchemaRegistry   schemaregistry.Registry
+
+	// Ready will be closed when Runtime has successfully started
+	Ready chan struct{}
+
+	// ProvisioningErr is set (once, before Ready closes) if
+	// ProvisionService.Init returned a non-nil error during initServices —
+	// regardless of Config.Pipelines.ExitOnDegraded. It is purely additive:
+	// `conduit run`'s own behavior (log the error via cerrors.ForEach, and
+	// only fail startup when ExitOnDegraded is set) is completely unchanged
+	// and never reads this field. It exists so the root embed package
+	// (github.com/conduitio/conduit) can tell a genuine file-provisioning
+	// failure apart from a healthy Ready and surface it as a returned error
+	// from Engine.Run, instead of the CLI's swallowed-log default — see that
+	// package's Run doc and the B1 DX-hardening fix it documents. nil means
+	// either provisioning is Config.Pipelines.Disabled, or it ran and found
+	// no errors.
+	ProvisioningErr error
+
+	pipelineService  *pipeline.Service
+	connectorService *connector.Service
+	processorService *processor.Service
+	lifecycleService lifecycleService
+
+	connectorPluginService *conn_plugin.PluginService
+	processorPluginService *proc_plugin.PluginService
+
+	connSchemaService *connutils.SchemaService
+	// connTokenService issues the per-connector tokens the connector utilities
+	// server requires on every call.
+	connTokenService   *connutils.AuthManager
+	connectorPersister *connector.Persister
+	procSchemaService  *procutils.SchemaService
+
+	logger log.CtxLogger
+
+	// metricsGrpcStatsHandler is this Runtime's grpc stats handler, used by
+	// serveGRPCAPI/startConnectorUtils. On the CLI path (no WithMetricsRegisterer
+	// option) it is the process-wide singleton configureMetrics() returns,
+	// exactly as before this field existed. On the embed path
+	// (WithMetricsRegisterer set) it is a fresh, per-Runtime instance
+	// registered only into the supplied registerer — see configureEmbeddedMetrics.
+	metricsGrpcStatsHandler *promgrpc.StatsHandler
+	metricsRegisterer       promclient.Registerer
+	metricsGatherer         promclient.Gatherer
+
+	// closeDBOnce/closeDBErr make CloseDB idempotent regardless of which of
+	// its (potentially multiple) callers gets there first — see CloseDB's doc.
+	closeDBOnce sync.Once
+	closeDBErr  error
+}
+
+// CloseDB closes r.DB exactly once, no matter how many times or from how many
+// call sites it is invoked, and returns the same error to every caller.
+//
+// This exists because r.DB is closed from two independent paths that must
+// never race or double-close the same handle: registerCleanupV1/V2's
+// tomb-driven drain (the normal `conduit run`/Handle.Stop shutdown path) and,
+// for the embed API, Engine.Close's resource-release path, which must run
+// regardless of whether Run was ever called or reached registerCleanup (see
+// the root conduit package's Engine.Close doc). Routing both through this one
+// sync.Once means neither path needs to know whether the other already ran.
+func (r *Runtime) CloseDB() error {
+	r.closeDBOnce.Do(func() {
+		r.closeDBErr = r.DB.Close()
+	})
+	return r.closeDBErr
+}
+
+// runtimeOptions holds the optional embed-only seams threaded through
+// NewRuntime via functional RuntimeOptions. The zero value matches
+// `conduit run`'s exact behavior — every field here is additive: leaving it
+// unset preserves what NewRuntime always did (AC-5: the seam is inert unless
+// an embed option is passed; see TestNewRuntime_CLIDefaultsUnchanged).
+type runtimeOptions struct {
+	logger            *log.CtxLogger
+	metricsRegisterer promclient.Registerer
+	metricsGatherer   promclient.Gatherer
+	dialCtx           context.Context
+}
+
+// RuntimeOption configures an embed-only seam on NewRuntime. See WithLogger,
+// WithMetricsRegisterer, WithDialContext.
+type RuntimeOption func(*runtimeOptions)
+
+// WithLogger supplies a pre-built log.CtxLogger, bypassing cfg.Log.NewLogger
+// and log.GetWriter's os.Stdout default entirely. It also suppresses the
+// process-global zerolog.DefaultContextLogger assignment NewRuntime otherwise
+// makes: that global is process-wide and would cross-talk between two
+// embedded Runtimes constructed with different loggers (see
+// TestTwoEngines_LoggerIsolated) — the supplied logger is still attached
+// directly to this Runtime and everything it constructs; only the ambient/
+// fallback global is skipped. `conduit run` never passes this option, so its
+// behavior (including the global assignment) is unchanged.
+func WithLogger(logger log.CtxLogger) RuntimeOption {
+	return func(o *runtimeOptions) { o.logger = &logger }
+}
+
+// defaultContextLoggerOnce bounds the process-global
+// zerolog.DefaultContextLogger assignment to at most once per process (#3111).
+// NewRuntime can be called concurrently by embedders, and a second assignment
+// would race with the first runtime's goroutines reading the global (and
+// misroute ambient logs between runtimes). The first runtime to need a
+// fallback wins; embedders that want per-runtime isolation pass WithLogger.
+var defaultContextLoggerOnce sync.Once
+
+// WithMetricsRegisterer supplies a Prometheus registerer that receives this
+// Runtime's metric families instead of the package-level configureMetrics()
+// path (which registers into promclient.DefaultRegisterer behind a
+// process-wide sync.Once, and is a no-op after the first call in the
+// process). A Runtime constructed with this option gets its own
+// foundation/metrics/prometheus.Registry and *promgrpc.StatsHandler,
+// registered only into the supplied registerer — never
+// promclient.DefaultRegisterer. `conduit run` never passes this option.
+//
+// If reg also implements Gatherer and WithMetricsGatherer is not supplied,
+// the embedded /metrics endpoint serves reg's full contents, including metrics
+// registered by the host application.
+//
+// A reg that does NOT implement Gatherer (prometheus.WrapRegistererWithPrefix
+// and friends return one of these) cannot back /metrics. With the API enabled,
+// Conduit logs MetricsDegradedWarning and keeps serving the process-global
+// default registry — the pre-existing, wrong-but-harmless behavior — for this
+// release. The next minor makes it an error (issue #2800). Supply WithMetricsGatherer with
+// the underlying registry to fix it.
+//
+// Known limitation (documented, not fixed by this seam): pkg/foundation/metrics
+// keeps process-global metric *definitions* (metrics.go's `global` slices) —
+// a metric created via metrics.NewCounter et al. (e.g. everything in
+// pkg/foundation/metrics/measure) fans out to every registry ever passed to
+// metrics.Register, including a second embedded Runtime's. Two concurrently
+// running embedded engines will therefore observe each other's metric
+// *values* even though each has its own isolated Registerer/Registry
+// *object*. See TestTwoEngines_MetricsCrossTalk_KnownLimitation — fixing this
+// is tracked as a follow-up, not this workstream (see the embed design doc's
+// Non-goals).
+func WithMetricsRegisterer(reg promclient.Registerer) RuntimeOption {
+	return func(o *runtimeOptions) { o.metricsRegisterer = reg }
+}
+
+// WithMetricsGatherer supplies the gatherer used by the embedded Runtime's
+// /metrics endpoint. It must expose the metrics registered through the value
+// passed to WithMetricsRegisterer.
+func WithMetricsGatherer(gatherer promclient.Gatherer) RuntimeOption {
+	return func(o *runtimeOptions) { o.metricsGatherer = gatherer }
+}
+
+// MetricsResolution is what ResolveMetricsGatherer decided.
+type MetricsResolution struct {
+	// Gatherer is what /metrics serves. Never nil once a registerer was
+	// supplied.
+	Gatherer promclient.Gatherer
+
+	// Degraded reports that Gatherer is NOT backed by the supplied registerer:
+	// the registerer does not implement prometheus.Gatherer, so /metrics falls
+	// back to the process-global default and shows metrics unrelated to what
+	// this Runtime registered. The caller is expected to warn — loudly — since
+	// nothing else about the process looks wrong.
+	Degraded bool
+}
+
+// ResolveMetricsGatherer decides which Gatherer the /metrics endpoint serves.
+//
+// It is exported so the embed package (github.com/conduitio/conduit) can apply
+// the SAME rule inside New — where the options are already known and no I/O is
+// needed — instead of letting a caller discover a bad pairing on their first
+// Run or Import. Two copies of this rule would eventually disagree, and the
+// symptom would be an Engine that behaves differently depending on which entry
+// point constructed it.
+//
+// The rules, in order:
+//   - a gatherer with no registerer is REJECTED. MetricsGatherer is new API, so
+//     there is no existing configuration to break, and the pairing is
+//     nonsensical: nothing would be registering into what it gathers.
+//   - an explicit gatherer is used as given.
+//   - a registerer that also implements Gatherer is used as its own gatherer,
+//     so the endpoint serves everything registered into it, host metrics
+//     included.
+//   - a registerer that does NOT implement Gatherer (prometheus.WrapRegisterer*
+//     returns one of these) is DEGRADED, not rejected: /metrics keeps serving
+//     the default gatherer, exactly as it did before this seam existed, and the
+//     caller warns.
+//
+// # Why the degraded case warns instead of failing
+//
+// Rejecting it outright was the original behavior of this change and is the
+// more obviously correct-looking option: the endpoint is demonstrably serving
+// the wrong metrics, and refusing to start says so. It was rejected anyway.
+//
+// Such a configuration STARTED in previous releases. Turning it into a startup
+// failure means an operator who upgrades Conduit finds their application dead
+// on boot, over a scrape target that is wrong but harmless — nothing about it
+// risks data. Killing a running system to correct an observability defect
+// inverts the cost. The project's deprecation policy (announce, then warn, then
+// remove, over at least two minor versions) exists for precisely this, and a
+// wrong /metrics payload is exactly the kind of defect it was written to pace.
+//
+// The warning is therefore load-bearing, not decorative: it is the entire
+// mitigation for one release. It must name the fix, and it must be impossible
+// to miss in a log. The next minor turns this into an error (tracked in issue
+// #2800); the godoc on
+// WithMetricsRegisterer and conduit.Options.MetricsGatherer both say so.
+func ResolveMetricsGatherer(reg promclient.Registerer, gatherer promclient.Gatherer, apiEnabled bool) (MetricsResolution, error) {
+	if reg == nil {
+		if gatherer != nil {
+			e := conduiterr.New(conduiterr.CodeInvalidArgument,
+				"a metrics gatherer was supplied without a metrics registerer")
+			e.Suggestion = "set both: conduit.Options{MetricsRegisterer: reg, MetricsGatherer: gatherer} " +
+				"(pkg/conduit: WithMetricsRegisterer + WithMetricsGatherer)"
+			return MetricsResolution{}, e
+		}
+		// No registerer: the caller gets the CLI defaults, decided by NewRuntime.
+		return MetricsResolution{}, nil
+	}
+
+	if gatherer != nil {
+		return MetricsResolution{Gatherer: gatherer}, nil
+	}
+
+	if g, ok := reg.(promclient.Gatherer); ok {
+		return MetricsResolution{Gatherer: g}, nil
+	}
+
+	// With the API disabled there is no /metrics route at all, so nothing is
+	// being served wrongly and there is nothing to warn about.
+	return MetricsResolution{Gatherer: promclient.DefaultGatherer, Degraded: apiEnabled}, nil
+}
+
+// MetricsDegradedWarning is the text logged when ResolveMetricsGatherer
+// degrades. It is a constant so the embed package and NewRuntime say the same
+// thing, and so a test can assert the operator is actually told.
+const MetricsDegradedWarning = "the metrics registerer does not implement prometheus.Gatherer, so /metrics is serving " +
+	"the default Prometheus registry instead of the metrics Conduit registered; pass the underlying registry too " +
+	"(conduit.Options.MetricsGatherer, or pkg/conduit's WithMetricsGatherer). This becomes an error in the next minor release."
+
+// WithDialContext supplies the context.Context OpenStore's Postgres/SQLite
+// dial uses instead of context.Background(), so a caller-supplied deadline or
+// cancellation aborts a slow/unreachable database dial promptly instead of
+// blocking indefinitely. It has no effect on the Badger/InMemory DB types
+// (they never dial a remote/blocking connection). It is not retained beyond
+// NewRuntime's own call — Runtime.Run's context is independent and must be
+// supplied fresh to Run (do not store a ctx across calls).
+func WithDialContext(ctx context.Context) RuntimeOption {
+	return func(o *runtimeOptions) { o.dialCtx = ctx }
+}
+
+// lifecycleService is an interface that we use temporarily to allow for
+// both the old and new lifecycle services to be used interchangeably.
+type lifecycleService interface {
+	Start(ctx context.Context, pipelineID string) error
+	Stop(ctx context.Context, pipelineID string, force bool) error
+	// StopAndWait is required so this interface stays a superset of
+	// provisioning.LifecycleService (Go requires that for the implicit
+	// interface-to-interface assignment in newRuntime below to type-check).
+	// See lifecycle.Service.StopAndWait's doc for what it guarantees, and
+	// lifecycle-poc(pkg/lifecycle-poc).Service.StopAndWait for why the
+	// Preview.PipelineArchV2 implementation always refuses.
+	StopAndWait(ctx context.Context, pipelineID string) error
+	// ReconfigureProcessor keeps this interface a superset of
+	// provisioning.LifecycleService (see StopAndWait above) — it is used by the
+	// live in-place apply path. See lifecycle.Service.ReconfigureProcessor.
+	ReconfigureProcessor(ctx context.Context, pipelineID, processorID string) error
+	// IsActive keeps this interface a superset of
+	// orchestrator.LifecycleService: Delete and Update are admitted by run
+	// liveness, not by status (#2899 item 2).
+	IsActive(pipelineID string) bool
+	// TryLockForMutation is the other half of that interface: the orchestrator
+	// excludes Start while it writes config (#2961).
+	TryLockForMutation(pipelineID string) (unlock func(), ok bool)
+	Init(ctx context.Context) error
+}
+
+// NewRuntime sets up a Runtime instance and primes it for start. opts are
+// additive, embed-only seams (see RuntimeOption); called with none, behavior
+// is byte-for-byte what NewRuntime did before opts existed — this is what
+// `conduit run` (via Entrypoint.Serve) always does.
+func NewRuntime(cfg Config, opts ...RuntimeOption) (*Runtime, error) {
+	if err := cfg.Validate(); err != nil {
+		return nil, cerrors.Errorf("invalid config: %w", err)
+	}
+	// Resolved once so every listener enforces the same token, and a token
+	// file that changes after startup cannot make the listeners disagree.
+	apiToken, err := cfg.APIToken()
+	if err != nil {
+		return nil, cerrors.Errorf("invalid config: %w", err)
+	}
+
+	// Process-wide, and before any service exists: conduit-commons caches
+	// parsed schemas, and a schema parsed before this call would keep the
+	// previous limit. Governs every in-process Avro decode (avro.decode and
+	// the SDK schema middleware of built-in connectors and processors).
+	// Invariant 6: a payload over the limit fails decode; never truncated.
+	if err := schemaregistry.ApplyAvroMaxElements(cfg.Schema.Avro.MaxElements); err != nil {
+		return nil, cerrors.Errorf("invalid config: %w", err)
+	}
+
+	var ro runtimeOptions
+	for _, opt := range opts {
+		opt(&ro)
+	}
+
+	metricsResolution, err := ResolveMetricsGatherer(ro.metricsRegisterer, ro.metricsGatherer, cfg.API.Enabled)
+	if err != nil {
+		return nil, err
+	}
+	metricsGatherer := metricsResolution.Gatherer
+	var logger log.CtxLogger
+	if ro.logger != nil {
+		// Embed path (AC-5.1): use the pre-built logger as-is instead of
+		// cfg.Log.NewLogger/log.GetWriter's os.Stdout default.
+		logger = *ro.logger
+	} else {
+		logger = cfg.Log.NewLogger(cfg.Log.Level, cfg.Log.Format)
+	}
+	logger.Logger = logger.
+		Hook(ctxutil.MessageIDLogCtxHook{}).
+		Hook(ctxutil.RequestIDLogCtxHook{}).
+		Hook(ctxutil.FilepathLogCtxHook{})
+	if ro.logger == nil {
+		// CLI path only (AC-5.3): an embed-supplied logger must never become
+		// the ambient global fallback — see WithLogger's doc. Assigned at most
+		// once per process so concurrent NewRuntime calls don't race on the
+		// process-wide global or misroute ambient logs between runtimes (#3111).
+		defaultContextLoggerOnce.Do(func() {
+			zerolog.DefaultContextLogger = &logger.Logger
+		})
+	}
+
+	// Warn as soon as there is a logger to warn with. This is the ENTIRE
+	// mitigation for a degraded resolution — /metrics will serve plausible but
+	// unrelated numbers, and nothing else about the process looks wrong — so it
+	// must not be conditional on anything further down, and it must survive an
+	// early return from OpenStore below.
+	if metricsResolution.Degraded {
+		logger.Warn(context.Background()).Msg(MetricsDegradedWarning)
+	}
+
+	dialCtx := context.Background()
+	if ro.dialCtx != nil {
+		// AC-5.4: let an embedder bound/cancel the store dial.
+		dialCtx = ro.dialCtx
+	}
+
+	db, err := OpenStore(dialCtx, cfg, logger)
+	if err != nil {
+		return nil, err
+	}
+
+	metricsRegisterer := ro.metricsRegisterer
+	var statsHandler *promgrpc.StatsHandler
+	if ro.metricsRegisterer != nil {
+		// Embed path (AC-5.2): isolated per-Runtime metrics, never the
+		// process-global promclient.DefaultRegisterer.
+		statsHandler, err = configureEmbeddedMetrics(ro.metricsRegisterer)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		metricsRegisterer = promclient.DefaultRegisterer
+		metricsGatherer = promclient.DefaultGatherer
+		statsHandler = configureMetrics()
+	}
+	measure.ConduitInfo.WithValues(Version(true)).Inc()
+
+	// Start the connector persister
+	connectorPersister := connector.NewPersister(
+		logger, db,
+		connector.DefaultPersisterDelayThreshold,
+		connector.DefaultPersisterBundleCountThreshold,
+	)
+
+	r := &Runtime{
+		Config: cfg,
+		DB:     db,
+		Ready:  make(chan struct{}),
+
+		apiToken: apiToken,
+
+		connectorPersister: connectorPersister,
+
+		logger:                  logger,
+		metricsGrpcStatsHandler: statsHandler,
+		metricsRegisterer:       metricsRegisterer,
+		metricsGatherer:         metricsGatherer,
+	}
+
+	err = createServices(r)
+	if err != nil {
+		return nil, cerrors.Errorf("failed to initialize services: %w", err)
+	}
+
+	return r, nil
+}
+
+// OpenStore opens the database driver configured by cfg (or returns
+// cfg.DB.Driver directly, when the embedder set one explicitly) without
+// doing anything else — no metrics, no persister, no services. It is the
+// exact DB-open logic NewRuntime uses, extracted so `conduit doctor`'s
+// store.reachable check (see
+// docs/design-documents/20260707-cli-doctor.md) can probe database
+// reachability the same way `conduit run` would, instead of reimplementing
+// or drifting from it.
+//
+// ctx bounds the Postgres/SQLite dial only (AC-5.4) — canceling it aborts a
+// slow/unreachable dial instead of blocking indefinitely. It has no effect on
+// Badger/InMemory (neither dials). ctx is not retained past this call.
+//
+// logger is a required parameter (not derived internally from cfg.Log) so a
+// caller that only wants to probe reachability — doctor runs before any
+// Runtime exists — can supply a throwaway logger (e.g. log.Nop()) instead of
+// depending on Runtime construction order or Config.Log.NewLogger being set.
+//
+// The returned database.DB is opened but not pinged; callers that only want
+// to validate config (not actually dial/open anything) should not call this.
+// A caller that opens a store here is responsible for calling Close on it.
+func OpenStore(ctx context.Context, cfg Config, logger log.CtxLogger) (database.DB, error) {
+	if cfg.DB.Driver != nil {
+		return cfg.DB.Driver, nil
+	}
+
+	var db database.DB
+	var err error
+	switch cfg.DB.Type {
+	case DBTypeBadger:
+		db, err = badger.New(logger.Logger, cfg.DB.Badger.Path)
+	case DBTypePostgres:
+		db, err = postgres.New(ctx, logger.Logger, cfg.DB.Postgres.ConnectionString, cfg.DB.Postgres.Table)
+	case DBTypeInMemory:
+		db = &inmemory.DB{}
+		logger.Warn(context.Background()).Msg("Using in-memory store, all pipeline configurations will be lost when Conduit stops.")
+	case DBTypeSQLite:
+		db, err = sqlite.New(ctx, logger.Logger, cfg.DB.SQLite.Path, cfg.DB.SQLite.Table)
+	default:
+		// An unsupported DB type is a config/validation problem, not an
+		// environment one. It stays exit 1 (the runtime default for an
+		// untagged error) by design — return it directly instead of falling into
+		// the Unavailable tagging below, which is reserved for a
+		// genuinely unreachable database (connection refused, file
+		// locked/inaccessible, etc.) for the configured, valid type.
+		return nil, cerrors.Errorf("invalid DB type %q", cfg.DB.Type)
+	}
+	if err != nil {
+		// Pass the wrapped error (not the raw err) as Wrap's cause so the
+		// stack frame cerrors.Errorf captures here isn't discarded:
+		// conduiterr.Wrap only synthesizes a frame of its own when cause
+		// is nil, and the raw driver error typically carries none.
+		wrapped := cerrors.Errorf("failed to create a DB instance: %w", err)
+		// Tagged Unavailable: the database Conduit depends on could not
+		// be opened/dialed. pkg/conduit/exitcode maps this to exit code
+		// 3 (environment), distinct from a config/validation failure.
+		return nil, conduiterr.Wrap(conduiterr.CodeUnavailable, wrapped.Error(), wrapped)
+	}
+	return db, nil
+}
+
+// Create all necessary internal services
+func createServices(r *Runtime) error {
+	schemaRegistry, err := createSchemaRegistry(r.Config, r.logger, r.DB)
+	if err != nil {
+		return cerrors.Errorf("failed to create schema registry: %w", err)
+	}
+
+	procSchemaService := procutils.NewSchemaService(r.logger, schemaRegistry)
+	standaloneReg, err := proc_standalone.NewRegistry(r.logger, r.Config.Processors.Path, procSchemaService)
+	if err != nil {
+		return cerrors.Errorf("failed creating processor registry: %w", err)
+	}
+
+	// Settings hardening (GHSA-m3mw-fpw8-w765). All of it is operator config,
+	// validated in Config.Validate and rebuilt here as the single source of
+	// truth; an error fails closed.
+	envAllow, err := r.Config.EnvAllowlist()
+	if err != nil {
+		return cerrors.Errorf("invalid env.allow config: %w", err)
+	}
+	filePolicy, err := r.Config.fileConnectorPolicy()
+	if err != nil {
+		return cerrors.Errorf("invalid %s config: %w", FileAllowedDirsKey, err)
+	}
+	if err := r.Config.ensureDefaultFilesDir(); err != nil {
+		r.logger.Warn(context.Background()).Err(err).Msg("could not create the default directory of the file connector")
+	}
+	jsFiles, err := r.Config.javascriptFileAccess()
+	if err != nil {
+		return cerrors.Errorf("invalid %s config: %w", JavaScriptAllowedDirsKey, err)
+	}
+	dialGuard, err := r.Config.builtinDialGuard()
+	if err != nil {
+		return cerrors.Errorf("invalid processor egress config: %w", err)
+	}
+
+	secretsPolicy, err := r.Config.secretsPolicy()
+	if err != nil {
+		return cerrors.Errorf("invalid %s config: %w", SecretsAllowedDirsKey, err)
+	}
+	connEgress, err := r.Config.connectorEgressPolicy()
+	if err != nil {
+		return cerrors.Errorf("invalid %s config: %w", connegress.AllowConfigPath, err)
+	}
+	trustPolicy, err := r.Config.trustPolicy()
+	if err != nil {
+		return cerrors.Errorf("invalid %s config: %w", SecretsAllowedDirsKey, err)
+	}
+	if connEgress.Restricted() {
+		// Standalone connectors are separate processes that never receive the
+		// engine's dialer, so the allowlist cannot bind them. The standalone
+		// registry refuses them at dispatch (see
+		// conn_standalone.WithEgressRestricted below); this is said once at
+		// startup so the scope of the setting is never a surprise.
+		r.logger.Info(context.Background()).
+			Str("setting", connegress.AllowConfigPath).
+			Msg("connector egress allowlist is set; standalone connectors are refused when a pipeline starts them (built-in connectors honor the allowlist)")
+	}
+	settingsResolver := engineSettingsResolver{env: envAllow, files: filePolicy, secrets: secretsPolicy, trust: trustPolicy, egress: connEgress}
+
+	procPluginService := proc_plugin.NewPluginService(
+		r.logger,
+		proc_builtin.NewRegistry(
+			r.logger, r.Config.ProcessorPlugins, schemaRegistry,
+			proc_builtin.WithDialGuard(dialGuard),
+			proc_builtin.WithJavaScriptFileAccess(jsFiles),
+		),
+		standaloneReg,
+	)
+
+	tokenService := connutils.NewAuthManager()
+	connSchemaService := connutils.NewSchemaService(r.logger, schemaRegistry, tokenService)
+
+	// Operator policy for built-in connectors' use of the host's ambient cloud
+	// credentials (connectors.ambient-credentials.*). Off by default: the zero
+	// policy denies. Validated in Config.Validate; rebuilt here as the single
+	// source of truth and re-checked so a caller that skipped Validate still
+	// fails closed.
+	ambientPolicy, ambientWarnings, err := r.Config.AmbientCredentialsPolicy(os.Getenv)
+	if err != nil {
+		return cerrors.Errorf("invalid ambient credentials config: %w", err)
+	}
+	r.logAmbientCredentialsPolicy(ambientPolicy, ambientWarnings)
+
+	standaloneEnv, err := r.Config.StandaloneEnvPolicy()
+	if err != nil {
+		return cerrors.Errorf("invalid %s config: %w", conn_standalone.EnvAllowConfigPath, err)
+	}
+
+	connPluginService := conn_plugin.NewPluginService(
+		r.logger,
+		conn_builtin.NewRegistry(
+			r.logger,
+			r.Config.ConnectorPlugins,
+			connSchemaService,
+			conn_builtin.WithAmbientCredentialsPolicy(ambientPolicy),
+			// The egress policy and its dial guard ride on the call context of
+			// the connectors that connect somewhere: a connector that honors the
+			// conduit-commons dialer seam opens every connection through
+			// connegress.Policy.DialContext (see withEgressPolicy).
+			conn_builtin.WithContextDecorator("postgres", withEgressPolicy(connEgress)),
+			conn_builtin.WithContextDecorator("kafka", withEgressPolicy(connEgress)),
+			conn_builtin.WithContextDecorator("s3", withEgressPolicy(connEgress)),
+		),
+		conn_standalone.NewRegistry(
+			r.logger,
+			r.Config.Connectors.Path,
+			conn_standalone.WithEnvWarning(r.Config.Connectors.Standalone.EnvWarning),
+			conn_standalone.WithEnvPolicy(standaloneEnv),
+			// Standalone connectors are separate processes that never receive
+			// the engine's dialer, so the egress allowlist cannot bind them;
+			// refuse them at dispatch (fail closed) while the allowlist is set.
+			conn_standalone.WithEgressRestricted(connEgress.Restricted()),
+		),
+		tokenService,
+		conn_plugin.WithSettingsGuard(settingsResolver.CheckSettings),
+	)
+
+	plService := pipeline.NewService(r.logger, r.DB)
+	connService := connector.NewService(r.logger, r.DB, r.connectorPersister,
+		connector.WithSettingsResolver(settingsResolver))
+
+	// Engine-level host-egress ceiling (processors.egress.*). Its default is
+	// deny-all, so on a stock instance this passes a closed ceiling and every
+	// processor resolves to DenyAll. Already validated in Config.Validate (called
+	// in NewRuntime before createServices); rebuilt here as the single source of
+	// truth. Re-checked defensively so a future caller that skips Validate still
+	// fails closed rather than silently running with no ceiling.
+	egressCeiling, err := r.Config.egressCeiling()
+	if err != nil {
+		return cerrors.Errorf("invalid processor egress config: %w", err)
+	}
+	procService := processor.NewService(r.logger, r.DB, procPluginService, processor.WithEgressCeiling(egressCeiling), processor.WithEnvAllowlist(envAllow))
+
+	// Error recovery configuration. Shared by both lifecycle implementations
+	// (the v2/funnel service reuses the lifecycle.ErrRecoveryCfg type) so an
+	// operator's pipelines.error-recovery.* settings apply under
+	// Preview.PipelineArchV2 too — without this, v2 silently ignored them and
+	// turned every transient error into a permanently-degraded pipeline.
+	errRecoveryCfg := &lifecycle.ErrRecoveryCfg{
+		MinDelay:         r.Config.Pipelines.ErrorRecovery.MinDelay,
+		MaxDelay:         r.Config.Pipelines.ErrorRecovery.MaxDelay,
+		BackoffFactor:    r.Config.Pipelines.ErrorRecovery.BackoffFactor,
+		MaxRetries:       r.Config.Pipelines.ErrorRecovery.MaxRetries,
+		MaxRetriesWindow: r.Config.Pipelines.ErrorRecovery.MaxRetriesWindow,
+	}
+
+	var lifecycleService lifecycleService
+	if r.Config.Preview.PipelineArchV2 {
+		r.logger.Info(context.Background()).Msg("using lifecycle service v2")
+		lifecycleV2 := lifecycle_v2.NewService(
+			r.logger,
+			errRecoveryCfg,
+			connService,
+			procService,
+			connPluginService,
+			plService,
+			r.Config.Preview.PipelineArchV2DisableMetrics,
+		)
+		lifecycleV2.SetMaxReceiveRecordSize(r.Config.Connectors.MaxReceiveRecordSize)
+		lifecycleService = lifecycleV2
+	} else {
+		lifecycleService = lifecycle.NewService(r.logger, errRecoveryCfg, connService, procService, connPluginService, plService)
+	}
+
+	provisionService := provisioning.NewService(r.DB, r.logger, plService, connService, procService, connPluginService, lifecycleService, r.Config.Pipelines.Path)
+	orc := orchestrator.NewOrchestrator(r.DB, r.logger, plService, connService, procService, connPluginService, procPluginService, lifecycleService)
+
+	r.Orchestrator = orc
+	r.ProvisionService = provisionService
+	r.SchemaRegistry = schemaRegistry
+
+	r.pipelineService = plService
+	r.connectorService = connService
+	r.processorService = procService
+	r.connectorPluginService = connPluginService
+	r.processorPluginService = procPluginService
+	r.connSchemaService = connSchemaService
+	r.connTokenService = tokenService
+	r.procSchemaService = procSchemaService
+	r.lifecycleService = lifecycleService
+
+	return nil
+}
+
+func createSchemaRegistry(config Config, logger log.CtxLogger, db database.DB) (schemaregistry.Registry, error) {
+	var schemaRegistry schemaregistry.Registry
+	var err error
+
+	switch config.SchemaRegistry.Type {
+	case SchemaRegistryTypeConfluent:
+		opts := []sr.ClientOpt{
+			sr.URLs(config.SchemaRegistry.Confluent.ConnectionString),
+		}
+		// Basic Auth
+		if config.SchemaRegistry.Confluent.Authentication.Type == SchemaRegistryAuthTypeBasic {
+			opts = append(opts, sr.BasicAuth(
+				config.SchemaRegistry.Confluent.Authentication.Username,
+				config.SchemaRegistry.Confluent.Authentication.Password,
+			))
+		}
+		// Bearer Auth
+		if config.SchemaRegistry.Confluent.Authentication.Type == SchemaRegistryAuthTypeBearer {
+			opts = append(opts, sr.BearerToken(config.SchemaRegistry.Confluent.Authentication.Token))
+		}
+		schemaRegistry, err = schemaregistry.NewClient(logger, opts...)
+		if err != nil {
+			return nil, cerrors.Errorf("failed to create schema registry client: %w", err)
+		}
+	case SchemaRegistryTypeBuiltin:
+		schemaRegistry, err = conduitschemaregistry.NewSchemaRegistry(db)
+		if err != nil {
+			return nil, cerrors.Errorf("failed to create built-in schema registry: %w", err)
+		}
+	default:
+		// shouldn't happen, we validate the config
+		return nil, cerrors.Errorf("invalid schema registry type %q", config.SchemaRegistry.Type)
+	}
+
+	return schemaRegistry, nil
+}
+
+func newLogger(level string, format string) log.CtxLogger {
+	// TODO make logger hooks configurable
+	l, _ := zerolog.ParseLevel(level)
+	f, _ := log.ParseFormat(format)
+	return log.InitLogger(l, f)
+}
+
+var (
+	metricsConfigureOnce    sync.Once
+	metricsGrpcStatsHandler *promgrpc.StatsHandler
+)
+
+// configureMetrics
+func configureMetrics() *promgrpc.StatsHandler {
+	metricsConfigureOnce.Do(func() {
+		// conduit metrics
+		reg := prometheus.NewRegistry(nil)
+		metrics.Register(reg)
+		promclient.MustRegister(reg)
+
+		// grpc metrics
+		metricsGrpcStatsHandler = promgrpc.ServerStatsHandler()
+		promclient.MustRegister(metricsGrpcStatsHandler)
+	})
+	return metricsGrpcStatsHandler
+}
+
+// configureEmbeddedMetrics is configureMetrics' embed-path counterpart (see
+// WithMetricsRegisterer): it builds a fresh, per-Runtime
+// foundation/metrics/prometheus.Registry and *promgrpc.StatsHandler and
+// registers both only into registerer — never promclient.DefaultRegisterer,
+// and never behind the CLI path's process-wide metricsConfigureOnce (each
+// call here produces an independent StatsHandler instance, so two embedded
+// Runtimes never share one).
+//
+// It uses registerer.Register (which returns an error) rather than
+// MustRegister (which panics) so a metric-name collision on a registerer the
+// caller reused across engines surfaces as a coded error from New, per
+// invariant: New never panics on a caller-supplied misconfiguration.
+//
+// Known limitation, accepted for v1 and tracked as
+// https://github.com/ConduitIO/conduit/issues/2669: metrics.Register(reg)
+// below runs before either registerer.Register call below is known to
+// succeed, so a failed Register (e.g. the name collision this function
+// itself guards against) still leaks reg into pkg/foundation/metrics'
+// process-global bookkeeping — it is never unregistered on this error path.
+func configureEmbeddedMetrics(registerer promclient.Registerer) (*promgrpc.StatsHandler, error) {
+	reg := prometheus.NewRegistry(nil)
+	metrics.Register(reg) // documented cross-talk limitation, see WithMetricsRegisterer's doc; leak-on-failure tracked as issue #2669
+	if err := registerer.Register(reg); err != nil {
+		wrapped := cerrors.Errorf("failed to register conduit metrics collector: %w", err)
+		return nil, conduiterr.Wrap(conduiterr.CodeInvalidArgument, wrapped.Error(), wrapped)
+	}
+
+	statsHandler := promgrpc.ServerStatsHandler()
+	if err := registerer.Register(statsHandler); err != nil {
+		wrapped := cerrors.Errorf("failed to register grpc stats collector: %w", err)
+		return nil, conduiterr.Wrap(conduiterr.CodeInvalidArgument, wrapped.Error(), wrapped)
+	}
+
+	return statsHandler, nil
+}
+
+// Run initializes all of Conduit's underlying services and starts the GRPC and
+// HTTP APIs. This function blocks until the supplied context is cancelled or
+// one of the services experiences a fatal error.
+func (r *Runtime) Run(ctx context.Context) (err error) {
+	// Tier-1-caution guard (embed workstream plan §11 task 6): if ctx is
+	// already canceled before Run does any work, return immediately instead
+	// of spinning up profiling, the tomb, and every service. This is not
+	// merely an optimization: empirically, without this guard, Run panics
+	// ("tomb.Go called after all goroutines terminated") when handed an
+	// already-canceled context — tomb.WithContext's own cancellation-watcher
+	// goroutine kills the tomb (and lets it finish) before initServices's
+	// later t.Go calls (e.g. serveGRPC) run, so those calls hit an
+	// already-dead tomb. `conduit run` never calls Run with an
+	// already-canceled context (a live process's context is only canceled by
+	// a signal that arrives after Run is already executing), so this is
+	// inert on the CLI path; it matters for the embed calling convention
+	// (Engine.Run), where a host can legitimately pass an already-canceled or
+	// already-expired ctx (e.g. one derived from an expired request
+	// deadline) — a documented, designed-for input, not caller misuse. This
+	// does not touch registerCleanup/the tomb's drain mechanics — it is a
+	// pure early return before either is constructed; the DB opened by
+	// NewRuntime is still live afterward, which is exactly why the embed
+	// API's Engine.Close exists as a resource-release path independent of
+	// whether Run got this far (see the root conduit package's Engine.Close
+	// doc).
+	//
+	// The error is returned through conduiterr.CodeInvalidArgument (not a
+	// bare context.Canceled/DeadlineExceeded) so it satisfies New/Run's
+	// documented promise of a *conduiterr.ConduitError where classifiable.
+	// Reusing CodeInvalidArgument rather than minting a new code matches this
+	// package's existing convention for embed-lifecycle-contract errors (see
+	// the root conduit package's Engine.Run/Handle.Stop docs for the same
+	// reasoning applied to a double Run call and a Stop timeout).
+	if err := ctx.Err(); err != nil {
+		wrapped := cerrors.Errorf("conduit: Run called with an already-done context: %w", err)
+		return conduiterr.Wrap(conduiterr.CodeInvalidArgument, wrapped.Error(), wrapped)
+	}
+
+	cleanup, err := r.initProfiling(ctx)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	t, ctx, setupDone := newRunTomb(ctx)
+
+	defer func() {
+		// Setup is over (or failed): the tomb may now end once its goroutines
+		// do. Must run before the Dying wait below.
+		close(setupDone)
+		if err != nil {
+			// This means run failed, we kill the tomb to stop any goroutines
+			// that might have been already started.
+			t.Kill(err)
+		}
+		// Block until tomb is dying, then wait for goroutines to stop running.
+		<-t.Dying()
+		r.logger.Warn(ctx).Msg("conduit is stopping, stand by for shutdown ...")
+		err = t.Wait()
+	}()
+
+	// Register cleanup function that will run after tomb is killed
+	r.registerCleanup(t)
+
+	// Initialize all services
+	err = r.initServices(ctx, t)
+	if err != nil {
+		return cerrors.Errorf("failed to initialize services: %w", err)
+	}
+
+	// Public gRPC and HTTP API
+	if r.Config.API.Enabled {
+		// Serve grpc and http API
+		grpcAddr, err := r.serveGRPCAPI(ctx, t)
+		if err != nil {
+			return cerrors.Errorf("failed to serve grpc api: %w", err)
+		}
+		httpAddr, err := r.serveHTTPAPI(ctx, t, grpcAddr)
+		if err != nil {
+			return cerrors.Errorf("failed to serve http api: %w", err)
+		}
+
+		port := 8080 // default
+		if tcpAddr, ok := httpAddr.(*net.TCPAddr); ok {
+			port = tcpAddr.Port
+		}
+		r.logger.Info(ctx).Send()
+		r.logger.Info(ctx).Msgf("click here to navigate to explore the HTTP API: http://localhost:%d/openapi", port)
+		r.logger.Info(ctx).Send()
+	} else {
+		r.logger.Info(ctx).Msg("API is disabled")
+	}
+
+	close(r.Ready)
+	return nil
+}
+
+// newRunTomb returns the tomb Run hangs every service goroutine on, and the
+// context derived from it. It also starts one long-lived goroutine that holds
+// the tomb alive until the tomb is dying AND setupDone is closed. It is also
+// the parent-context watcher that tomb.WithContext would have started.
+//
+// Why: a tomb with no live goroutine is dead, and tomb.Go on a dead tomb panics
+// ("tomb.Go called after all goroutines terminated"). With tomb.WithContext the
+// only goroutine is the one that watches the parent context, so a parent
+// canceled at any point during Run's setup (the embed API hands Run caller
+// contexts, e.g. one with a deadline) kills the tomb and the next t.Go in
+// initServices or serveGRPCAPI panics. The goroutine is started before the
+// parent is attached, so the tomb has a live goroutine from its first instant,
+// however early the parent is canceled.
+func newRunTomb(parent context.Context) (t *tomb.Tomb, ctx context.Context, setupDone chan<- struct{}) {
+	t = &tomb.Tomb{}
+	done := make(chan struct{})
+	t.Go(func() error {
+		// Also the watcher tomb.WithContext would have started: parent
+		// canceled means the tomb is dying.
+		select {
+		case <-t.Dying():
+		case <-parent.Done():
+			t.Kill(parent.Err())
+		}
+		<-done
+		return nil
+	})
+	ctx = t.Context(parent)
+	return t, ctx, done
+}
+
+func (r *Runtime) initProfiling(ctx context.Context) (deferred func(), err error) {
+	deferred = func() {}
+
+	// deferFunc adds the func into deferred so it can be executed by the caller
+	// in a defer statement
+	deferFunc := func(f func()) {
+		oldDeferred := deferred
+		deferred = func() {
+			f()
+			oldDeferred()
+		}
+	}
+	// ignoreErr returns a function that executes f and ignores the returned error
+	ignoreErr := func(f func() error) func() {
+		return func() {
+			_ = f() // ignore error
+		}
+	}
+	defer func() {
+		if err != nil {
+			// on error we make sure deferred functions are executed and return
+			// an empty function as deferred instead
+			deferred()
+			deferred = func() {}
+		}
+	}()
+
+	if r.Config.Dev.CPUProfile != "" {
+		f, err := os.Create(r.Config.Dev.CPUProfile)
+		if err != nil {
+			return deferred, cerrors.Errorf("could not create CPU profile: %w", err)
+		}
+		deferFunc(ignoreErr(f.Close))
+		if err := pprof.StartCPUProfile(f); err != nil {
+			return deferred, cerrors.Errorf("could not start CPU profile: %w", err)
+		}
+		deferFunc(pprof.StopCPUProfile)
+	}
+	if r.Config.Dev.MemProfile != "" {
+		deferFunc(func() {
+			f, err := os.Create(r.Config.Dev.MemProfile)
+			if err != nil {
+				r.logger.Err(ctx, err).Msg("could not create memory profile")
+				return
+			}
+			defer f.Close()
+			runtime.GC() // get up-to-date statistics
+			if err := pprof.WriteHeapProfile(f); err != nil {
+				r.logger.Err(ctx, err).Msg("could not write memory profile")
+			}
+		})
+	}
+	if r.Config.Dev.BlockProfile != "" {
+		runtime.SetBlockProfileRate(1)
+		deferFunc(func() {
+			f, err := os.Create(r.Config.Dev.BlockProfile)
+			if err != nil {
+				r.logger.Err(ctx, err).Msg("could not create block profile")
+				return
+			}
+			defer f.Close()
+			if err := pprof.Lookup("block").WriteTo(f, 0); err != nil {
+				r.logger.Err(ctx, err).Msg("could not write block profile")
+			}
+		})
+	}
+	return
+}
+
+func (r *Runtime) registerCleanup(t *tomb.Tomb) {
+	if r.Config.Preview.PipelineArchV2 {
+		r.registerCleanupV2(t)
+	} else {
+		r.registerCleanupV1(t)
+	}
+}
+
+func (r *Runtime) registerCleanupV1(t *tomb.Tomb) {
+	ls := r.lifecycleService.(*lifecycle.Service)
+	t.Go(func() error {
+		<-t.Dying()
+		// start cleanup with a fresh context
+		ctx := context.Background()
+
+		// t.Err() can be nil, when we had a call: t.Kill(nil)
+		// t.Err() will be context.Canceled, if the tomb's context was canceled
+		if t.Err() == nil || cerrors.Is(t.Err(), context.Canceled) {
+			ls.StopAll(ctx, pipeline.ErrGracefulShutdown)
+		} else {
+			// tomb died due to a real error
+			ls.StopAll(ctx, cerrors.Errorf("conduit experienced an error: %w", t.Err()))
+		}
+		err := ls.Wait(exitTimeout)
+		t.Go(func() error {
+			r.connectorPersister.Wait()
+			return r.CloseDB()
+		})
+		return err
+	})
+}
+
+func (r *Runtime) registerCleanupV2(t *tomb.Tomb) {
+	ls := r.lifecycleService.(*lifecycle_v2.Service)
+	t.Go(func() error {
+		<-t.Dying()
+		// start cleanup with a fresh context
+		ctx := context.Background()
+
+		err := ls.StopAll(ctx, false)
+		if err != nil {
+			r.logger.Err(ctx, err).Msg("some pipelines stopped with an error")
+		}
+
+		// Wait for the pipelines to stop
+		const (
+			count    = 6
+			interval = exitTimeout / count
+		)
+
+		pipelinesStopped := make(chan struct{})
+		go func() {
+			for i := count; i > 0; i-- {
+				if i == 1 {
+					// on last try, stop forcefully
+					_ = ls.StopAll(ctx, true)
+				}
+
+				r.logger.Info(ctx).Msgf("waiting for pipelines to stop running (time left: %s)", time.Duration(i)*interval)
+				select {
+				case <-time.After(interval):
+				case <-pipelinesStopped:
+					return
+				}
+			}
+		}()
+
+		err = ls.Wait(exitTimeout)
+		switch {
+		case err != nil && err != context.DeadlineExceeded:
+			r.logger.Warn(ctx).Err(err).Msg("some pipelines stopped with an error")
+		case err == context.DeadlineExceeded:
+			r.logger.Warn(ctx).Msg("some pipelines did not stop in time")
+		default:
+			r.logger.Info(ctx).Msg("all pipelines stopped gracefully")
+		}
+
+		// Signal the progress logger above to stop. This must be a close, not
+		// a send on an unbuffered channel: the logger's loop runs for exactly
+		// count*interval == exitTimeout, so when ls.Wait returns after the full
+		// exitTimeout (pipelines did not stop in time) the logger has already
+		// left its final select and returned, and a send here would block
+		// forever with no receiver — deadlocking Runtime.Run and hanging
+		// shutdown. Closing is idempotent with a missing receiver, so Run
+		// always returns.
+		close(pipelinesStopped)
+
+		t.Go(func() error {
+			r.connectorPersister.Wait()
+			return r.CloseDB()
+		})
+
+		return nil
+	})
+}
+
+// newHTTPMetricsHandler builds the handler served at /metrics (see
+// serveHTTPAPI).
+func (r *Runtime) newHTTPMetricsHandler() http.Handler {
+	// ContinueOnError, not the promhttp default: with an embedded Runtime the
+	// gatherer holds the HOST application's collectors too, so one broken host
+	// collector would otherwise turn every scrape into a 500 that also hides
+	// Conduit's own metrics — losing our observability because of someone
+	// else's bug. ErrorLog gives that failure somewhere to be seen; the
+	// default is to discard it.
+	handler := promhttp.HandlerFor(r.metricsGatherer, promhttp.HandlerOpts{
+		ErrorHandling: promhttp.ContinueOnError,
+		ErrorLog:      promLogger{logger: r.logger},
+	})
+	return instrumentMetricHandler(r.logger, r.metricsRegisterer, handler)
+}
+
+// instrumentMetricHandler is promhttp.InstrumentMetricHandler with its panic
+// contained.
+//
+// That function panics on any registration error that is not
+// AlreadyRegisteredError, and r.metricsRegisterer can be supplied by the host
+// application (WithMetricsRegisterer). A host collector whose name collides
+// with promhttp's own — "promhttp_metric_handler_requests_total" with
+// different labels — therefore panics inside serveHTTPAPI, which Run calls
+// synchronously with no recover anywhere in the path: the panic unwinds into
+// the embedding application and takes the process down.
+//
+// Serving /metrics without the handler's own scrape counters is a far better
+// outcome than crashing someone's application, so the panic is caught and the
+// uninstrumented handler is used instead. The recover (rather than
+// pre-registering the two collectors here) also keeps this correct if promhttp
+// grows another panic path.
+func instrumentMetricHandler(logger log.CtxLogger, reg promclient.Registerer, handler http.Handler) (h http.Handler) {
+	defer func() {
+		if p := recover(); p != nil {
+			logger.Warn(context.Background()).
+				Msgf("serving /metrics without handler instrumentation: %v", p)
+			h = handler
+		}
+	}()
+	return promhttp.InstrumentMetricHandler(reg, handler)
+}
+
+// promLogger adapts the runtime logger to promhttp.Logger, so a gather error
+// says something instead of vanishing into a 500 with no explanation.
+type promLogger struct {
+	logger log.CtxLogger
+}
+
+func (l promLogger) Println(v ...any) {
+	l.logger.Warn(context.Background()).Msg(strings.TrimSpace(fmt.Sprintln(v...)))
+}
+
+func (r *Runtime) apiRejections() *apisec.Rejections {
+	r.apiRejectionsOnce.Do(func() {
+		r.apiRejectionsVal = apisec.NewRejections(r.metricsRegisterer, r.logger)
+	})
+	return r.apiRejectionsVal
+}
+
+func (r *Runtime) serveGRPCAPI(ctx context.Context, t *tomb.Tomb) (net.Addr, error) {
+	unary := []grpc.UnaryServerInterceptor{
+		grpcutil.RequestIDUnaryServerInterceptor(r.logger),
+		grpcutil.LoggerUnaryServerInterceptor(r.logger),
+	}
+	var stream []grpc.StreamServerInterceptor
+	if r.apiToken != "" {
+		// The token check runs before anything else sees the call, and the
+		// stream interceptor also covers server reflection.
+		auth := apisec.NewAuthenticator(r.apiToken, r.apiRejections())
+		unary = append([]grpc.UnaryServerInterceptor{auth.UnaryInterceptor()}, unary...)
+		stream = append(stream, auth.StreamInterceptor())
+	}
+	grpcServer := grpc.NewServer(
+		grpc.ChainUnaryInterceptor(unary...),
+		grpc.ChainStreamInterceptor(stream...),
+		grpc.StatsHandler(r.metricsGrpcStatsHandler),
+		grpc.MaxRecvMsgSize(10*1024*1024),
+	)
+
+	pipelineAPIv1 := api.NewPipelineAPIv1(r.Orchestrator.Pipelines, r.ProvisionService, r.Config.API.AllowLiveRestartApply)
+	pipelineAPIv1.Register(grpcServer)
+
+	processorAPIv1 := api.NewProcessorAPIv1(r.Orchestrator.Processors, r.Orchestrator.ProcessorPlugins)
+	processorAPIv1.Register(grpcServer)
+
+	connectorAPIv1 := api.NewConnectorAPIv1(r.Orchestrator.Connectors, r.Orchestrator.ConnectorPlugins)
+	connectorAPIv1.Register(grpcServer)
+
+	pluginAPIv1 := api.NewPluginAPIv1(r.Orchestrator.ConnectorPlugins)
+	pluginAPIv1.Register(grpcServer)
+
+	info := api.NewInformation(Version(false))
+	info.Register(grpcServer)
+	// Makes it easier to use command line tools to interact
+	// with the gRPC API.
+	// https://github.com/grpc/grpc/blob/master/doc/server-reflection.md
+	reflection.Register(grpcServer)
+
+	// Names taken from api.proto
+	healthServer := api.NewHealthServer(
+		map[string]api.Checker{
+			"PipelineService":        r.pipelineService,
+			"ConnectorService":       r.connectorService,
+			"ProcessorService":       r.processorService,
+			"ConnectorPluginService": r.connectorPluginService,
+			"ProcessorPluginService": r.processorPluginService,
+		},
+		r.logger,
+	)
+	grpc_health_v1.RegisterHealthServer(grpcServer, healthServer)
+
+	// serve grpc server
+	addr, err := r.serveGRPC(ctx, t, grpcServer, r.Config.API.GRPC.Address)
+	if err != nil {
+		return nil, err
+	}
+
+	r.logger.Info(ctx).Str(log.ServerAddressField, addr.String()).Msg("grpc API started")
+	return addr, nil
+}
+
+// startConnectorUtils starts all the utility services needed by connectors.
+func (r *Runtime) startConnectorUtils(ctx context.Context, t *tomb.Tomb) (net.Addr, error) {
+	grpcServer := grpc.NewServer(
+		// The connector token check runs first, on every call (including
+		// streams and unknown methods).
+		grpc.ChainUnaryInterceptor(
+			r.connTokenService.UnaryServerInterceptor(r.apiRejections()),
+			grpcutil.RequestIDUnaryServerInterceptor(r.logger),
+			grpcutil.LoggerUnaryServerInterceptor(r.logger),
+		),
+		grpc.ChainStreamInterceptor(r.connTokenService.StreamServerInterceptor(r.apiRejections())),
+		grpc.StatsHandler(r.metricsGrpcStatsHandler),
+	)
+
+	schemaServiceAPI := pconnutils.NewSchemaServiceServer(r.connSchemaService)
+	connutilsv1.RegisterSchemaServiceServer(grpcServer, schemaServiceAPI)
+
+	// No server reflection here: it would list the services to any local
+	// process, and plugins do not use it. The API server has reflection, behind
+	// the API token.
+
+	// Names taken from schema.proto
+	healthServer := api.NewHealthServer(
+		map[string]api.Checker{
+			"SchemaService": r.connSchemaService,
+		},
+		r.logger,
+	)
+	grpc_health_v1.RegisterHealthServer(grpcServer, healthServer)
+
+	// Serve utilities on a random loopback port. Only connector plugins that
+	// Conduit itself starts on this host dial it, and it has no
+	// authentication, so it must never be reachable from the network.
+	addr, err := r.serveGRPC(ctx, t, grpcServer, "127.0.0.1:0")
+	if err != nil {
+		return nil, err
+	}
+
+	r.logger.Info(ctx).Str(log.ServerAddressField, addr.String()).Msg("connector utilities started")
+	return addr, nil
+}
+
+func (r *Runtime) serveHTTPAPI(
+	ctx context.Context,
+	t *tomb.Tomb,
+	grpcAddr net.Addr,
+) (net.Addr, error) {
+	dialOpts := []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())}
+	if r.apiToken != "" {
+		// The gateway authenticates the HTTP request itself (see below) and
+		// then calls the gRPC server as a trusted in-process client.
+		dialOpts = append(dialOpts, grpc.WithPerRPCCredentials(apisec.BearerCredentials(r.apiToken)))
+	}
+	conn, err := grpc.NewClient(grpcAddr.String(), dialOpts...)
+	if err != nil {
+		return nil, cerrors.Errorf("failed to dial server: %w", err)
+	}
+
+	gwmux := grpcruntime.NewServeMux(
+		grpcruntime.WithIncomingHeaderMatcher(grpcutil.HeaderMatcher),
+		grpcruntime.WithOutgoingHeaderMatcher(grpcutil.HeaderMatcher),
+		grpcutil.WithErrorHandler(r.logger),
+		grpcutil.WithPrettyJSONMarshaler(),
+		grpcruntime.WithHealthzEndpoint(grpc_health_v1.NewHealthClient(conn)),
+	)
+
+	err = apiv1.RegisterPipelineServiceHandler(ctx, gwmux, conn)
+	if err != nil {
+		return nil, cerrors.Errorf("failed to register pipelines handler: %w", err)
+	}
+
+	err = apiv1.RegisterConnectorServiceHandler(ctx, gwmux, conn)
+	if err != nil {
+		return nil, cerrors.Errorf("failed to register connectors handler: %w", err)
+	}
+
+	err = apiv1.RegisterProcessorServiceHandler(ctx, gwmux, conn)
+	if err != nil {
+		return nil, cerrors.Errorf("failed to register processors handler: %w", err)
+	}
+
+	err = apiv1.RegisterPluginServiceHandler(ctx, gwmux, conn)
+	if err != nil {
+		return nil, cerrors.Errorf("failed to register plugins handler: %w", err)
+	}
+
+	err = apiv1.RegisterInformationServiceHandler(ctx, gwmux, conn)
+	if err != nil {
+		return nil, cerrors.Errorf("failed to register Information handler: %w", err)
+	}
+
+	oaHandler := http.StripPrefix("/openapi/", openapi.Handler())
+	err = gwmux.HandlePath(
+		"GET",
+		"/openapi/**",
+		func(w http.ResponseWriter, req *http.Request, pathParams map[string]string) {
+			oaHandler.ServeHTTP(w, req)
+		},
+	)
+	if err != nil {
+		return nil, cerrors.Errorf("failed to register openapi handler: %w", err)
+	}
+
+	err = gwmux.HandlePath(
+		"GET",
+		"/openapi",
+		func(w http.ResponseWriter, req *http.Request, pathParams map[string]string) {
+			http.Redirect(w, req, "/openapi/", http.StatusFound)
+		},
+	)
+	if err != nil {
+		return nil, cerrors.Errorf("failed to register openapi redirect handler: %w", err)
+	}
+
+	metricsHandler := r.newHTTPMetricsHandler()
+	err = gwmux.HandlePath(
+		"GET",
+		"/metrics",
+		func(w http.ResponseWriter, req *http.Request, pathParams map[string]string) {
+			metricsHandler.ServeHTTP(w, req)
+		},
+	)
+	if err != nil {
+		return nil, cerrors.Errorf("failed to register metrics handler: %w", err)
+	}
+
+	readyzHandler := r.readyzHandler()
+	err = gwmux.HandlePath(
+		"GET",
+		"/readyz",
+		func(w http.ResponseWriter, req *http.Request, pathParams map[string]string) {
+			readyzHandler.ServeHTTP(w, req)
+		},
+	)
+	if err != nil {
+		return nil, cerrors.Errorf("failed to register readyz handler: %w", err)
+	}
+
+	allowedOrigins := r.Config.API.HTTP.CORS.AllowedOrigins
+	if slices.Contains(allowedOrigins, "*") {
+		// The API has no authentication. A wildcard CORS origin therefore lets any
+		// web page reach it; combined with a non-loopback bind, that is
+		// network-wide unauthenticated read and control. Warn loudly, louder still
+		// when the bind is not loopback.
+		w := r.logger.Warn(ctx)
+		if isLoopbackBind(r.Config.API.HTTP.Address) {
+			w.Msg("CORS is configured with wildcard '*': any web origin may call the unauthenticated HTTP API and websocket streams. Prefer exact origins outside local development.")
+		} else {
+			w.Str(log.ServerAddressField, r.Config.API.HTTP.Address).
+				Msg("CORS wildcard '*' with a non-loopback bind and no API authentication: any website in any browser on this network can read and control this Conduit instance. Use exact origins, bind to loopback, or front it with an authenticating proxy.")
+		}
+	}
+	policy := apisec.BrowserPolicy{
+		AllowedOrigins: allowedOrigins,
+		// Invariant: on a loopback bind the Host header must be a loopback
+		// name (or one the operator listed), so DNS rebinding cannot make an
+		// attacker origin look same-origin. On a network bind the token is the
+		// protection and the legitimate host names are unknowable.
+		ValidateHost: isLoopbackBind(r.Config.API.HTTP.Address),
+		AllowedHosts: r.Config.API.HTTP.AllowedHosts,
+		Rejections:   r.apiRejections(),
+	}
+	handler := buildAPIHandler(ctx, gwmux, policy, r.logger)
+	if r.apiToken != "" {
+		// Gates /v1, /openapi, /metrics and the inspector WebSocket. It sits
+		// inside uiMiddleware, so only the embedded UI's static assets are
+		// served without a token.
+		handler = apisec.NewAuthenticator(r.apiToken, r.apiRejections()).HTTP(handler)
+		r.logger.Info(ctx).Msg("API token authentication is enabled for the HTTP and gRPC APIs")
+	} else {
+		r.logger.Info(ctx).Msg("API token authentication is disabled: the loopback-only API accepts any local client; set api.token-file to require a token")
+	}
+	// UI-7: mount the embedded built-in UI at "/", last, so it can never
+	// shadow any route above (see pkg/conduit/ui.go and
+	// docs/design-documents/20260713-greenfield-built-in-ui.md §7).
+	handler = uiMiddleware(ctx, handler, r.Config.API.HTTP.UI.Enabled, r.logger)
+	// Outermost: Host, Origin and Content-Type are checked before anything
+	// else, including the UI and the token gate, on every method.
+	handler = policy.Guard(handler)
+	// Outermost of all: framing, CSP, nosniff and referrer headers on every
+	// response, including the guard's refusals.
+	handler = apisec.SecurityHeaders(handler)
+
+	addr, err := r.serveHTTP(
+		ctx,
+		t,
+		&http.Server{
+			Addr:              r.Config.API.HTTP.Address,
+			Handler:           handler,
+			ReadHeaderTimeout: 10 * time.Second,
+		},
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	r.logger.Info(ctx).Str(log.ServerAddressField, addr.String()).Msg("http API started")
+	return addr, nil
+}
+
+func preflightHandler(w http.ResponseWriter, r *http.Request) {
+	// The origin is already known-allowed by allowCORS before this runs. Reflect
+	// the browser's requested headers (rather than a fixed list) so a UI setting a
+	// correlation header (x-request-id, read by the gateway) or, in future, an
+	// Authorization header is not blocked by an out-of-date allowlist. Fall back to
+	// the historical minimal set when the browser requests nothing specific.
+	reqHeaders := r.Header.Get("Access-Control-Request-Headers")
+	if reqHeaders == "" {
+		reqHeaders = "Content-Type,Accept"
+	}
+	w.Header().Set("Access-Control-Allow-Headers", reqHeaders)
+	w.Header().Set("Access-Control-Allow-Methods", "GET,HEAD,POST,PUT,DELETE")
+	// Let the browser cache the preflight so it doesn't re-issue OPTIONS before
+	// every API/stream call.
+	w.Header().Set("Access-Control-Max-Age", "600")
+}
+
+// buildAPIHandler wraps the gateway mux with CORS and websocket proxying. The
+// websocket upgrader checks origins with the same BrowserPolicy as the HTTP
+// guard, exactly as serveHTTPAPI assembles it. Extracted so the wiring is
+// testable without standing up the full runtime (a regression that dropped the
+// websocket check here would otherwise pass every unit test).
+func buildAPIHandler(ctx context.Context, gwmux http.Handler, policy apisec.BrowserPolicy, logger log.CtxLogger) http.Handler {
+	return grpcutil.WithWebsockets(
+		ctx,
+		grpcutil.WithDefaultGatewayMiddleware(allowCORS(gwmux, policy.AllowedOrigins)),
+		logger,
+		policy.CheckWebSocketOrigin,
+	)
+}
+
+// originAllowed reports whether origin is permitted by the configured allowlist:
+// true if the list contains the wildcard "*" or the exact origin. It is the
+// single origin-decision shared by allowCORS (HTTP) and the websocket CheckOrigin,
+// so the two surfaces can never diverge.
+func originAllowed(origin string, allowedOrigins []string) bool {
+	for _, a := range allowedOrigins {
+		if a == "*" || a == origin {
+			return true
+		}
+	}
+	return false
+}
+
+// allowCORS enables Cross-Origin Resource Sharing for the browser origins in
+// allowedOrigins (exact match, or all when the list contains "*"). It reflects the
+// matched origin (never a literal "*") and sets Vary: Origin so a shared cache
+// can't serve one origin's headers to another. It sets no Access-Control-Allow-
+// Credentials: the API is unauthenticated, and reflecting the origin keeps this
+// forward-safe if auth is ever added. An empty allowlist denies all cross-origin
+// requests (the secure default); same-origin requests are unaffected either way.
+func allowCORS(h http.Handler, allowedOrigins []string) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		origin := r.Header.Get("Origin")
+		if origin != "" && originAllowed(origin, allowedOrigins) {
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+			w.Header().Add("Vary", "Origin")
+			if r.Method == http.MethodOptions && r.Header.Get("Access-Control-Request-Method") != "" {
+				preflightHandler(w, r)
+				return
+			}
+		}
+		h.ServeHTTP(w, r)
+	})
+}
+
+// isLoopbackBind reports whether addr binds only the loopback interface. An empty
+// host (":8080"), "0.0.0.0", or "::" binds all interfaces and is NOT loopback;
+// "localhost" and any address in 127.0.0.0/8 or ::1 is loopback.
+func isLoopbackBind(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		host = addr
+	}
+	if host == "" {
+		return false // all interfaces
+	}
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+func (r *Runtime) serveGRPC(
+	ctx context.Context,
+	t *tomb.Tomb,
+	srv *grpc.Server,
+	address string,
+) (net.Addr, error) {
+	// ctx governs only the Listen operation (address resolution / socket
+	// creation), not the returned listener's lifetime. Server shutdown is driven
+	// separately via t.Dying() below, so cancelling ctx after this returns does
+	// not close the listener.
+	var lc net.ListenConfig
+	ln, err := lc.Listen(ctx, "tcp", address)
+	if err != nil {
+		// See the comment on the equivalent DB-creation-failure branch above:
+		// wrap first, then pass the wrapped error as the cause, so the
+		// captured stack frame isn't discarded.
+		wrapped := cerrors.Errorf("failed to listen on address %q: %w", address, err)
+		// Tagged Unavailable (e.g. the address is already bound by another
+		// process): pkg/conduit/exitcode maps this to exit code 3.
+		return nil, conduiterr.Wrap(conduiterr.CodeUnavailable, wrapped.Error(), wrapped)
+	}
+
+	t.Go(func() error {
+		return srv.Serve(ln)
+	})
+	t.Go(func() error {
+		<-t.Dying()
+		gracefullyStopped := make(chan struct{})
+		go func() {
+			defer close(gracefullyStopped)
+			srv.GracefulStop()
+		}()
+
+		select {
+		case <-gracefullyStopped:
+			return nil // server stopped as expected
+		case <-time.After(exitTimeout):
+			return cerrors.Errorf("timeout %v exceeded while closing grpc server", exitTimeout)
+		}
+	})
+
+	return ln.Addr(), nil
+}
+
+func (r *Runtime) serveHTTP(
+	ctx context.Context,
+	t *tomb.Tomb,
+	srv *http.Server,
+) (net.Addr, error) {
+	// See the note in serveGRPC: ctx scopes the Listen call only, not the
+	// listener's lifetime.
+	var lc net.ListenConfig
+	ln, err := lc.Listen(ctx, "tcp", srv.Addr)
+	if err != nil {
+		// Wrap-then-pass-the-wrapped-error, same reasoning as serveGRPC above
+		// (keeps the captured stack frame instead of discarding it).
+		wrapped := cerrors.Errorf("failed to listen on address %q: %w", r.Config.API.HTTP.Address, err)
+		// Tagged Unavailable, same reasoning as serveGRPC above.
+		return nil, conduiterr.Wrap(conduiterr.CodeUnavailable, wrapped.Error(), wrapped)
+	}
+
+	t.Go(func() error {
+		err := srv.Serve(ln)
+		if err != nil {
+			if err == http.ErrServerClosed {
+				// ignore expected close
+				return nil
+			}
+			return cerrors.Errorf("http server listening on %q stopped with error: %w", ln.Addr(), err)
+		}
+		return nil
+	})
+	t.Go(func() error {
+		<-t.Dying()
+		// start server shutdown with a timeout, use fresh context
+		ctx, cancel := context.WithTimeout(context.Background(), exitTimeout)
+		defer cancel()
+		return srv.Shutdown(ctx)
+	})
+
+	return ln.Addr(), nil
+}
+
+// InitProvisioningOnly initializes just the metadata services
+// (processor/connector/pipeline — the ones ProvisionService.Plan/ApplyPlan
+// read and mutate) so ProvisionService is ready to use, without starting the
+// gRPC/HTTP API servers, the connector-utils callback server, or any
+// pipeline's actual dataflow (lifecycleService.Init, which would resume
+// previously-running pipelines, is deliberately never called here).
+//
+// It exists for the standalone `conduit pipelines deploy|apply` CLI commands
+// (see cmd/conduit/internal/deploy), which need a working ProvisionService
+// without booting the full server — reusing NewRuntime's exact, real service
+// construction (schema registry, builtin connector/processor registries)
+// rather than a second, parallel bootstrap that could drift from it.
+//
+// Known limitation (documented, not silently papered over): connectorPluginService
+// is initialized with an empty connector-utils address (no live callback
+// server is started), so a connector plugin that needs it during OnDelete
+// (invoked when apply deletes a connector, including the delete+create pair
+// for a Type change) may fail to run its cleanup hook correctly in this
+// standalone mode. See docs/design-documents/20260708-cli-pipeline-deploy-apply.md's
+// PR failure-mode analysis.
+//
+// Callers must call r.DB.Close() when done; InitProvisioningOnly does not
+// start anything that needs its own shutdown path (no goroutines, no
+// listeners), so there is nothing else to release.
+func (r *Runtime) InitProvisioningOnly(ctx context.Context) error {
+	if err := r.processorService.Init(ctx); err != nil {
+		return cerrors.Errorf("failed to init processor service: %w", err)
+	}
+
+	r.connectorPluginService.Init(ctx, "", r.Config.Connectors.MaxReceiveRecordSize)
+
+	if err := r.connectorService.Init(ctx); err != nil {
+		return cerrors.Errorf("failed to init connector service: %w", err)
+	}
+
+	// Invariant 7 / Tier-1 safety (see plan.go's isRunningStatus and AC-13):
+	// pipelineService.Init converts any persisted StatusRunning to
+	// StatusSystemStopped (it cannot know whether the process that set
+	// StatusRunning is still alive) — the *same* laundering conduit run
+	// itself relies on after a real restart. That means a status read
+	// through *this* Runtime can never distinguish "was running before an
+	// unrelated crash" from "is actually running right now in a separate,
+	// live conduit run process" — only the process that actually started a
+	// pipeline's goroutines (or a live RPC to it) can tell the difference.
+	// See the design doc's PR failure-mode analysis for how the CLI commands
+	// account for this (DB-type gate on the standalone apply path: BadgerDB/
+	// SQLite's exclusive file lock makes "a live conduit run has this store
+	// open too" fail at OpenStore instead of silently proceeding; Postgres,
+	// which allows concurrent connections, is refused outright).
+	if err := r.pipelineService.Init(ctx); err != nil {
+		return cerrors.Errorf("failed to init pipeline service: %w", err)
+	}
+
+	return nil
+}
+
+func (r *Runtime) initServices(ctx context.Context, t *tomb.Tomb) error {
+	err := r.processorService.Init(ctx)
+	if err != nil {
+		return cerrors.Errorf("failed to init processor service: %w", err)
+	}
+
+	// Initialize APIs needed by connector plugins
+	// Needs to be initialized before connectorPluginService
+	// because the standalone connector registry needs to run all plugins,
+	// and the plugins initialize a connector utils client when they are run.
+	connUtilsAddr, err := r.startConnectorUtils(ctx, t)
+	if err != nil {
+		return cerrors.Errorf("failed to start connector utilities API: %w", err)
+	}
+	r.logger.Info(ctx).Msgf("connector utilities started on %v", connUtilsAddr)
+
+	r.connectorPluginService.Init(ctx, connUtilsAddr.String(), r.Config.Connectors.MaxReceiveRecordSize)
+
+	err = r.connectorService.Init(ctx)
+	if err != nil {
+		return cerrors.Errorf("failed to init connector service: %w", err)
+	}
+
+	if r.Config.Pipelines.ExitOnDegraded {
+		if r.Config.Preview.PipelineArchV2 {
+			ls := r.lifecycleService.(*lifecycle_v2.Service)
+			ls.OnFailure(func(e lifecycle_v2.FailureEvent) {
+				r.logger.Warn(ctx).
+					Err(e.Error).
+					Str(log.PipelineIDField, e.ID).
+					Msg("Conduit will shut down due to a pipeline failure and 'exit-on-degraded' enabled")
+				t.Kill(cerrors.Errorf("shut down due to 'exit-on-degraded' error: %w", e.Error))
+			})
+		} else {
+			ls := r.lifecycleService.(*lifecycle.Service)
+			ls.OnFailure(func(e lifecycle.FailureEvent) {
+				r.logger.Warn(ctx).
+					Err(e.Error).
+					Str(log.PipelineIDField, e.ID).
+					Msg("Conduit will shut down due to a pipeline failure and 'exit-on-degraded' enabled")
+				t.Kill(cerrors.Errorf("shut down due to 'exit-on-degraded' error: %w", e.Error))
+			})
+		}
+	}
+	err = r.pipelineService.Init(ctx)
+	if err != nil {
+		return cerrors.Errorf("failed to init pipeline service: %w", err)
+	}
+
+	if r.Config.Pipelines.Disabled {
+		// Embed-only: Options.PipelinesDir was left empty (see the root
+		// conduit package's New doc) — file provisioning is off, not merely
+		// pointed at an empty/missing path, so Path is never stat'd or
+		// scanned. `conduit run` never sets Disabled (see its field doc), so
+		// this branch is unreachable on the CLI path.
+		r.logger.Debug(ctx).Msg("file-based pipeline provisioning is disabled, skipping")
+	} else {
+		err = r.ProvisionService.Init(ctx)
+		if err != nil {
+			// Additive (see ProvisioningErr's doc): recorded regardless of
+			// ExitOnDegraded, purely for the embed API to read after Ready
+			// closes. Does not change what's logged or when initServices
+			// itself fails below — that remains exactly `conduit run`'s
+			// existing behavior.
+			r.ProvisioningErr = err
+			cerrors.ForEach(err, func(err error) {
+				r.logger.Err(ctx, err).Msg("provisioning failed")
+			})
+			if r.Config.Pipelines.ExitOnDegraded {
+				r.logger.Warn(ctx).
+					Err(err).
+					Msg("Conduit will shut down due to a pipeline provisioning failure and 'exit on error' enabled")
+				err = cerrors.Errorf("shut down due to 'exit on error' enabled: %w", err)
+				return err
+			}
+		}
+	}
+
+	err = r.lifecycleService.Init(ctx)
+	if err != nil {
+		cerrors.ForEach(err, func(err error) {
+			r.logger.Err(ctx, err).Msg("pipeline failed to be started")
+		})
+	}
+
+	if r.Config.Dev.Enabled {
+		if err := r.startDevWatcher(ctx, t); err != nil {
+			return cerrors.Errorf("failed to start dev watcher: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// startDevWatcher starts the `conduit run --dev` hot-reload file watcher
+// (pkg/conduit/dev) as a tomb-managed goroutine, once startup provisioning
+// (ProvisionService.Init above) and pipeline auto-resume
+// (lifecycleService.Init above) have both already run — the watcher only
+// ever reacts to *subsequent* edits, per
+// docs/design-documents/20260712-pipeline-dev-hot-reload.md §4.
+//
+// Invariant 7: ctx here is the tomb-derived context Run constructed at its
+// top (`t, ctx := tomb.WithContext(ctx)`), so Ctrl-C/SIGTERM cancelling it
+// cancels the watcher the same way it cancels every other service — t.Go
+// makes dev.Watcher.Run's return value part of the tomb's shutdown
+// accounting, and a normal cancellation (context.Canceled) is translated to
+// nil so it is never mistaken for a watcher failure.
+func (r *Runtime) startDevWatcher(ctx context.Context, t *tomb.Tomb) error {
+	w, err := dev.New(r.ProvisionService, r.lifecycleService, r.devPipelineStatus, dev.Options{
+		Path:   r.Config.Pipelines.Path,
+		Logger: r.logger,
+		Out:    os.Stdout,
+		JSON:   r.Config.Dev.JSON,
+	})
+	if err != nil {
+		return err
+	}
+
+	t.Go(func() error {
+		err := w.Run(ctx)
+		if err != nil && cerrors.Is(err, context.Canceled) {
+			return nil
+		}
+		return err
+	})
+	return nil
+}
+
+// devPipelineStatus is the dev.StatusFunc the watcher uses purely to label
+// an apply accurately (see dev.StatusFunc's doc) — it reports whether
+// pipelineID currently has live, in-process work, mirroring
+// provisioning.isRunningStatus's classification (pkg/provisioning/plan.go),
+// which is unexported and cannot be called from here. This duplicates a
+// three-case predicate, not engine behavior: keep it in sync with
+// provisioning's own definition if that classification ever changes.
+func (r *Runtime) devPipelineStatus(ctx context.Context, pipelineID string) (bool, error) {
+	inst, err := r.Orchestrator.Pipelines.Get(ctx, pipelineID)
+	if err != nil {
+		if cerrors.Is(err, pipeline.ErrInstanceNotFound) {
+			return false, nil
+		}
+		return false, err
+	}
+	switch inst.GetStatus() {
+	case pipeline.StatusRunning, pipeline.StatusRecovering, pipeline.StatusDegraded:
+		return true, nil
+	case pipeline.StatusSystemStopped, pipeline.StatusUserStopped:
+		return false, nil
+	default:
+		return false, nil
+	}
+}
+
+// logAmbientCredentialsPolicy logs the effective ambient-credentials policy at
+// startup, so an operator can see what is on without reading the config.
+// Endpoint and resource lists are counted, not printed (they are shown by
+// `conduit doctor`).
+func (r *Runtime) logAmbientCredentialsPolicy(p hostpolicy.Policy, warnings []string) {
+	ctx := context.Background()
+	logger := r.logger.WithComponent("connector.AmbientCredentials")
+	logger.Info(ctx).
+		Bool("enabled", p.AmbientCredentials).
+		Int("allow_endpoints_count", len(p.AllowEndpoints)).
+		Int("allow_resources_count", len(p.AllowResources)).
+		Bool("allow_proxy", p.AllowProxy).
+		Msg("ambient credentials policy")
+	for _, w := range warnings {
+		logger.Warn(ctx).Msg(w)
+	}
+}

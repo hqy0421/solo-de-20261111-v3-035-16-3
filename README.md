@@ -1,0 +1,639 @@
+# Conduit
+
+![Logo](https://raw.githubusercontent.com/ConduitIO/.github/main/images/conduit-logo-outlined.svg)
+
+_Data Integration for Production Data Stores. :dizzy:_
+
+![scarf pixel](https://static.scarf.sh/a.png?x-pxid=ae2e6c1b-5c87-4c4f-80bd-dd598b2e3c3b)
+[![License](https://img.shields.io/badge/license-Apache%202-blue)](https://github.com/ConduitIO/conduit/blob/main/LICENSE.md)
+[![Test](https://github.com/ConduitIO/conduit/actions/workflows/test.yml/badge.svg)](https://github.com/ConduitIO/conduit/actions/workflows/test.yml)
+[![Go Report Card](https://goreportcard.com/badge/github.com/conduitio/conduit)](https://goreportcard.com/report/github.com/conduitio/conduit)
+[![GitHub Discussions](https://img.shields.io/github/discussions/ConduitIO/conduit?logo=github&label=discussions)](https://github.com/ConduitIO/conduit/discussions)
+[![Twitter](https://img.shields.io/static/v1?label=X/Twitter&message=Follow&color=1DA1F2&logo=twitter&logoColor=white)](https://x.com/ConduitIO)
+[![Go Reference](https://pkg.go.dev/badge/github.com/conduitio/conduit.svg)](https://pkg.go.dev/github.com/conduitio/conduit)
+[![Conduit docs](https://img.shields.io/badge/conduit-docs-blue)](https://conduitdata.io/docs/getting-started)
+[![API docs](https://img.shields.io/badge/HTTP_API-docs-blue)](https://conduitdata.io/api)
+
+## Overview
+
+Conduit is a data streaming tool written in Go. It aims to provide the best user
+experience for building and running real-time data pipelines. Conduit comes with
+common connectors, processors and observability data out of the box.
+
+Conduit pipelines are built out of simple building blocks which run in their own
+goroutines and are connected using Go channels. This makes Conduit pipelines
+incredibly performant on multi-core machines. Conduit guarantees the order of
+received records won't change, it also takes care of consistency by propagating
+acknowledgements to the start of the pipeline only when a record is successfully
+processed on all destinations.
+
+Conduit connectors are plugins that communicate with Conduit via a gRPC
+interface. This means that plugins can be written in any language as long as
+they conform to the required interface.
+
+Conduit was created and open-sourced by [Meroxa](https://meroxa.io).
+
+- [Quick start](#quick-start)
+- [Installation guide](#installation-guide)
+- [Preflight checks](#preflight-checks)
+- [Configuring Conduit](#configuring-conduit)
+- [Storage](#storage)
+- [Connectors](#connectors)
+- [Processors](#processors)
+- [API](#api)
+- [Embed Conduit in your Go app](#embed-conduit-in-your-go-app)
+- [Documentation](#documentation)
+- [Contributing](#contributing)
+
+## Quick start
+
+The fastest way to see Conduit working — scaffold and run a demo pipeline with a
+single command:
+
+```sh
+conduit quickstart
+```
+
+Sample records flow to your console within seconds. State is in-memory and nothing
+is written to your working directory; press Ctrl-C to stop. For a full walkthrough,
+see <https://conduitdata.io/docs/getting-started>.
+
+## Installation guide
+
+### Install script (recommended)
+
+The install script detects your platform and installs Conduit through the native
+package manager for it — Homebrew on macOS, `dpkg` or `rpm` on Linux:
+
+```sh
+curl https://conduitdata.io/install.sh | bash
+```
+
+This is the route the [documentation site](https://conduitdata.io/docs/getting-started)
+leads with, and on macOS it is the one to prefer: it goes through Homebrew, so it
+avoids the quarantine problem described under
+[Download binary and run](#download-binary-and-run).
+
+### Homebrew
+
+Make sure you have [homebrew](https://brew.sh/) installed on your machine, then run:
+
+```sh
+brew update
+brew install conduit
+```
+
+### Download binary and run
+
+Download a pre-built binary from
+the [latest release](https://github.com/conduitio/conduit/releases/latest) and
+run it:
+
+```sh
+./conduit run
+```
+
+On macOS, the release binaries are ad-hoc signed — they are not Developer ID
+signed and they are not notarized. A binary downloaded through a browser
+therefore carries the `com.apple.quarantine` attribute, and Gatekeeper refuses
+to run it with no error message at all: the process is killed and you get an
+empty terminal. Clear the attribute after downloading and before you run the
+binary for the first time:
+
+```sh
+xattr -d com.apple.quarantine ./conduit
+```
+
+`curl` and `wget` do not set the quarantine attribute, so a binary fetched that
+way runs as-is. Homebrew and the install script are unaffected — on macOS,
+prefer either of those.
+
+Once you see that the service is running, the configured pipeline should start
+processing records automatically. You can also interact with
+the [Conduit API](#api) directly, we recommend navigating
+to `http://localhost:8080/openapi` and exploring the HTTP API through Swagger
+UI.
+
+Conduit can be configured through command line parameters. To view the full list
+of available options, run `./conduit run --help` or see
+[configuring Conduit](#configuring-conduit).
+
+### Debian
+
+Download the right `.deb` file for your machine architecture from the
+[latest release](https://github.com/conduitio/conduit/releases/latest), then run
+the command below, substituting the version and architecture of the file you
+downloaded for `<version>` and `<arch>`:
+
+```sh
+dpkg -i conduit_<version>_Linux_<arch>.deb
+```
+
+### RPM
+
+Download the right `.rpm` file for your machine architecture from the
+[latest release](https://github.com/conduitio/conduit/releases/latest), then run
+the command below, substituting the version and architecture of the file you
+downloaded for `<version>` and `<arch>`:
+
+```sh
+rpm -i conduit_<version>_Linux_<arch>.rpm
+```
+
+### Build from source
+
+Requirements:
+
+- [Go](https://go.dev/) 1.26 or newer
+- [Make](https://www.gnu.org/software/make/)
+
+```shell
+git clone git@github.com:ConduitIO/conduit.git
+cd conduit
+make
+./conduit run
+```
+
+### Docker
+
+Our Docker images are hosted on GitHub's Container Registry. To run the latest
+Conduit version, you should run the following command:
+
+```sh
+docker run \
+  -e CONDUIT_API_TOKEN="$(openssl rand -hex 32)" \
+  -p 127.0.0.1:8080:8080 \
+  conduit.docker.scarf.sh/conduitio/conduit:latest
+```
+
+The API listens on all interfaces inside the container, so Conduit requires an
+API token there (`CONDUIT_API_TOKEN`, or `CONDUIT_API_TOKEN_FILE` for a mounted
+secret) and refuses to start without one. Publish the port on `127.0.0.1` as
+above; `-p 8080:8080` publishes it on every host interface. Because the bind is
+not loopback, the Host header check is off in the container and only the token
+stops DNS rebinding; the token is sent in plaintext without TLS, so put a
+TLS-terminating proxy in front for anything beyond your own machine. The image runs as
+the non-root user `conduit` (uid 10001). See
+[API hardening](docs/operations/api-hardening.md).
+
+### Docker Compose quickstart
+
+[`deploy/docker-compose`](deploy/docker-compose) runs a pinned, signed release image
+with a pipeline already running (a generator writing to a file), Conduit's state on
+a named volume, a readiness health check and a graceful stop period:
+
+```sh
+git clone https://github.com/ConduitIO/conduit.git
+cd conduit/deploy/docker-compose
+export CONDUIT_API_TOKEN="$(openssl rand -hex 32)"
+docker compose up -d --wait
+docker compose exec conduit tail -n 3 /data/records.ndjson
+docker compose down            # add -v to delete the state volume
+```
+
+The API and UI are on <http://localhost:8080>, published on loopback only and requires
+`Authorization: Bearer $CONDUIT_API_TOKEN`. The container binds `0.0.0.0`, so the
+Host check is off and only that token stops DNS rebinding; it is plaintext without TLS. Swap
+`pipelines/quickstart.yaml` for your own pipeline to go
+further. CI runs this stack end to end (`deploy-quickstart`).
+
+[`deploy/`](deploy) also has systemd, ECS and Nomad examples. They are examples, not
+supported products.
+
+## Preflight checks
+
+Before running Conduit for the first time (or after changing configuration), run
+`conduit doctor` to check whether your environment is ready:
+
+```sh
+conduit doctor
+```
+
+It runs a set of offline, non-destructive checks — config resolution and
+validation, database reachability, API address availability, plugin
+directories, the built-in plugin registry, and whether a running engine is
+reachable — and reports pass/warn/fail for each, grouped by category. It does
+not start a Runtime; this is distinct from the running server's `/readyz` and
+`/healthz` endpoints, which answer "is the running engine serving?" instead of
+"would `conduit run` succeed here?".
+
+Useful flags: `--json` for machine-readable output, `--check <name>` (repeatable)
+to run only specific checks, `--deep` to additionally verify standalone connector
+plugin binaries in an isolated subprocess, `--require-server` to fail instead of
+warn when no Conduit server is reachable, and `-q`/`--quiet` to only print
+warnings, failures, and the summary. See `conduit doctor --help` for the full
+list of checks and exit codes, and
+[the design doc](docs/design-documents/20260707-cli-doctor.md) for the rationale.
+
+## Configuring Conduit
+
+Conduit accepts CLI flags, environment variables and a configuration file to
+configure its behavior. Each CLI flag has a corresponding environment variable
+and a corresponding field in the configuration file. Conduit uses the value for
+each configuration option based on the following priorities:
+
+- **CLI flags (highest priority)** - if a CLI flag is provided it will always be
+  respected, regardless of the environment variable or configuration file. To
+  see a full list of available flags run `conduit run --help`.
+- **Environment variables (lower priority)** - an environment variable is only
+  used if no CLI flag is provided for the same option. Environment variables
+  have the prefix `CONDUIT` and contain underscores instead of dots and
+  hyphens (e.g. the flag `-db.postgres.connection-string` corresponds to
+  `CONDUIT_DB_POSTGRES_CONNECTION_STRING`).
+- **Configuration file (lowest priority)** - By default, Conduit loads a
+  configuration file named `conduit.yaml` located in the same directory as the
+  Conduit binary. You can customize the directory path to this file using the
+  CLI flag `--config.path`. The configuration file is optional, as any value
+  specified within it can be overridden by an environment variable or a CLI
+  flag.
+
+  The file must be a YAML document, and keys can be hierarchically structured
+  using `.`. For example:
+
+  ```yaml
+  db:
+    type: postgres # corresponds to flag -db.type and env variable CONDUIT_DB_TYPE
+    postgres:
+      connection-string: postgres://localhost:5432/conduitdb # -db.postgres.connection-string or CONDUIT_DB_POSTGRES_CONNECTION_STRING
+  ```
+
+  To generate a configuration file with default values, use:
+  `conduit init --path <directory where conduit.yaml will be created>`.
+
+This parsing configuration is provided thanks to our own CLI
+library [ecdysis](https://github.com/conduitio/ecdysis), which builds on top
+of [Cobra](https://github.com/spf13/cobra) and
+uses [Viper](https://github.com/spf13/viper) under the hood.
+
+## Storage
+
+Conduit's own data (information about pipelines, connectors, etc.) can be stored
+in the following databases:
+
+- BadgerDB (default)
+- PostgreSQL
+- SQLite
+
+It's also possible to store all the data in memory, which is sometimes useful
+for development purposes.
+
+The database type used can be configured with the `db.type` parameter (through
+any of the [configuration](#configuring-conduit) options in Conduit).
+For example, the CLI flag to use a PostgreSQL database with Conduit is as
+follows: `-db.type=postgres`.
+
+Changing database parameters (e.g. the PostgreSQL connection string) is done
+through parameters of the following form: `db.<db type>.<parameter name>`. For
+example, the CLI flag to use a PostgreSQL instance listening on `localhost:5432`
+would be: `-db.postgres.connection-string=postgres://localhost:5432/conduitdb`.
+
+The full example in our case would be:
+
+```shell
+./conduit run -db.type=postgres -db.postgres.connection-string="postgresql://localhost:5432/conduitdb"
+```
+
+## Connectors
+
+For the full list of available connectors, see
+the [Connector List](https://conduitdata.io/docs/using/connectors/list). If
+there's a connector that you're looking for that isn't available in Conduit,
+please file an [issue](https://github.com/ConduitIO/conduit/issues/new?assignees=&labels=triage&template=3-connector-request.yml&title=Connector%3A+%3Cresource%3E+%5BSource%2FDestination%5D)
+.
+
+The quickest way to add a connector is the signed connector registry:
+`conduit connectors install <name>` — see the
+[registry install guide](https://conduitdata.io/docs/using/connectors/installing).
+
+Conduit loads standalone connectors at startup. The connector binaries need to
+be placed in the `connectors` directory relative to the Conduit binary so
+Conduit can find them. Alternatively, the path to the standalone connectors can
+be adjusted using the CLI flag `-connectors.path`.
+
+Standalone connectors run as separate processes and receive Conduit's
+environment variables. Conduit logs one warning at startup that lists the names
+of credential-like variables being passed; see
+[standalone plugin environment](docs/operations/standalone-plugin-environment.md).
+
+Conduit ships with a number of built-in connectors:
+
+- [File connector](https://github.com/ConduitIO/conduit-connector-file) provides
+  a source/destination to read/write a local file (useful for quickly trying out
+  Conduit without additional setup).
+- [Kafka connector](https://github.com/ConduitIO/conduit-connector-kafka)
+  provides a source/destination for Apache Kafka.
+- [Postgres connector](https://github.com/ConduitIO/conduit-connector-postgres)
+  provides a source/destination for PostgreSQL.
+- [S3 connector](https://github.com/ConduitIO/conduit-connector-s3) provides a
+  source/destination for AWS S3.
+- [Generator connector](https://github.com/ConduitIO/conduit-connector-generator)
+  provides a source which generates random data (useful for testing).
+- [Log connector](https://github.com/ConduitIO/conduit-connector-log)
+  provides a destination which logs all records (useful for testing).
+  
+Additionally, we have prepared
+a [Kafka Connect wrapper](https://github.com/conduitio/conduit-kafka-connect-wrapper)
+that allows you to run any Apache Kafka Connect connector as part of a Conduit
+pipeline.
+
+If you are interested in writing a connector yourself, have a look at
+our [Go Connector SDK](https://github.com/ConduitIO/conduit-connector-sdk).
+Since standalone connectors communicate with Conduit through gRPC they can be
+written in virtually any programming language, as long as the connector follows
+the [Conduit Connector Protocol](https://github.com/ConduitIO/conduit-connector-protocol).
+
+### Ambient cloud credentials
+
+Built-in connectors never use the Conduit host's own cloud identity (for AWS,
+the default credential chain: environment, shared config, IRSA, ECS and EC2
+roles) unless the operator turns it on. The API is unauthenticated by default,
+so a pipeline author must not be able to act as the host:
+
+```yaml
+connectors:
+  ambient-credentials:
+    enabled: true
+    allow-resources: ["acme-ingest-prod"] # exact bucket names, required
+    allow-endpoints: ["https://minio.internal:9000"] # only for custom endpoints
+```
+
+Pipelines then use `builtin:s3` with no keys. Static keys in a pipeline work as
+before. See [ambient credentials](docs/operations/ambient-credentials.md) for
+the rules, error codes and runbook, and run
+`conduit doctor --check connectors.ambient_credentials` to see the effective
+policy.
+
+## Settings and the host
+
+Connector and processor settings can come from the API, so they get no ambient access to the
+machine Conduit runs on. Four things are closed until the operator opens them in `conduit.yaml`, by
+flag, or by `CONDUIT_*` environment, and never through a pipeline or API field:
+
+- `${VAR}` expands only for names in [`env.allow`](docs/operations/env-allowlist.md).
+- `webhook.http`, `ollama.request`, `openai.*` and `cohere.*` refuse private, loopback, link-local and
+  metadata addresses unless the exact destination is in
+  [`processors.egress.builtin-allow`](docs/operations/outbound-http-egress.md).
+- The `file` connector and `custom.javascript` (`script.path`, `require()`) are confined to
+  [`connectors.file.allowed-dirs` and `processors.javascript.allowed-dirs`](docs/operations/file-access.md).
+- Built-in connectors never connect to a cloud metadata endpoint, and the operator can confine every
+  target with [`connectors.egress.allow`](docs/operations/connector-egress.md). Writers of the API are
+  trusted to choose the other targets (a database, a Kafka cluster, an S3 endpoint).
+- The log connector, and so the default dead-letter queue, does not write record keys or payloads
+  unless `payload: true`.
+
+Every refusal is a coded error that names the key to change.
+
+## Processors
+
+A processor is a component that operates on a single record that flows through a
+pipeline. It can either change the record (i.e. **transform** it) or **filter**
+it out based on some criteria.
+
+Conduit provides a number of built-in processors, which can be used to
+manipulate fields, send requests to HTTP endpoints, and more,
+check [built-in processors](https://conduitdata.io/docs/using/processors/builtin/)
+for the list of built-in processors and documentations.
+
+Conduit also provides the ability to write your
+own [standalone processor](https://conduitdata.io/docs/developing/processors/building),
+or you can use the built-in processor [`custom.javascript`](https://conduitdata.io/docs/using/processors/builtin/custom.javascript)
+to write custom processors in JavaScript.
+
+More detailed information as well as examples can be found in
+the [Processors documentation](https://conduitdata.io/docs/using/processors/getting-started).
+
+### Processor host egress
+
+Standalone (WASM) processors can reach the network — for example to call an
+embedding provider — through a host-provided HTTP capability. This is a
+security boundary, so it is **closed by default** and opens in two independent
+tiers (a processor gets egress only where both agree):
+
+1. **Per-processor opt-in (pipeline config).** The pipeline author enables
+   egress for a specific processor with a `sdk.egress.allow` allowlist in that
+   processor's config.
+2. **Engine-level ceiling (instance config, `processors.egress.*`).** The
+   operator running the instance sets an outer bound no pipeline can exceed. The
+   effective allowlist is the **intersection** of the two; entries a pipeline
+   requests that the ceiling does not permit are dropped with a startup warning,
+   never silently honored.
+
+The engine ceiling defaults to **deny-all** — on a stock instance a processor
+requesting egress gets nothing until an operator affirmatively sets
+`processors.egress.enabled: true`. The allowlist is the opt-in; the real SSRF
+guarantee is the dial-time resolved-IP gate (a matched hostname that resolves to
+a private/link-local/hostile address is still refused at connect time), not this
+coarse host pre-filter.
+
+Engine-level configuration options (CLI flag / env var / `conduit.yaml`):
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `processors.egress.enabled` | `false` | Open the ceiling. `false` = deny-all; no pipeline opt-in can override it. |
+| `processors.egress.allow` | _(empty)_ | Allowlist of `host[:port]` / `scheme://host[:port]` entries (repeatable). Empty **with `enabled: true`** means unrestricted (single-tenant convenience). |
+| `processors.egress.secret-refs` | _(empty)_ | Secret names a pipeline may reference for host-injected `Authorization` (repeatable). |
+| `processors.egress.timeout` | `0` (no cap) | Upper bound on the per-call egress timeout; a larger per-processor value is clamped down. |
+| `processors.egress.max-response-bytes` | `0` (no cap) | Upper bound on the buffered response body in bytes; a larger per-processor value is clamped down. |
+
+A malformed engine egress config (for example a wildcard or otherwise invalid
+allowlist entry) fails startup with an actionable error — egress is never
+silently disabled. Example scoping an instance to two embedding providers:
+
+```yaml
+processors:
+  egress:
+    enabled: true
+    allow:
+      - api.openai.com
+      - https://api.voyageai.com:443
+    secret-refs:
+      - openai_api_key
+    max-response-bytes: 4194304 # 4 MiB
+```
+
+See the
+[host-egress design document](docs/design-documents/20260726-wasm-host-egress-capability.md)
+for the full threat model and the two-tier resolution semantics.
+
+## API
+
+Conduit exposes a gRPC API and an HTTP API.
+
+By default both APIs listen on `127.0.0.1` only. Binding either to a non-loopback
+address (for example `:8080`) requires an API token: set `api.token-file`
+(`CONDUIT_API_TOKEN_FILE`) or `CONDUIT_API_TOKEN`, otherwise Conduit refuses to
+start. When a token is set, HTTP, gRPC (including reflection), `/metrics` and
+the inspector WebSocket require `Authorization: Bearer <token>`, on loopback too.
+The CLI reads the same token from `--api.token-file`, `CONDUIT_API_TOKEN_FILE`
+or `CONDUIT_API_TOKEN`. Browser requests from another origin, requests with a
+non-JSON body and requests with an unexpected `Host` are refused. See
+[API hardening](docs/operations/api-hardening.md) for the full list and the
+runbook for each refusal.
+
+The gRPC API is by default running on port 8084. You can define a custom address
+using the CLI flag `-api.grpc.address`. To learn more about the gRPC API please have
+a look at
+the [protobuf file](https://github.com/ConduitIO/conduit/blob/main/proto/api/v1/api.proto).
+
+The HTTP API is by default running on port 8080. You can define a custom address
+using the CLI flag `-api.http.address`. It is generated
+using [gRPC gateway](https://github.com/grpc-ecosystem/grpc-gateway) and is thus
+providing the same functionality as the gRPC API. To learn more about the HTTP
+API please have a look at the [API documentation](https://conduitdata.io/api),
+[OpenAPI definition](https://github.com/ConduitIO/conduit/blob/main/pkg/http/openapi/swagger-ui/api/v1/api.swagger.json)
+or run Conduit and navigate to `http://localhost:8080/openapi` to open
+a [Swagger UI](https://github.com/swagger-api/swagger-ui) which makes it easy to
+try it out.
+
+## Embed Conduit in your Go app
+
+You can run a full Conduit engine in-process, inside your own Go application, and
+drive its lifecycle with ordinary function calls — no subprocess, no socket. The
+engine that powers the CLI is the one you embed.
+
+Embedding requires Go 1.26 or newer.
+
+```sh
+go get github.com/conduitio/conduit
+```
+
+Until [dop251/goja#816](https://github.com/dop251/goja/pull/816) is merged and released, add this
+to your own `go.mod`. A `replace` in Conduit's `go.mod` does not apply to programs that import it,
+and without the patch a script that stores a `Map` or `Set` inside itself crashes the process
+(see the [runbook](docs/operations/js-processor-output.md)):
+
+```text
+replace github.com/dop251/goja => github.com/ConduitIO/goja v0.0.0-20261020160110-aed438ab3fe6
+```
+
+```go
+e, _ := conduit.New(ctx, conduit.Options{DB: conduit.DBOptions{Type: "badger"}})
+h, _ := e.Run(ctx)
+defer h.Stop(ctx)
+
+_ = e.ImportPipeline(ctx, conduit.NewPipeline("hello").
+    WithConnector(conduit.NewSourceConnector("src", "builtin:generator")).
+    WithConnector(conduit.NewDestinationConnector("dst", "builtin:log")))
+_ = e.StartPipeline(ctx, "hello")
+```
+
+The exported API (`Options`, `Engine`, `Handle`, `New`, and the pipelines-in-code
+builder) is a semver-committed, frozen import path. See the
+[Embedding Conduit (Go) guide](https://conduitdata.io/docs/developing/embedding-go)
+for the full lifecycle, options (logger/metrics injection, storage), deployment and
+state considerations, and known limitations. Non-Go bindings (Python, Node) are
+planned as gRPC client libraries — see the [roadmap](ROADMAP.md).
+
+## Exit codes
+
+Every `conduit` CLI invocation — one-shot commands (`conduit pipelines list`, ...) and the
+long-running `conduit run` — exits with one of a small set of deterministic codes, so scripts and
+agents can branch on failure kind without parsing error text:
+
+| Code  | Meaning       | Examples                                                                     |
+| ----- | ------------- | ----------------------------------------------------------------------------- |
+| `0`   | Success       | The command succeeded, or `conduit run` shut down gracefully on a single SIGINT/SIGTERM. |
+| `1`   | Runtime error | An internal or unclassified error (a bug, an unexpected failure).           |
+| `2`   | Validation    | The request or config was rejected: invalid argument, not found, already exists, failed precondition. |
+| `3`   | Environment   | A required external dependency is unreachable: the server, the database, a rate limit, or an already-bound listen address. |
+
+`conduit run` treats a **second** SIGINT/SIGTERM (received after the first one has already started
+a graceful shutdown) as a forced kill and exits with the POSIX `128+signum` convention instead
+(`SIGINT` → `130`, `SIGTERM` → `143`) — the same value a shell reports for a process killed by that
+signal, so a forced kill is distinguishable from an ordinary classified exit code.
+
+A multi-result command like `conduit doctor` (many checks, one process) reduces its checks to a
+single exit code by taking the **worst** bucket across every failing check — a database that can't
+be reached (environment, `3`) always outranks an invalid config field (validation, `2`) in the
+final exit code, regardless of which check ran first. Warnings never affect the exit code.
+
+See [ADR: deterministic CLI exit codes](docs/architecture-decision-records/20260706-deterministic-cli-exit-codes.md)
+for the full mapping and rationale, `pkg/conduit/exitcode` for the implementation, and
+`pkg/conduit/check` for the multi-result aggregation `doctor` (and future multi-check commands)
+share.
+
+## Validating pipeline configs
+
+`conduit pipelines validate <path>` (alias: `conduit pipeline validate`) statically checks one
+pipeline config file, or every `.yml`/`.yaml` file in a directory (not recursed), without starting
+Conduit or contacting a running instance — it's fully offline, so it's safe to run in CI or before
+`conduit run` with no server anywhere nearby.
+
+```console
+$ conduit pipelines validate pipelines/orders.yaml
+✗ pipelines/orders.yaml
+✗ config.field_required   /connectors/0/plugin
+    connector "orders:postgres": "plugin" is mandatory
+    → set connectors[0].plugin (e.g. "builtin:postgres")
+
+Summary: 1 files · 0 passed · 1 failed · 1 problems
+Fix the ✗ items above, then re-run.
+```
+
+(the connector's ID is shown enriched — `<pipelineID>:<connectorID>` — since validation runs after the same
+default-enrichment step `conduit run` applies; `--json`'s `configPath` still points at your original
+`connectors[0]`.)
+
+Every problem in every file is reported — a bad file never stops the rest from being checked.
+Exits `0` if every pipeline is valid, `2` otherwise (see Exit codes above). Add `--json` for the
+structured `{command, ok, summary, result, error}` envelope, or `-q/--quiet` to suppress passing
+(`✓`) lines and show only failures and the summary.
+
+`lint` (advisory warnings, e.g. deprecated fields) and `dry-run` (shows the enriched pipeline graph
+and optionally resolves builtin plugin references) share the same engine and are planned as
+follow-ups — see
+[the design doc](docs/design-documents/20260707-cli-pipeline-validate.md).
+
+## Documentation
+
+To learn more about how to use Conduit
+visit [Conduit.io/docs](https://conduitdata.io/docs).
+
+If you are interested in internals of Conduit we have prepared some technical
+documentation:
+
+- [Pipeline Semantics](https://conduitdata.io/docs/core-concepts/pipeline-semantics) explains the internals of how
+  a Conduit pipeline works.
+- [Pipeline Configuration Files](https://conduitdata.io/docs/using/pipelines/configuration-file)
+  explains how you can define pipelines using YAML files.
+- [Processors](https://conduitdata.io/docs/using/processors/getting-started) contains examples and more information about
+  Conduit processors.
+- [Conduit Architecture](https://conduitdata.io/docs/core-concepts/architecture)
+  will give you a high-level overview of Conduit.
+- [Conduit Metrics](docs/metrics.md)
+  provides more information about how Conduit exposes metrics.
+- [Conduit Package structure](docs/package_structure.md)
+  provides more information about the different packages in Conduit.
+
+### llms.txt
+
+[`llms.txt`](llms.txt) and [`llms-full.txt`](llms-full.txt) at the repo root are a
+machine-readable index for agents and LLM tools, generated straight from the pipeline config
+schema, the built-in connector registry, the stable error-code registry, and the `conduit mcp`
+tool catalog — see [`cmd/conduit/internal/llmsgen`](cmd/conduit/internal/llmsgen). They are
+never hand-edited: `make generate` regenerates both, and CI fails the build if the committed
+files drift from source.
+
+## Contributing
+
+For a complete guide to contributing to Conduit, see
+the [contribution guide](https://github.com/ConduitIO/conduit/blob/main/CONTRIBUTING.md).
+
+We welcome you to join the community and contribute to Conduit to make it
+better! When something does not work as intended please check if there is
+already an [issue](https://github.com/ConduitIO/conduit/issues) that describes
+your problem, otherwise
+please [open an issue](https://github.com/ConduitIO/conduit/issues/new/choose)
+and let us know. When you are not sure how to do something
+please [open a discussion](https://github.com/ConduitIO/conduit/discussions).
+
+We also value contributions in the form of pull requests. When opening a PR please
+ensure:
+
+- You have followed
+  the [Code Guidelines](https://github.com/ConduitIO/conduit/blob/main/docs/code_guidelines.md).
+- There is no other [pull request](https://github.com/ConduitIO/conduit/pulls)
+  for the same update/change.
+- You have written unit tests.
+- You have made sure that the PR is of reasonable size and can be easily
+  reviewed.

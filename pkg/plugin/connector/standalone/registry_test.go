@@ -1,0 +1,199 @@
+// Copyright © 2022 Meroxa, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package standalone
+
+import (
+	"context"
+	"fmt"
+	"path"
+	"path/filepath"
+	"regexp"
+	"testing"
+
+	"github.com/conduitio/conduit-commons/config"
+	"github.com/conduitio/conduit-connector-protocol/pconnector"
+	"github.com/conduitio/conduit-connector-protocol/pconnector/server"
+	"github.com/conduitio/conduit/pkg/foundation/cerrors/conduiterr"
+	"github.com/conduitio/conduit/pkg/foundation/log"
+	"github.com/conduitio/conduit/pkg/plugin"
+	"github.com/conduitio/conduit/pkg/plugin/connector"
+	"github.com/matryer/is"
+)
+
+// These constants need to match the constants in pkg/plugin/connector/standalone/test/testplugin/main.go
+const (
+	testPluginDir = "./test"
+
+	testPluginName        = "test-plugin"
+	testPluginSummary     = "My test plugin summary"
+	testPluginDescription = "My test plugin description"
+	testPluginVersion     = "v0.1.0"
+	testPluginAuthor      = "test"
+
+	testPluginSourceParam1            = "src.foo"
+	testPluginSourceParam1Default     = ""
+	testPluginSourceParam1Description = "Required parameter"
+	testPluginSourceParam2            = "src.bar"
+	testPluginSourceParam2Default     = "bar"
+	testPluginSourceParam2Description = "Optional parameter"
+
+	testPluginDestinationParam1            = "dest.foo"
+	testPluginDestinationParam1Default     = ""
+	testPluginDestinationParam1Description = "Required parameter"
+	testPluginDestinationParam2            = "dest.bar"
+	testPluginDestinationParam2Default     = "bar"
+	testPluginDestinationParam2Description = "Optional parameter"
+)
+
+func testPluginBlueprint() blueprint {
+	pluginPath, err := filepath.Abs(path.Join(testPluginDir, "testplugin.sh"))
+	if err != nil {
+		panic(err)
+	}
+
+	return blueprint{
+		FullName: plugin.FullName(fmt.Sprintf("standalone:%v@%v", testPluginName, testPluginVersion)),
+		Path:     pluginPath,
+		Specification: pconnector.Specification{
+			Name:        testPluginName,
+			Summary:     testPluginSummary,
+			Description: testPluginDescription,
+			Version:     testPluginVersion,
+			Author:      testPluginAuthor,
+			SourceParams: map[string]config.Parameter{
+				testPluginSourceParam1: {
+					Default:     testPluginSourceParam1Default,
+					Type:        0, // no type
+					Description: testPluginSourceParam1Description,
+					Validations: []config.Validation{
+						config.ValidationRequired{},
+						config.ValidationInclusion{List: []string{"one", "two"}},
+					},
+				},
+				testPluginSourceParam2: {
+					Default:     testPluginSourceParam2Default,
+					Type:        config.ParameterTypeInt,
+					Description: testPluginSourceParam2Description,
+					Validations: []config.Validation{
+						config.ValidationExclusion{List: []string{"3", "4"}},
+						config.ValidationGreaterThan{V: 1},
+					},
+				},
+			},
+			DestinationParams: map[string]config.Parameter{
+				testPluginDestinationParam1: {
+					Default:     testPluginDestinationParam1Default,
+					Type:        config.ParameterTypeInt,
+					Description: testPluginDestinationParam1Description,
+					Validations: []config.Validation{
+						config.ValidationLessThan{V: 10},
+						config.ValidationRegex{Regex: regexp.MustCompile("[1-9]")},
+					},
+				},
+				testPluginDestinationParam2: {
+					Default:     testPluginDestinationParam2Default,
+					Type:        config.ParameterTypeDuration,
+					Description: testPluginDestinationParam2Description,
+					Validations: nil,
+				},
+			},
+		},
+	}
+}
+
+func TestRegistry_loadPlugins(t *testing.T) {
+	is := is.New(t)
+	ctx := context.Background()
+
+	r := NewRegistry(log.Test(t), testPluginDir)
+	got := r.loadPlugins(ctx)
+	want := map[string]map[string]blueprint{
+		testPluginName: {
+			testPluginVersion:          testPluginBlueprint(),
+			plugin.PluginVersionLatest: testPluginBlueprint(),
+		},
+	}
+
+	is.Equal(len(got), 1)
+	is.Equal(got, want)
+}
+
+func TestRegistry_List(t *testing.T) {
+	is := is.New(t)
+	ctx := context.Background()
+
+	r := NewRegistry(log.Nop(), testPluginDir)
+	r.Init(ctx, ":12345", server.DefaultMaxReceiveRecordSize)
+
+	got := r.List()
+	bp := testPluginBlueprint()
+	want := map[plugin.FullName]pconnector.Specification{
+		bp.FullName: bp.Specification,
+	}
+	is.Equal(got, want)
+}
+
+// When connectors.egress.allow is set, every standalone connector is refused at
+// dispatch: a standalone plugin is a separate process that never receives the
+// engine's dialer, so the allowlist cannot bind it, and starting it would run
+// an unconstrained process (fail closed).
+func TestRegistry_NewDispenser_RefusedWhenEgressRestricted(t *testing.T) {
+	is := is.New(t)
+
+	r := NewRegistry(log.Nop(), "", WithEgressRestricted(true))
+	_, err := r.NewDispenser(log.Nop(), plugin.FullName("standalone:mysql:latest"), pconnector.PluginConfig{})
+
+	ce, ok := conduiterr.Get(err)
+	is.True(ok)
+	is.Equal(ce.Code, CodeStandaloneNotAllowlisted)
+	is.Equal(ce.ConfigPath, "connectors.egress.allow")
+	is.True(ce.Suggestion != "")
+}
+
+// Without the allowlist the registry behaves as before: an unloaded plugin is
+// reported as not found, not as an egress refusal.
+func TestRegistry_NewDispenser_NotRefusedWhenEgressUnrestricted(t *testing.T) {
+	is := is.New(t)
+
+	r := NewRegistry(log.Nop(), "", WithEgressRestricted(false))
+	_, err := r.NewDispenser(log.Nop(), plugin.FullName("standalone:mysql:latest"), pconnector.PluginConfig{})
+
+	ce, ok := conduiterr.Get(err)
+	is.True(ok)
+	is.Equal(ce.Code, conduiterr.CodeConnectorPluginNotFound)
+}
+
+// TestRegistry_NewDispenser_CarriesSpecification (#3321): the dispenser carries
+// the specification loaded from the plugin binary at registration, for the
+// version the name resolved to, and reading it starts no plugin process.
+func TestRegistry_NewDispenser_CarriesSpecification(t *testing.T) {
+	is := is.New(t)
+	ctx := context.Background()
+
+	r := NewRegistry(log.Nop(), testPluginDir)
+	r.Init(ctx, ":12345", server.DefaultMaxReceiveRecordSize)
+
+	for _, name := range []string{
+		"standalone:" + testPluginName,
+		"standalone:" + testPluginName + "@" + testPluginVersion,
+	} {
+		d, err := r.NewDispenser(log.Nop(), plugin.FullName(name), pconnector.PluginConfig{})
+		is.NoErr(err)
+		spec, ok := connector.DispenserSpecification(d)
+		is.True(ok)
+		is.Equal(spec, testPluginBlueprint().Specification)
+		is.True(!d.(*Dispenser).dispensed) // nothing was started to read it
+	}
+}

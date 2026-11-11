@@ -1,0 +1,519 @@
+// Copyright © 2023 Meroxa, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package config
+
+import (
+	"strings"
+	"testing"
+
+	"github.com/conduitio/conduit/pkg/connector"
+	"github.com/conduitio/conduit/pkg/foundation/cerrors"
+	"github.com/conduitio/conduit/pkg/foundation/cerrors/conduiterr"
+	"github.com/conduitio/conduit/pkg/pipeline"
+	"github.com/matryer/is"
+)
+
+// TestValidate_ConfigPathAndCode proves each validation error carries a
+// machine-actionable code and a JSON-pointer to the offending field — the "failing
+// config path" an agent or UI needs to point a user at exactly what to fix.
+func TestValidate_ConfigPathAndCode(t *testing.T) {
+	testCases := []struct {
+		name     string
+		cfg      Pipeline
+		wantPath string
+		wantCode conduiterr.Code
+	}{
+		{
+			name:     "missing pipeline id",
+			cfg:      Pipeline{Status: StatusRunning},
+			wantPath: "/id",
+			wantCode: CodeFieldRequired,
+		},
+		{
+			name:     "invalid status",
+			cfg:      Pipeline{ID: "pipeline1", Status: "bogus"},
+			wantPath: "/status",
+			wantCode: CodeFieldInvalid,
+		},
+		{
+			name:     "connector missing plugin",
+			cfg:      Pipeline{ID: "pipeline1", Status: StatusRunning, Connectors: []Connector{{ID: "con1", Type: TypeSource}}},
+			wantPath: "/connectors/0/plugin",
+			wantCode: CodeFieldRequired,
+		},
+		{
+			name: "nested processor missing id",
+			cfg: Pipeline{ID: "pipeline1", Status: StatusRunning, Connectors: []Connector{
+				{ID: "con1", Plugin: "builtin:file", Type: TypeSource, Processors: []Processor{{Plugin: "field.set"}}},
+			}},
+			wantPath: "/connectors/0/processors/0/id",
+			wantCode: CodeFieldRequired,
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			is := is.New(t)
+			err := Validate(tc.cfg)
+			is.True(err != nil)
+
+			ce, ok := conduiterr.Get(err)
+			is.True(ok) // carries a ConduitError
+			is.Equal(ce.Code.Reason(), tc.wantCode.Reason())
+			is.Equal(ce.ConfigPath, tc.wantPath)
+			is.True(ce.Suggestion != "") // every validation error carries a remediation hint
+		})
+	}
+}
+
+// TestValidate_ConnectorMissingPlugin_SuggestionMatchesDesignExample locks in
+// the exact suggestion wording from
+// docs/design-documents/20260707-cli-pipeline-validate.md's FAIL output
+// example, so `pipelines validate`'s rendered output stays in sync with the
+// design doc it was reviewed against.
+func TestValidate_ConnectorMissingPlugin_SuggestionMatchesDesignExample(t *testing.T) {
+	is := is.New(t)
+	cfg := Pipeline{ID: "pipeline1", Status: StatusRunning, Connectors: []Connector{{ID: "pg-source", Type: TypeSource}}}
+
+	err := Validate(cfg)
+	is.True(err != nil)
+
+	ce, ok := conduiterr.Get(err)
+	is.True(ok)
+	is.Equal(ce.Suggestion, `set connectors[0].plugin (e.g. "builtin:postgres")`)
+}
+
+func TestValidator_MandatoryFields(t *testing.T) {
+	tests := []struct {
+		name   string
+		config Pipeline
+	}{{
+		name: "pipeline ID is mandatory",
+		config: Pipeline{
+			// mandatory field
+			ID:          "",
+			Status:      "stopped",
+			Name:        "pipeline1",
+			Description: "desc1",
+		},
+	}, {
+		name: "processor type is mandatory",
+		config: Pipeline{
+			ID:          "pipeline1",
+			Status:      "stopped",
+			Name:        "pipeline1",
+			Description: "desc1",
+			Processors: []Processor{{
+				ID: "pipeline1proc1",
+				// mandatory field
+				Plugin: "",
+				Settings: map[string]string{
+					"additionalProp1": "string",
+					"additionalProp2": "string",
+				},
+			}},
+		},
+	}, {
+		name: "connector plugin is mandatory",
+		config: Pipeline{
+			ID:          "pipeline1",
+			Status:      "running",
+			Name:        "pipeline1",
+			Description: "desc1",
+			Connectors: []Connector{{
+				ID:   "con1",
+				Type: "source",
+				// mandatory field
+				Plugin: "",
+				Name:   "",
+				Settings: map[string]string{
+					"aws.region": "us-east-1",
+					"aws.bucket": "my-bucket",
+				},
+			}},
+		},
+	}, {
+		name: "connector type is mandatory",
+		config: Pipeline{
+			ID:          "pipeline1",
+			Status:      "running",
+			Name:        "pipeline1",
+			Description: "desc1",
+			Connectors: []Connector{{
+				ID: "con1",
+				// mandatory field
+				Type:   "",
+				Plugin: "builtin:s3",
+				Name:   "",
+				Settings: map[string]string{
+					"aws.region": "us-east-1",
+					"aws.bucket": "my-bucket",
+				},
+			}},
+		},
+	}}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			is := is.New(t)
+
+			err := Validate(tt.config)
+			is.True(err != nil)
+			is.True(cerrors.Is(err, ErrMandatoryField))
+		})
+	}
+}
+
+func TestValidator_InvalidFields(t *testing.T) {
+	tests := []struct {
+		name    string
+		config  Pipeline
+		wantErr error
+	}{{
+		name: "connector type is invalid",
+		config: Pipeline{
+			ID:          "pipeline1",
+			Status:      "running",
+			Name:        "pipeline1",
+			Description: "desc1",
+			Connectors: []Connector{{
+				ID: "con1",
+				// invalid field
+				Type:   "my-type",
+				Plugin: "builtin:s3",
+				Name:   "",
+				Settings: map[string]string{
+					"aws.region": "us-east-1",
+					"aws.bucket": "my-bucket",
+				},
+			}},
+		},
+		wantErr: ErrInvalidField,
+	}, {
+		name: "connector id is too long",
+		config: Pipeline{
+			ID:          "pipeline1",
+			Status:      "running",
+			Name:        "pipeline1",
+			Description: "desc1",
+			Connectors: []Connector{{
+				ID:     strings.Repeat("x", 257),
+				Type:   "source",
+				Plugin: "builtin:s3",
+				Name:   "",
+			}},
+		},
+		wantErr: connector.ErrIDOverLimit,
+	}, {
+		name: "connector name is too long",
+		config: Pipeline{
+			ID:          "pipeline1",
+			Status:      "running",
+			Name:        "pipeline1",
+			Description: "desc1",
+			Connectors: []Connector{{
+				ID:     "x",
+				Name:   strings.Repeat("x", 257),
+				Type:   "source",
+				Plugin: "builtin:s3",
+			}},
+		},
+		wantErr: connector.ErrNameOverLimit,
+	}, {
+		name: "pipeline id is too long",
+		config: Pipeline{
+			ID:          strings.Repeat("x", 257),
+			Status:      "running",
+			Name:        "pipeline1",
+			Description: "desc1",
+			Connectors:  []Connector{},
+		},
+		wantErr: pipeline.ErrIDOverLimit,
+	}, {
+		name: "pipeline name is too long",
+		config: Pipeline{
+			ID:          "pipeline1",
+			Name:        strings.Repeat("x", 257),
+			Status:      "running",
+			Description: "desc1",
+			Connectors:  []Connector{},
+		},
+		wantErr: pipeline.ErrNameOverLimit,
+	}, {
+		name: "pipeline desc is too long",
+		config: Pipeline{
+			ID:          "pipeline1",
+			Name:        "pipeline1",
+			Status:      "running",
+			Description: strings.Repeat("x", 9000),
+			Connectors:  []Connector{},
+		},
+		wantErr: pipeline.ErrDescriptionOverLimit,
+	}, {
+		name: "pipeline status is invalid",
+		config: Pipeline{
+			ID: "pipeline1",
+			// invalid field
+			Status:      "invalid-status",
+			Name:        "pipeline1",
+			Description: "desc1",
+			Connectors: []Connector{{
+				ID:     "con1",
+				Type:   "source",
+				Plugin: "builtin:s3",
+				Name:   "",
+				Settings: map[string]string{
+					"aws.region": "us-east-1",
+					"aws.bucket": "my-bucket",
+				},
+			}},
+		},
+		wantErr: ErrInvalidField,
+	}, {
+		name: "processor workers is negative",
+		config: Pipeline{
+			ID:          "pipeline1",
+			Status:      "running",
+			Name:        "pipeline1",
+			Description: "desc1",
+			Processors: []Processor{{
+				ID:       "proc1",
+				Plugin:   "js",
+				Settings: map[string]string{},
+				// invalid field
+				Workers: -1,
+			}},
+		},
+		wantErr: ErrInvalidField,
+	}}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			is := is.New(t)
+
+			err := Validate(tt.config)
+			is.True(err != nil)
+			is.True(cerrors.Is(err, tt.wantErr))
+		})
+	}
+}
+
+func TestValidator_MultiErrors(t *testing.T) {
+	is := is.New(t)
+
+	before := Pipeline{
+		ID:          "pipeline1",
+		Status:      "running",
+		Name:        "pipeline1",
+		Description: "desc1",
+		Connectors: []Connector{{
+			ID: "con1",
+			// invalid field #1
+			Type: "my-type",
+			// mandatory field #1
+			Plugin: "",
+			Name:   "",
+			Settings: map[string]string{
+				"aws.region": "us-east-1",
+				"aws.bucket": "my-bucket",
+			},
+			Processors: []Processor{{
+				ID: "pipeline1proc1",
+				// mandatory field #2
+				Plugin: "",
+				Settings: map[string]string{
+					"additionalProp1": "string",
+					"additionalProp2": "string",
+				},
+			}},
+		}},
+		Processors: []Processor{{
+			ID: "pipeline1proc1",
+			// mandatory field #3
+			Plugin: "",
+			Settings: map[string]string{
+				"additionalProp1": "string",
+				"additionalProp2": "string",
+			},
+		}},
+	}
+
+	err := Validate(before)
+
+	var invalid, mandatory, all int
+	cerrors.ForEach(err, func(err error) {
+		all++
+		if cerrors.Is(err, ErrInvalidField) {
+			invalid++
+		}
+		if cerrors.Is(err, ErrMandatoryField) {
+			mandatory++
+		}
+	})
+	is.Equal(all, 4)
+	is.Equal(invalid, 1)
+	is.Equal(mandatory, 3)
+}
+
+func TestValidator_DuplicateID(t *testing.T) {
+	is := is.New(t)
+
+	test := Pipeline{
+		ID:          "pipeline1",
+		Status:      "running",
+		Name:        "pipeline1",
+		Description: "desc1",
+		Connectors: []Connector{
+			{
+				ID:     "con1",
+				Type:   "source",
+				Plugin: "builtin:s3",
+				Name:   "",
+				Settings: map[string]string{
+					"aws.region": "us-east-1",
+					"aws.bucket": "my-bucket",
+				},
+				Processors: []Processor{
+					{
+						ID:     "pipeline1proc1",
+						Plugin: "js",
+						Settings: map[string]string{
+							"additionalProp1": "string",
+							"additionalProp2": "string",
+						},
+					},
+				},
+			},
+			{
+				ID:     "con1",
+				Type:   "destination",
+				Plugin: "builtin:s3",
+				Name:   "",
+				Settings: map[string]string{
+					"aws.region": "us-east-1",
+					"aws.bucket": "my-bucket",
+				},
+				Processors: []Processor{
+					{
+						ID:     "pipeline1proc1",
+						Plugin: "js",
+						Settings: map[string]string{
+							"additionalProp1": "string",
+							"additionalProp2": "string",
+						},
+					},
+				},
+			},
+		},
+		Processors: []Processor{
+			{
+				ID:     "pipeline1proc1",
+				Plugin: "js",
+				Settings: map[string]string{
+					"additionalProp1": "string",
+					"additionalProp2": "string",
+				},
+			},
+		},
+	}
+
+	err := Validate(test)
+	is.True(err != nil)
+	is.True(cerrors.Is(err, ErrDuplicateID))
+}
+
+// TestValidate_RepairFixes_GoldenPerClass is AC-1 for the repair v1 starter
+// set's producers that live in this package (design doc
+// 20260712-repair-command.md §6, items #2-#4 — item #1 is the yaml
+// package's linter, tested there): for each error class, the producing
+// site emits a non-nil Fix with a correct ConfigPath, a valid Op, and a
+// Value that, applied, clears the finding.
+func TestValidate_RepairFixes_GoldenPerClass(t *testing.T) {
+	is := is.New(t)
+
+	t.Run("status: unambiguous normalization gets a fix", func(t *testing.T) {
+		cfg := Pipeline{ID: "p1", Status: " Running "}
+		err := Validate(cfg)
+		ce, ok := conduiterr.Get(err)
+		is.True(ok)
+		is.True(ce.Fix != nil)
+		is.Equal(ce.Fix.ConfigPath, "/status")
+		is.Equal(ce.Fix.Op, "set")
+		is.Equal(ce.Fix.Value, "running")
+
+		// Applying it clears the finding.
+		fixed := cfg
+		fixed.Status = ce.Fix.Value
+		is.True(Validate(fixed) == nil || !cerrors.Is(Validate(fixed), ErrInvalidField))
+	})
+
+	t.Run("status: ambiguous value gets no fix", func(t *testing.T) {
+		cfg := Pipeline{ID: "p1", Status: "bogus"}
+		err := Validate(cfg)
+		ce, ok := conduiterr.Get(err)
+		is.True(ok)
+		is.True(ce.Fix == nil) // no deterministic canonical target — honestly no fix
+	})
+
+	t.Run("processor workers: negative gets a fix to 1", func(t *testing.T) {
+		cfg := Pipeline{ID: "p1", Status: StatusRunning, Processors: []Processor{
+			{ID: "proc1", Plugin: "js", Workers: -5},
+		}}
+		err := Validate(cfg)
+		ce, ok := conduiterr.Get(err)
+		is.True(ok)
+		is.True(ce.Fix != nil)
+		is.Equal(ce.Fix.ConfigPath, "/processors/0/workers")
+		is.Equal(ce.Fix.Op, "set")
+		is.Equal(ce.Fix.Value, "1")
+
+		fixed := cfg
+		fixed.Processors[0].Workers = 1
+		is.True(!cerrors.Is(Validate(fixed), ErrInvalidField))
+	})
+
+	t.Run("description: over-long gets a truncation fix", func(t *testing.T) {
+		long := strings.Repeat("d", pipeline.DescriptionLengthLimit+50)
+		cfg := Pipeline{ID: "p1", Status: StatusRunning, Description: long}
+		err := Validate(cfg)
+		ce, ok := conduiterr.Get(err)
+		is.True(ok)
+		is.True(ce.Fix != nil)
+		is.Equal(ce.Fix.ConfigPath, "/description")
+		is.Equal(ce.Fix.Op, "set")
+		is.Equal(len(ce.Fix.Value), pipeline.DescriptionLengthLimit)
+		is.Equal(ce.Fix.Value, long[:pipeline.DescriptionLengthLimit])
+
+		fixed := cfg
+		fixed.Description = ce.Fix.Value
+		is.True(len(fixed.Description) <= pipeline.DescriptionLengthLimit)
+	})
+}
+
+// TestValidate_RepairFixes_SurviveGRPCStatusRoundTrip is AC-2: a real
+// producer's Fix survives ConduitError -> gRPC status.Status -> ConduitError
+// intact — extending conduiterr's own TestRoundTrip_AllFields (which uses a
+// synthetic Fix) to an actual producer in this codebase.
+func TestValidate_RepairFixes_SurviveGRPCStatusRoundTrip(t *testing.T) {
+	is := is.New(t)
+
+	cfg := Pipeline{ID: "p1", Status: " Running "}
+	err := Validate(cfg)
+	orig, ok := conduiterr.Get(err)
+	is.True(ok)
+	is.True(orig.Fix != nil)
+
+	got := conduiterr.FromStatus(conduiterr.ToStatus(orig))
+	is.Equal(got.Fix, orig.Fix)
+	is.Equal(got.Code.Reason(), orig.Code.Reason())
+	is.Equal(got.ConfigPath, orig.ConfigPath)
+}

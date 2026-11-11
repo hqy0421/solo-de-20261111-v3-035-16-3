@@ -1,0 +1,35 @@
+# This is a fixture used in tests. The Go objects, expected to be created by
+# this configuration file, can be found in the same folder.
+version: 2.0
+pipelines:
+  - id: pipeline1
+    status: running
+    name: name1
+    description: desc1
+    connectors:
+      - id: con1
+        type: source
+        plugin: builtin:file
+        name: source
+        settings:
+          path: my/path/file1.txt
+      - id: con2
+        type: destination
+        plugin: builtin:file
+        name: dest
+        settings:
+          path: my/path/file2.txt
+        processors:
+          - id: proc1con
+            plugin: js
+            workers: 10
+            settings:
+              additionalProp1: string
+    processors:
+      - id: proc1
+        plugin: js
+        settings:
+          additionalProp1: string
+    dead-letter-queue:
+      window-size: 20
+      window-nack-threshold: 10

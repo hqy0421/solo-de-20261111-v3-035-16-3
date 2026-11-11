@@ -1,0 +1,881 @@
+// Copyright © 2022 Meroxa, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package conduit
+
+import (
+	"fmt"
+	"net"
+	"net/url"
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
+	"time"
+
+	"github.com/conduitio/conduit-commons/database"
+	"github.com/conduitio/conduit-connector-protocol/pconnector/server"
+	sdk "github.com/conduitio/conduit-connector-sdk"
+	"github.com/conduitio/conduit/pkg/foundation/cerrors"
+	"github.com/conduitio/conduit/pkg/foundation/cerrors/conduiterr"
+	"github.com/conduitio/conduit/pkg/foundation/log"
+	"github.com/conduitio/conduit/pkg/http/apisec"
+	"github.com/conduitio/conduit/pkg/lifecycle"
+	"github.com/conduitio/conduit/pkg/plugin/connector/builtin"
+	conn_standalone "github.com/conduitio/conduit/pkg/plugin/connector/standalone"
+	proc_builtin "github.com/conduitio/conduit/pkg/plugin/processor/builtin"
+	"github.com/conduitio/conduit/pkg/plugin/processor/egress"
+	"github.com/conduitio/conduit/pkg/registry/index"
+	"github.com/conduitio/conduit/pkg/schemaregistry"
+	"github.com/rs/zerolog"
+	"golang.org/x/exp/constraints"
+)
+
+// Default API bind addresses. Loopback, so a default install is not reachable
+// from the network; see validateAPIAccess.
+const (
+	defaultHTTPAddress = "127.0.0.1:8080"
+	defaultGRPCAddress = "127.0.0.1:8084"
+)
+
+const (
+	DBTypeBadger   = "badger"
+	DBTypePostgres = "postgres"
+	DBTypeInMemory = "inmemory"
+	DBTypeSQLite   = "sqlite"
+
+	SchemaRegistryTypeConfluent = "confluent"
+	SchemaRegistryTypeBuiltin   = "builtin"
+
+	SchemaRegistryAuthTypeBasic  = "basic"
+	SchemaRegistryAuthTypeBearer = "bearer"
+	SchemaRegistryAuthTypeNone   = "none"
+)
+
+// Config holds all configurable values for Conduit.
+type Config struct {
+	ConduitCfg struct {
+		Path string `long:"config.path" usage:"global conduit configuration file" default:"./conduit.yaml"`
+	} `mapstructure:"config"`
+
+	// Env is the operator's policy for ${VAR} references in connector and
+	// processor settings.
+	//
+	// SECURITY POSTURE: deny by default. Settings arrive over the API as well
+	// as from YAML, so expanding them against the whole process environment
+	// would hand every secret in the engine's environment to any API caller.
+	// Only the names listed here expand; any other reference is refused with
+	// config.env_var_not_allowed. The list is operator config (conduit.yaml, a
+	// flag or CONDUIT_ENV_ALLOW), never an API field. See
+	// docs/operations/env-allowlist.md.
+	Env struct {
+		Allow []string `long:"env.allow" mapstructure:"allow" usage:"environment variable names that ${VAR} references in connector and processor settings may expand (repeatable, exact names, default none)"`
+	}
+
+	// Secrets confines the TLS and credential files that connector settings name
+	// (for Postgres, the sslcert, sslkey, sslrootcert and sslcrl
+	// parameters of the connection string). Deny by default outside
+	// <data dir>/secrets and the system CA directories. Separate from
+	// connectors.file.allowed-dirs on purpose: certificate material lives where
+	// the data files do not (/etc/ssl, mounted secrets), and allowing those
+	// directories to the file connector would make them readable as data. See
+	// docs/operations/file-access.md.
+	Secrets struct {
+		AllowedDirs []string `long:"secrets.allowed-dirs" mapstructure:"allowed-dirs" usage:"directories connector settings may read TLS and credential files from (repeatable); replaces the default <data dir>/secrets; CA bundles (sslrootcert, sslcrl) may also come from the system CA directories"`
+	}
+
+	DB struct {
+		// When Driver is specified it takes precedence over other DB related
+		// fields.
+		Driver database.DB
+
+		Type   string `long:"db.type" usage:"database type; accepts badger,postgres,inmemory,sqlite"`
+		Badger struct {
+			Path string `long:"db.badger.path" usage:"path to badger DB"`
+		}
+		Postgres struct {
+			ConnectionString string `long:"db.postgres.connection-string" mapstructure:"connection-string" usage:"postgres connection string, may be a database URL or in PostgreSQL keyword/value format"`
+			Table            string `long:"db.postgres.table" usage:"postgres table in which to store data (will be created if it does not exist)"`
+		}
+		SQLite struct {
+			Path  string `long:"db.sqlite.path" usage:"path to sqlite3 DB"`
+			Table string `long:"db.sqlite.table" usage:"sqlite3 table in which to store data (will be created if it does not exist)"`
+		}
+	}
+
+	API struct {
+		Enabled bool `long:"api.enabled" usage:"enable HTTP and gRPC API"`
+		HTTP    struct {
+			// Address defaults to loopback. A non-loopback address requires an API
+			// token (api.token or api.token-file); Validate refuses otherwise.
+			Address string `long:"api.http.address" usage:"address for serving the HTTP API; defaults to loopback, a non-loopback address requires api.token or api.token-file"`
+			// AllowedHosts lists extra Host header names accepted on a loopback
+			// bind, on top of localhost, 127.0.0.1 and [::1]. It exists for
+			// setups that reach a loopback-bound Conduit through a local
+			// reverse proxy or tunnel under another name. Without it, any other
+			// Host is refused (DNS rebinding protection).
+			AllowedHosts []string `long:"api.http.allowed-hosts" mapstructure:"allowed-hosts" usage:"extra Host header names (no port) accepted on a loopback bind, besides localhost, 127.0.0.1 and [::1]; repeatable"`
+			// CORS.AllowedOrigins controls which browser origins may call the HTTP
+			// API and open the websocket-proxied streaming RPCs. Default: empty
+			// (deny all cross-origin — the same-origin embedded UI needs none).
+			// Entries are matched exactly (canonical scheme://host[:port], no
+			// trailing slash). "*" allows any origin, but — because the API is
+			// unauthenticated — it is REFUSED at startup on a non-loopback bind
+			// (that would be network-wide unauthenticated read/control); it is
+			// permitted only on a loopback bind for local development. A network
+			// deployment must list exact origins.
+			CORS struct {
+				AllowedOrigins []string `long:"api.http.cors.allowed-origins" mapstructure:"allowed-origins" usage:"allowed browser CORS origins for the HTTP API and websocket streams; repeatable; exact scheme://host[:port] (no trailing slash). '*' allows any origin but is refused on a non-loopback bind (unauthenticated network-wide access); use exact origins for network deployments"`
+			} `mapstructure:"cors"`
+			// UI gates the embedded built-in web UI (see
+			// docs/design-documents/20260713-greenfield-built-in-ui.md §7).
+			// The assets are always compiled into the binary via go:embed
+			// (pkg/web/ui) — this only gates whether the "/" route is
+			// registered, the same route-disable precedent
+			// pkg/http/openapi's swagger UI uses (embed unconditionally,
+			// gate the route). Disabling does not shrink the binary; it
+			// only removes the surface. Default: enabled. The SPA is
+			// mounted last, after every existing route (/v1/*, /openapi/*,
+			// /healthz, /readyz, /metrics), so it can never shadow them —
+			// see pkg/conduit/ui.go and its route-collision test.
+			UI struct {
+				Enabled bool `long:"api.http.ui.enabled" mapstructure:"enabled" usage:"serve the built-in web UI at '/' (observe + operate); the SPA is always embedded in the binary, this only gates the route — disabling removes the surface, not the binary size"`
+			} `mapstructure:"ui"`
+		}
+		GRPC struct {
+			// This is the address where the gRPC API will be served which is shared as a global flag
+			// for the Conduit CLI.
+			Address string `long:"api.grpc.address" usage:"address for serving the gRPC API; defaults to loopback, a non-loopback address requires api.token or api.token-file"`
+		}
+		// Token is the bearer token every HTTP, gRPC, inspector WebSocket and
+		// /metrics request must present. Prefer TokenFile or the
+		// CONDUIT_API_TOKEN environment variable: a flag value is visible in
+		// the process list. When a token is set it is enforced on loopback
+		// binds too.
+		Token string `long:"api.token" usage:"bearer token required by the HTTP and gRPC APIs; prefer api.token-file or the CONDUIT_API_TOKEN environment variable over this flag, which is visible in the process list" redact:"true"`
+		// TokenFile is the path of a file holding the bearer token.
+		TokenFile string `long:"api.token-file" mapstructure:"token-file" usage:"path to a file containing the bearer token required by the HTTP and gRPC APIs; also used by CLI commands that talk to the API (CONDUIT_API_TOKEN_FILE)"`
+		// AllowLiveRestartApply is the Tier-1 enforced data-path gate for the
+		// ApplyPipeline RPC (see
+		// docs/design-documents/20260708-live-server-deploy-apply.md, Item 6,
+		// and pkg/http/api.PipelineAPIv1.allowLiveRestartApply): when false
+		// (the default), ApplyPipeline refuses to apply a restart-class
+		// change to a currently-running pipeline, no matter who calls it or
+		// what they pass — see
+		// pkg/provisioning.CodeLiveApplyUnauthorized. This is a
+		// process-level operator flag, deliberately not settable via the API
+		// itself (there is no corresponding ApplyPipelineRequest field): an
+		// operator authorizes live restart-class applies by restarting
+		// Conduit with this flag set, not by anything an API caller/agent
+		// can pass in a request. See docs/operations/live-restart-apply.md.
+		AllowLiveRestartApply bool `long:"api.allow-live-restart-apply" mapstructure:"allow-live-restart-apply" usage:"allow ApplyPipeline to apply a restart-class change to a running pipeline (Tier-1 operator authorization; see docs/operations/live-restart-apply.md)"`
+	}
+
+	Log struct {
+		NewLogger func(level, format string) log.CtxLogger
+		Level     string `long:"log.level" usage:"sets logging level; accepts debug, info, warn, error, trace"`
+		Format    string `long:"log.format" usage:"sets the format of the logging; accepts json, cli"`
+	}
+
+	Connectors struct {
+		Path string `long:"connectors.path" usage:"path to standalone connectors' directory"`
+
+		// MaxReceiveRecordSize is the maximum size of a processed record in bytes. Default value is limited by the gRPC default server max receive message size.
+		MaxReceiveRecordSize int `long:"connectors.max-receive-record-size" mapstructure:"max-receive-record-size" usage:"maximum size of a processed record in bytes for standalone connectors"`
+
+		// File confines the built-in file connector (source and destination) to
+		// operator-configured directories. Deny by default outside the
+		// default directory under the Conduit data dir. See
+		// docs/operations/file-access.md.
+		File struct {
+			AllowedDirs []string `long:"connectors.file.allowed-dirs" mapstructure:"allowed-dirs" usage:"directories the file connector may read and write (repeatable); paths are resolved through symlinks first; replaces the default <data dir>/files"`
+
+			// defaultDir is <data dir>/files. Conduit creates it (0700) at
+			// startup while it is still in AllowedDirs, so the default works
+			// without setup. Unexported: a default, not an operator key.
+			defaultDir string
+		} `mapstructure:"file"`
+
+		// Egress is the operator's allowlist for where built-in connectors may
+		// connect (postgres url, kafka servers, s3 endpoint). Empty means no
+		// allowlist; cloud metadata endpoints are refused either way. API
+		// writers are trusted to choose connection targets; this narrows them
+		// to what the operator lists. See docs/operations/connector-egress.md.
+		Egress struct {
+			Allow []string `long:"connectors.egress.allow" mapstructure:"allow" usage:"when set, built-in connectors may only connect to these host:port, ip:port or cidr:port targets (repeatable, for example db.internal:5432 or 10.0.0.0/8:9092); cloud metadata endpoints are refused whether or not this is set"`
+		} `mapstructure:"egress"`
+
+		Standalone struct {
+			// EnvWarning controls the one-time startup warning that lists the
+			// names of host environment variables standalone connector plugin
+			// processes no longer receive (and any sensitive-looking name that
+			// Env.Allow passes). Advisory only: it does not change the
+			// environment plugins receive. Operators who have reviewed the
+			// list can set it to false. See
+			// docs/operations/standalone-plugin-environment.md.
+			EnvWarning bool `long:"connectors.standalone.env-warning" mapstructure:"env-warning" usage:"warn at startup about the host environment variables standalone connector plugins no longer receive, and about sensitive-looking ones the allowlist passes"`
+
+			// Env.Allow lists the host environment variables, beyond the base
+			// set (PATH, HOME, TMPDIR/TEMP/TMP, TZ, LANG, LANGUAGE, LC_*, and
+			// SYSTEMROOT/WINDIR on Windows), that standalone connector
+			// plugin processes receive. Exact names. Default none: plugins no
+			// longer inherit the engine's environment.
+			Env struct {
+				Allow []string `long:"connectors.standalone.env.allow" mapstructure:"allow" usage:"host environment variables, beyond PATH, HOME, TMPDIR, TZ, locale, SSL_CERT_FILE/SSL_CERT_DIR and the proxy variables, that standalone connector plugins receive (repeatable, exact names, default none)"`
+			} `mapstructure:"env"`
+		}
+
+		// AmbientCredentials is the operator's policy for built-in connectors
+		// that can fall back to the host's ambient cloud identity (for AWS, the
+		// default credential chain). Tier-1 security control.
+		//
+		// SECURITY POSTURE: off by default. A pipeline author cannot turn it on:
+		// these keys are not connector parameters, and the policy reaches
+		// built-in connectors only on the engine-built call context (see
+		// pkg/plugin/connector/builtin). Standalone plugins never receive it
+		// and so always deny. See
+		// docs/design-documents/20261012-builtin-connector-ambient-credentials.md
+		// and docs/operations/ambient-credentials.md.
+		AmbientCredentials struct {
+			Enabled        bool     `long:"connectors.ambient-credentials.enabled" mapstructure:"enabled" usage:"allow built-in connectors to use this process's ambient cloud credentials (for example the AWS default credential chain) when a pipeline sets no static keys (default false)"`
+			AllowEndpoints []string `long:"connectors.ambient-credentials.allow-endpoints" mapstructure:"allow-endpoints" usage:"the only custom endpoints that may receive ambient-credential-signed requests: exact https://host[:port] entries (repeatable)"`
+			AllowResources []string `long:"connectors.ambient-credentials.allow-resources" mapstructure:"allow-resources" usage:"exact resource names (for s3, bucket names) the ambient identity may use; required when enabled, wildcards are refused (repeatable)"`
+			AllowProxy     bool     `long:"connectors.ambient-credentials.allow-proxy" mapstructure:"allow-proxy" usage:"allow ambient credentials while HTTP_PROXY/HTTPS_PROXY/ALL_PROXY is set; the link-local address refusal then cannot apply"`
+		} `mapstructure:"ambient-credentials"`
+	}
+
+	Install struct {
+		// AllowUnsigned is the operator policy gate for `conduit connectors
+		// install --allow-unsigned` (Tier-1 security control, plan-v2 §6).
+		// false hard-disables the entire --allow-unsigned path regardless
+		// of flag/TTY/env var — the mitigation for "a prompt-injected agent
+		// convinces an operator to run a suggested command": once set, it
+		// cannot be talked around by anything short of editing this config
+		// and restarting. Defaults to false as of DeVaris's Tier-1 posture
+		// decision: the escape-hatch CAPABILITY itself is off unless an
+		// operator explicitly opts in (install.allowUnsigned: true) — the
+		// flag still exists and is still gated by TTY-confirm/env-var/
+		// never-from-MCP on top of that, but now requires an explicit,
+		// affirmative operator choice before any of those gates are even
+		// reachable.
+		AllowUnsigned bool `long:"install.allow-unsigned" mapstructure:"allow-unsigned" usage:"operator policy: permit --allow-unsigned connector installs at all (false hard-disables regardless of flag/TTY/env var)"`
+		// MaxStaleness overrides index.DefaultMaxStaleness (7 days) — how
+		// old a cryptographically-verified index's timestamp may be before
+		// install/audit refuse it as stale.
+		MaxStaleness time.Duration `long:"install.max-staleness" mapstructure:"max-staleness" usage:"maximum age of a verified registry index before it is considered stale"`
+		// AllowStaleBundle is the operator policy gate for `conduit
+		// connectors install --bundle --allow-stale-bundle` (PR-4,
+		// plan-v2/step5 §7 step 3), gated identically to AllowUnsigned above
+		// per DeVaris's ratification: false hard-disables the entire
+		// --allow-stale-bundle path regardless of flag/TTY/env var.
+		AllowStaleBundle bool `long:"install.allow-stale-bundle" mapstructure:"allow-stale-bundle" usage:"operator policy: permit --allow-stale-bundle offline connector installs at all (false hard-disables regardless of flag/TTY/env var)"`
+	}
+
+	Processors struct {
+		Path string `long:"processors.path" usage:"path to standalone processors' directory"`
+
+		// JavaScript confines custom.javascript's file access. script.path may
+		// only read from AllowedDirs (default: <data dir>/scripts), and
+		// require() is defined only when AllowedDirs is set explicitly, and
+		// then only loads from those directories.
+		JavaScript struct {
+			AllowedDirs []string `long:"processors.javascript.allowed-dirs" mapstructure:"allowed-dirs" usage:"directories custom.javascript may load script.path and require() modules from (repeatable); require() is disabled when unset"`
+
+			// scriptsDir is the default script.path directory. Unexported on
+			// purpose: it is a default, not an operator key.
+			scriptsDir string
+		} `mapstructure:"javascript"`
+
+		// Egress is the engine-level host-egress ceiling for standalone (WASM)
+		// processors — the operator's outer bound on the network hosts a
+		// processor may reach via the host `http_request` capability. It clamps
+		// every pipeline's per-processor `sdk.egress.*` opt-in by intersection
+		// (see pkg/plugin/processor/egress.ResolvePolicy).
+		//
+		// SECURITY POSTURE: the default is DENY-ALL. Egress stays fully closed
+		// until an operator affirmatively sets processors.egress.enabled=true
+		// (defense in depth for shared/multi-tenant instances) — a processor
+		// requesting egress on a stock instance gets DenyAll. The allowlist is
+		// the opt-in; the dial-time resolved-IP gate (egress.Refuse) is the real
+		// SSRF guarantee, not this coarse host pre-filter. See
+		// docs/design-documents/20260726-wasm-host-egress-capability.md and the
+		// README "Processor host egress" section.
+		Egress struct {
+			// Enabled opens the engine-level egress ceiling. When false (the
+			// default) the ceiling is deny-all and no pipeline opt-in can
+			// override it, regardless of the fields below.
+			Enabled bool `long:"processors.egress.enabled" mapstructure:"enabled" usage:"open the engine-level host-egress ceiling for standalone processors (default false = deny-all; no pipeline can exceed this ceiling)"`
+			// Allow is the ceiling allowlist of host[:port] / scheme://host[:port]
+			// entries (repeatable, or comma/space-separated). Empty + enabled =>
+			// unrestricted single-tenant mode (honor whatever pipelines request).
+			// Each entry is parsed by egress.ParseAllowlist; a malformed entry
+			// fails startup.
+			Allow []string `long:"processors.egress.allow" mapstructure:"allow" usage:"engine-level egress allowlist: host[:port] or scheme://host[:port] entries (repeatable); empty with enabled=true means unrestricted (single-tenant)"`
+			// SecretRefs is the set of secret names the ceiling grants; a
+			// pipeline may reference (via sdk.egress.secretRefs) only secrets in
+			// this set on a restricted (non-empty Allow) ceiling.
+			SecretRefs []string `long:"processors.egress.secret-refs" mapstructure:"secret-refs" usage:"engine-level egress secret grants: secret names a pipeline may reference for host-injected Authorization (repeatable)"`
+			// Timeout, when > 0, is an upper bound on the per-call egress timeout
+			// no pipeline can exceed (tightening only). 0 means no ceiling cap
+			// (the per-processor value / egress.DefaultTimeout applies).
+			Timeout time.Duration `long:"processors.egress.timeout" mapstructure:"timeout" usage:"engine-level upper bound on the per-call egress timeout (0 = no ceiling cap)"`
+			// MaxResponseBytes, when > 0, is an upper bound on the buffered
+			// response body no pipeline can exceed (tightening only). 0 means no
+			// ceiling cap (the per-processor value / egress.DefaultMaxResponseBytes
+			// applies).
+			MaxResponseBytes int64 `long:"processors.egress.max-response-bytes" mapstructure:"max-response-bytes" usage:"engine-level upper bound on the buffered egress response body in bytes (0 = no ceiling cap)"`
+			// BuiltinAllow exempts exact destinations from the dial-time guard
+			// of the built-in outbound-HTTP processors (webhook.http,
+			// ollama.request, openai.*, cohere.*), which otherwise refuse
+			// private, loopback, link-local and metadata addresses. Unlike
+			// Allow, it never restricts public destinations. Exact
+			// host[:port] / http://ip[:port] entries; a local Ollama needs
+			// http://127.0.0.1:11434. See docs/operations/outbound-http-egress.md.
+			BuiltinAllow []string `long:"processors.egress.builtin-allow" mapstructure:"builtin-allow" usage:"destinations the built-in outbound-HTTP processors may reach despite being private/loopback/link-local, e.g. http://127.0.0.1:11434 for a local Ollama (repeatable, exact entries, default none)"`
+		} `mapstructure:"egress"`
+	}
+
+	Pipelines struct {
+		Path           string `long:"pipelines.path" usage:"path to a pipelines' directory or a pipeline configuration file"`
+		ExitOnDegraded bool   `long:"pipelines.exit-on-degraded" mapstructure:"exit-on-degraded" usage:"exit Conduit if a pipeline is degraded"`
+
+		// Disabled turns off file-based pipeline provisioning entirely:
+		// initServices never calls ProvisionService.Init, so Path is never
+		// stat'd or scanned. It deliberately has no `long`/`mapstructure`
+		// tag — it is not a CLI flag, `conduit run` never sets it, and
+		// DefaultConfig leaves it at its zero value (false) — so this field
+		// cannot regress the CLI's cwd/pipelines default-scanning behavior.
+		// It exists only for the root embed package
+		// (github.com/conduitio/conduit), whose New sets it when
+		// Options.PipelinesDir is left empty: an embed-only "no file
+		// provisioning" intent that must not be expressible by silently
+		// inheriting this Config's DefaultConfig-populated Path
+		// (cwd/pipelines) — that default is CLI-oriented, not something a
+		// pure-embed/Import-driven caller ever asked for. See initServices.
+		Disabled bool
+
+		ErrorRecovery struct {
+			// MinDelay is the minimum delay before restart: Default: 1 second
+			MinDelay time.Duration `long:"pipelines.error-recovery.min-delay" mapstructure:"min-delay" usage:"minimum delay before restart"`
+			// MaxDelay is the maximum delay before restart: Default: 10 minutes
+			MaxDelay time.Duration `long:"pipelines.error-recovery.max-delay" mapstructure:"max-delay" usage:"maximum delay before restart"`
+			// BackoffFactor is the factor by which the delay is multiplied after each restart: Default: 2
+			BackoffFactor int `long:"pipelines.error-recovery.backoff-factor" mapstructure:"backoff-factor" usage:"backoff factor applied to the last delay"`
+			// MaxRetries is the maximum number of restarts before the pipeline is considered unhealthy: Default: -1 (infinite)
+			MaxRetries int64 `long:"pipelines.error-recovery.max-retries" mapstructure:"max-retries" usage:"maximum number of retries"`
+			// MaxRetriesWindow is the duration window in which the max retries are counted: Default: 5 minutes
+			MaxRetriesWindow time.Duration `long:"pipelines.error-recovery.max-retries-window" mapstructure:"max-retries-window" usage:"amount of time running without any errors after which a pipeline is considered healthy"`
+		} `mapstructure:"error-recovery"`
+	}
+
+	ConnectorPlugins map[string]sdk.Connector
+	ProcessorPlugins map[string]proc_builtin.ProcessorPluginConstructor
+
+	SchemaRegistry struct {
+		Type string `long:"schema-registry.type" usage:"schema registry type; accepts builtin,confluent"`
+
+		Confluent struct {
+			ConnectionString string `long:"schema-registry.confluent.connection-string" mapstructure:"connection-string" usage:"confluent schema registry connection string"`
+			Authentication   struct {
+				Type     string `long:"schema-registry.confluent.auth.type" usage:"schema registry authentication type; accepts none,basic,bearer"`
+				Username string `long:"schema-registry.confluent.auth.basic.username" usage:"schema registry basic authentication username"`
+				Password string `long:"schema-registry.confluent.auth.basic.password" usage:"schema registry basic authentication password"`
+				Token    string `long:"schema-registry.confluent.auth.bearer.token" usage:"schema registry authentication bearer token"`
+			}
+		}
+	} `mapstructure:"schema-registry"`
+
+	Schema struct {
+		Avro struct {
+			// MaxElements bounds how many elements one Avro array or map may
+			// declare when Conduit decodes Avro in-process: the built-in
+			// avro.decode processor and the schema middleware of built-in
+			// connectors and processors. A payload over the limit fails to
+			// decode with schema.avro.limit_exceeded; it is never truncated.
+			// 0 removes the limit (the pre-v0.20.1 behavior, which leaves
+			// the decoder open to allocating whatever a payload declares).
+			// Standalone plugins decode in their own process with their own
+			// SDK and are not governed by this setting. Applied once at
+			// startup, process-wide (see schemaregistry.ApplyAvroMaxElements).
+			MaxElements int `long:"schema.avro.max-elements" mapstructure:"max-elements" usage:"maximum elements in one Avro array or map decoded in-process (built-in processors and connectors); larger payloads fail with schema.avro.limit_exceeded; 0 = no limit"`
+		} `mapstructure:"avro"`
+	} `mapstructure:"schema"`
+
+	Preview struct {
+		// PipelineArchV2 runs pipelines on the preview engine
+		// (pkg/lifecycle-poc) instead of the classic default (pkg/lifecycle).
+		// It is required for record fan-out: the classic engine is
+		// one-record-in-one-record-out and stops a pipeline whose processor
+		// splits a record with stream.CodeFanOutRequiresArchV2. Keep the usage
+		// string in sync with that code's godoc, which is what reaches
+		// llms-full.txt.
+		PipelineArchV2               bool `long:"preview.pipeline-arch-v2" mapstructure:"pipeline-arch-v2" usage:"enables the preview pipeline engine (architecture v2). Required for pipelines with a processor that splits one record into several (record fan-out, e.g. ai.chunk, split, clone), including the postgres-pgvector-rag template: the classic default engine cannot run them and stops with pipeline.fanout_requires_arch_v2. Known limit: a split record whose pieces are cut across a multi-destination fan-out fails with pipeline.split_run_straddles_fanout. v2 batches a destination itself with its effective sdk.batch.size and sdk.batch.delay (the pipeline config, else the connector's own defaults) and configures the connector not to batch as well; sdk.batch.delay bounds how long a partial batch waits before it is written; with sdk.batch.size alone a partial batch waits for more records or a stop, and the start logs pipeline.archv2_destination_batch_unbounded_wait. A dead-letter queue with sdk.batch.size above 1 or sdk.batch.delay above 0 is refused at start with pipeline.archv2_destination_batching_unsupported, because v2 waits for every ack before the next read. A destination or dead-letter-queue sdk.batch.* value must be a literal: an environment reference is refused with pipeline.archv2_destination_batching_not_literal. This flag is temporary: a single pipeline engine that supports record fan-out is planned, and the flag will then be deprecated"`
+		PipelineArchV2DisableMetrics bool `long:"preview.pipeline-arch-v2-disable-metrics" mapstructure:"pipeline-arch-v2-disable-metrics" usage:"disables metrics about amount of data (in bytes) moved in pipeline architecture v2 (increases performance)"`
+	}
+
+	// Generate configures `conduit generate`. It is read only by that
+	// command; the engine (`conduit run`) ignores it.
+	//
+	// The fields deliberately have no `long` tag: `conduit generate` has its
+	// own --provider flag, and a long tag would add a --generate.provider
+	// flag to every command that embeds Config (run, doctor, connectors, ...)
+	// where it would do nothing. They are set in conduit.yaml or through
+	// their environment variables.
+	Generate struct {
+		// Provider selects the generation provider (anthropic, openai,
+		// ollama) when the --provider flag is not given. Precedence:
+		// --provider, then CONDUIT_GENERATE_PROVIDER, then this, then
+		// auto-detection. Empty means "not set". The value is validated
+		// when `conduit generate` resolves its provider, not at engine
+		// startup: an unknown name fails generate with
+		// common.invalid_argument and config path /generate/provider, and
+		// never stops `conduit run`.
+		Provider string `mapstructure:"provider"`
+	} `mapstructure:"generate"`
+
+	Dev struct {
+		CPUProfile   string `long:"dev.cpuprofile" usage:"write CPU profile to file"`
+		MemProfile   string `long:"dev.memprofile" usage:"write memory profile to file"`
+		BlockProfile string `long:"dev.blockprofile" usage:"write block profile to file"`
+
+		// Enabled turns on the hot-reload dev watcher (see pkg/conduit/dev
+		// and docs/design-documents/20260712-pipeline-dev-hot-reload.md §4).
+		// `conduit run --dev` and `conduit pipelines dev` both set this
+		// (via the --dev alias, see cmd/conduit/root/run.RunCommand) rather
+		// than exposing "--dev.enabled" as the primary spelling — it is here,
+		// under the existing Dev config group, for the same reason the flags
+		// above are: it is a run-time, --pipelines.path-scoped mode, not a
+		// distinct subsystem toggle.
+		Enabled bool `long:"dev.enabled" mapstructure:"enabled" usage:"watch pipelines.path and hot-reload changes into the running engine (see 'conduit run --dev')"`
+		// JSON selects --json structured dev-watcher event lines (one apply
+		// = one JSON object) over the default human-readable status line.
+		// Only meaningful when Enabled.
+		JSON bool `long:"dev.json" mapstructure:"json" usage:"emit dev-watcher apply events as JSON lines instead of human-readable text"`
+	}
+}
+
+func DefaultConfig() Config {
+	dir, err := os.Getwd()
+	if err != nil {
+		panic(cerrors.Errorf("failed to get current directory: %w", err))
+	}
+
+	return DefaultConfigWithBasePath(dir)
+}
+
+func DefaultConfigWithBasePath(basePath string) Config {
+	var cfg Config
+
+	cfg.ConduitCfg.Path = filepath.Join(basePath, "conduit.yaml")
+
+	cfg.DB.Type = DBTypeBadger
+	cfg.DB.Badger.Path = filepath.Join(basePath, "conduit.db")
+	cfg.DB.Postgres.Table = "conduit_kv_store"
+	cfg.DB.SQLite.Path = filepath.Join(basePath, "conduit.db")
+	cfg.DB.SQLite.Table = "conduit_kv_store"
+
+	cfg.API.Enabled = true
+	cfg.API.HTTP.Address = defaultHTTPAddress
+	cfg.API.HTTP.UI.Enabled = true
+	cfg.API.GRPC.Address = defaultGRPCAddress
+
+	cfg.Log.NewLogger = newLogger
+	cfg.Log.Level = "info"
+	cfg.Log.Format = "cli"
+
+	cfg.Connectors.Path = filepath.Join(basePath, "connectors")
+	cfg.Connectors.MaxReceiveRecordSize = server.DefaultMaxReceiveRecordSize
+	cfg.Connectors.Standalone.EnvWarning = true
+
+	cfg.Install.AllowUnsigned = false
+	cfg.Install.MaxStaleness = index.DefaultMaxStaleness
+	cfg.Install.AllowStaleBundle = false
+
+	cfg.Processors.Path = filepath.Join(basePath, "processors")
+	cfg.Processors.JavaScript.scriptsDir = filepath.Join(basePath, "scripts")
+	// Deny by default outside <data dir>/files: the file connector cannot reach
+	// conduit.db, conduit.yaml, the process's other files or the rest of the
+	// host unless an operator widens this.
+	cfg.Secrets.AllowedDirs = []string{filepath.Join(basePath, "secrets")}
+	cfg.Connectors.File.defaultDir = filepath.Join(basePath, "files")
+	cfg.Connectors.File.AllowedDirs = []string{cfg.Connectors.File.defaultDir}
+	// Deny-all by default: the host-egress ceiling is closed until an operator
+	// affirmatively opens it (processors.egress.enabled=true). Set explicitly so
+	// the security default is legible here and anchored by a test.
+	cfg.Processors.Egress.Enabled = false
+
+	cfg.Pipelines.Path = filepath.Join(basePath, "pipelines")
+	cfg.Pipelines.ErrorRecovery.MinDelay = time.Second
+	cfg.Pipelines.ErrorRecovery.MaxDelay = 10 * time.Minute
+	cfg.Pipelines.ErrorRecovery.BackoffFactor = 2
+	cfg.Pipelines.ErrorRecovery.MaxRetries = lifecycle.InfiniteRetriesErrRecovery
+	cfg.Pipelines.ErrorRecovery.MaxRetriesWindow = 5 * time.Minute
+
+	cfg.SchemaRegistry.Type = SchemaRegistryTypeBuiltin
+	cfg.SchemaRegistry.Confluent.Authentication.Type = SchemaRegistryAuthTypeNone
+
+	cfg.Schema.Avro.MaxElements = schemaregistry.DefaultAvroMaxElements
+
+	cfg.ConnectorPlugins = builtin.DefaultBuiltinConnectors
+	cfg.ProcessorPlugins = proc_builtin.DefaultBuiltinProcessors
+	return cfg
+}
+
+func (c Config) validateDBConfig() error {
+	if c.DB.Driver == nil {
+		switch c.DB.Type {
+		case DBTypeBadger:
+			if c.DB.Badger.Path == "" {
+				return requiredConfigFieldErr("db.badger.path")
+			}
+		case DBTypePostgres:
+			if c.DB.Postgres.ConnectionString == "" {
+				return requiredConfigFieldErr("db.postgres.connection-string")
+			}
+			if c.DB.Postgres.Table == "" {
+				return requiredConfigFieldErr("db.postgres.table")
+			}
+		case DBTypeInMemory:
+			// all good
+		case DBTypeSQLite:
+			if c.DB.SQLite.Path == "" {
+				return requiredConfigFieldErr("db.sqlite.path")
+			}
+			if c.DB.SQLite.Table == "" {
+				return requiredConfigFieldErr("db.sqlite.table")
+			}
+		default:
+			return invalidConfigFieldErr("db.type")
+		}
+	}
+	return nil
+}
+
+func (c Config) validateAPIConfig() error {
+	if !c.API.Enabled {
+		return nil
+	}
+	if c.API.GRPC.Address == "" {
+		return requiredConfigFieldErr("api.grpc.address")
+	}
+	if c.API.HTTP.Address == "" {
+		return requiredConfigFieldErr("api.http.address")
+	}
+	// Each CORS origin must be a canonical scheme://host[:port] with no path or
+	// trailing slash (a browser's Origin header never carries one, so a
+	// mismatched entry would silently fail CORS at runtime). "*" is the allow-any
+	// wildcard.
+	for _, o := range c.API.HTTP.CORS.AllowedOrigins {
+		if o == "*" {
+			continue
+		}
+		u, err := url.Parse(o)
+		if err != nil || u.Scheme == "" || u.Host == "" || u.Path != "" || u.RawQuery != "" || u.Fragment != "" {
+			return invalidConfigFieldErr("api.http.cors.allowed-origins")
+		}
+	}
+	// The API is unauthenticated, so a wildcard CORS origin lets any web page read
+	// and control this instance. On a non-loopback (network-reachable) bind that
+	// is unauthenticated, network-wide exposure of live record data — refuse it at
+	// startup rather than only warn. "*" stays allowed on a loopback bind for
+	// local development; a network deployment must list exact origins (or bind
+	// loopback behind an authenticating proxy).
+	if slices.Contains(c.API.HTTP.CORS.AllowedOrigins, "*") && !isLoopbackBind(c.API.HTTP.Address) {
+		return invalidConfigFieldErr("api.http.cors.allowed-origins")
+	}
+	return c.validateAPIAccess()
+}
+
+// validateAPIAccess checks the settings that decide who may call the API: the
+// host allowlist and the token requirement on non-loopback binds.
+func (c Config) validateAPIAccess() error {
+	for _, h := range c.API.HTTP.AllowedHosts {
+		if h == "" || strings.ContainsAny(h, "/@ \t") || strings.Contains(h, "://") {
+			ce := conduiterr.New(conduiterr.CodeInvalidArgument, fmt.Sprintf("%q is not a valid host name for api.http.allowed-hosts", h))
+			ce.ConfigPath = apisec.ConfigPathAllowedHosts
+			ce.Suggestion = "list bare host names without scheme, port or path, for example conduit.internal"
+			return ce
+		}
+		if _, _, err := net.SplitHostPort(h); err == nil {
+			ce := conduiterr.New(conduiterr.CodeInvalidArgument, fmt.Sprintf("%q must not include a port in api.http.allowed-hosts", h))
+			ce.ConfigPath = apisec.ConfigPathAllowedHosts
+			ce.Suggestion = "list the host name only; the port is not checked"
+			return ce
+		}
+	}
+	// Invariant: the API is never served unauthenticated to the network. A
+	// non-loopback bind of either listener needs a token. (The connector
+	// utilities listener is always loopback; see startConnectorUtils.)
+	token, err := c.APIToken()
+	if err != nil {
+		return err
+	}
+	if token == "" {
+		for _, bind := range []struct{ path, addr string }{
+			{"api.http.address", c.API.HTTP.Address},
+			{"api.grpc.address", c.API.GRPC.Address},
+		} {
+			if !isLoopbackBind(bind.addr) {
+				ce := conduiterr.New(apisec.CodeTokenRequired,
+					fmt.Sprintf("%q is %q, which is reachable from the network, and no API token is configured", bind.path, bind.addr))
+				ce.ConfigPath = apisec.ConfigPathTokenFile
+				ce.Suggestion = "set api.token-file (CONDUIT_API_TOKEN_FILE) or api.token (CONDUIT_API_TOKEN), or bind " + bind.path + " to 127.0.0.1"
+				return ce
+			}
+		}
+	}
+	return nil
+}
+
+// APIToken returns the configured API token, or "" when none is configured. It
+// reads api.token-file, so a missing or empty file is an error here rather
+// than a silently open API.
+func (c Config) APIToken() (string, error) {
+	return apisec.ResolveToken(c.API.Token, c.API.TokenFile)
+}
+
+func (c Config) validateSchemaRegistryConfig() error {
+	switch c.SchemaRegistry.Type {
+	case SchemaRegistryTypeConfluent:
+		if c.SchemaRegistry.Confluent.ConnectionString == "" {
+			return requiredConfigFieldErr("schema-registry.confluent.connection-string")
+		}
+		// check auth type
+		switch c.SchemaRegistry.Confluent.Authentication.Type {
+		case SchemaRegistryAuthTypeBasic:
+			if c.SchemaRegistry.Confluent.Authentication.Username == "" {
+				return requiredConfigFieldErr("schema-registry.confluent.auth.basic.username")
+			}
+			if c.SchemaRegistry.Confluent.Authentication.Password == "" {
+				return requiredConfigFieldErr("schema-registry.confluent.auth.basic.password")
+			}
+		case SchemaRegistryAuthTypeBearer:
+			if c.SchemaRegistry.Confluent.Authentication.Token == "" {
+				return requiredConfigFieldErr("schema-registry.confluent.auth.bearer.token")
+			}
+		case SchemaRegistryAuthTypeNone:
+			// no authentication required, do nothing.
+		default:
+			return requiredConfigFieldErr("schema-registry.confluent.auth.type")
+		}
+
+	case SchemaRegistryTypeBuiltin:
+		// all good
+	default:
+		return invalidConfigFieldErr("schema-registry.type")
+	}
+	return nil
+}
+
+// validateSchemaConfig checks schema.* engine settings. The error is coded
+// (common.invalid_argument) and carries the setting's config path, so the
+// CLI, API and MCP surfaces can point at the field to fix.
+func (c Config) validateSchemaConfig() error {
+	if n := c.Schema.Avro.MaxElements; n < 0 {
+		ce := conduiterr.New(conduiterr.CodeInvalidArgument,
+			fmt.Sprintf("%q config value mustn't be negative (got: %d)", schemaregistry.AvroMaxElementsConfigPath, n))
+		ce.ConfigPath = schemaregistry.AvroMaxElementsConfigPath
+		ce.Suggestion = "set " + schemaregistry.AvroMaxElementsConfigPath + " to a positive element limit, or 0 for no limit"
+		return ce
+	}
+	return nil
+}
+
+// egressCeiling translates the operator's engine-level egress config
+// (processors.egress.*) into the egress.Policy ceiling handed to the processor
+// service via processor.WithEgressCeiling. It is the single source of truth for
+// that translation: Config.Validate calls it to surface a malformed config as a
+// startup error, and createServices calls it to build the ceiling actually
+// passed to the engine.
+//
+// SECURITY: a zero/disabled config yields egress.DenyAll() (Enabled=false) — the
+// deny-all default that keeps the host-egress boundary closed until an operator
+// sets processors.egress.enabled=true. A malformed allowlist or negative bound
+// is a startup error, NEVER a silent disable (a silent disable would be a
+// confusing security surprise: the operator thinks egress is scoped when it is
+// actually off, or vice-versa).
+func (c Config) egressCeiling() (egress.Policy, error) {
+	e := c.Processors.Egress
+
+	// Parse/validate the allowlist regardless of Enabled so a typo fails startup
+	// rather than silently doing nothing. ParseAllowlist accepts the repeatable
+	// []string joined with commas (it also splits on commas/whitespace itself),
+	// so both `--processors.egress.allow a --processors.egress.allow b` and a
+	// single "a,b" env/yaml value parse identically.
+	allow, err := egress.ParseAllowlist(strings.Join(e.Allow, ","))
+	if err != nil {
+		return egress.DenyAll(), cerrors.Errorf("%q config value is invalid: %w", "processors.egress.allow", err)
+	}
+	if e.Timeout < 0 {
+		return egress.DenyAll(), invalidConfigFieldErr("processors.egress.timeout")
+	}
+	if e.MaxResponseBytes < 0 {
+		return egress.DenyAll(), invalidConfigFieldErr("processors.egress.max-response-bytes")
+	}
+
+	if !e.Enabled {
+		// Deny-all default (defense in depth): the ceiling stays closed no matter
+		// what else is configured. Returning the zero-value Policy makes
+		// ResolvePolicy return DenyAll for every processor.
+		return egress.DenyAll(), nil
+	}
+
+	var secretRefs map[string]struct{}
+	if len(e.SecretRefs) > 0 {
+		secretRefs = make(map[string]struct{})
+		for _, raw := range e.SecretRefs {
+			for _, name := range strings.FieldsFunc(raw, func(r rune) bool {
+				return r == ',' || r == ' ' || r == '\t' || r == '\n'
+			}) {
+				secretRefs[name] = struct{}{}
+			}
+		}
+	}
+
+	return egress.Policy{
+		Enabled:          true,
+		Allowlist:        allow,
+		SecretRefs:       secretRefs,
+		Timeout:          e.Timeout,          // 0 => ResolvePolicy applies no ceiling cap
+		MaxResponseBytes: e.MaxResponseBytes, // 0 => ResolvePolicy applies no ceiling cap
+	}, nil
+}
+
+// validateEgressConfig fails startup on a malformed engine-level egress config
+// (bad allowlist entry, negative bound). It never silently disables egress.
+func (c Config) validateEgressConfig() error {
+	_, err := c.egressCeiling()
+	return err
+}
+
+func (c Config) validateErrorRecovery() error {
+	errRecoveryCfg := c.Pipelines.ErrorRecovery
+	var errs []error
+
+	if err := requirePositiveValue("min-delay", errRecoveryCfg.MinDelay); err != nil {
+		errs = append(errs, err)
+	}
+	if err := requirePositiveValue("max-delay", errRecoveryCfg.MaxDelay); err != nil {
+		errs = append(errs, err)
+	}
+	if errRecoveryCfg.MaxDelay > 0 && errRecoveryCfg.MinDelay > errRecoveryCfg.MaxDelay {
+		errs = append(errs, cerrors.New(`"min-delay" should be smaller than "max-delay"`))
+	}
+	if err := requireNonNegativeValue("backoff-factor", errRecoveryCfg.BackoffFactor); err != nil {
+		errs = append(errs, err)
+	}
+	if errRecoveryCfg.MaxRetries < lifecycle.InfiniteRetriesErrRecovery {
+		errs = append(errs, cerrors.Errorf(`invalid "max-retries" value. It must be %d for infinite retries or >= 0`, lifecycle.InfiniteRetriesErrRecovery))
+	}
+	if err := requirePositiveValue("max-retries-window", errRecoveryCfg.MaxRetriesWindow); err != nil {
+		errs = append(errs, err)
+	}
+
+	return cerrors.Join(errs...)
+}
+
+func (c Config) Validate() error {
+	// TODO simplify validation with struct tags
+
+	if err := c.validateDBConfig(); err != nil {
+		return err
+	}
+
+	if err := c.validateSchemaRegistryConfig(); err != nil {
+		return err
+	}
+
+	if err := c.validateAPIConfig(); err != nil {
+		return err
+	}
+
+	if err := c.validateSchemaConfig(); err != nil {
+		return err
+	}
+
+	if c.Log.Level == "" {
+		return requiredConfigFieldErr("log.level")
+	}
+	_, err := zerolog.ParseLevel(c.Log.Level)
+	if err != nil {
+		return invalidConfigFieldErr("log.level")
+	}
+
+	if c.Log.Format == "" {
+		return requiredConfigFieldErr("log.format")
+	}
+	_, err = log.ParseFormat(c.Log.Format)
+	if err != nil {
+		return invalidConfigFieldErr("log.format")
+	}
+
+	if c.Pipelines.Path == "" {
+		return requiredConfigFieldErr("pipelines.path")
+	}
+	// check if folder exists
+	_, err = os.Stat(c.Pipelines.Path)
+	if c.Pipelines.Path != DefaultConfig().Pipelines.Path && os.IsNotExist(err) {
+		return invalidConfigFieldErr("pipelines.path")
+	}
+
+	if err := c.validateErrorRecovery(); err != nil {
+		return cerrors.Errorf("invalid error recovery config: %w", err)
+	}
+
+	if err := c.validateHardeningConfig(); err != nil {
+		return err
+	}
+	if _, err := c.StandaloneEnvPolicy(); err != nil {
+		return err
+	}
+
+	if err := c.validateEgressConfig(); err != nil {
+		return err
+	}
+	if _, _, err := c.AmbientCredentialsPolicy(os.Getenv); err != nil {
+		return err
+	}
+	return nil
+}
+
+func invalidConfigFieldErr(name string) error {
+	return cerrors.Errorf("%q config value is invalid", name)
+}
+
+func requiredConfigFieldErr(name string) error {
+	return cerrors.Errorf("%q config value is required", name)
+}
+
+func requireNonNegativeValue[T constraints.Integer](name string, value T) error {
+	if value < 0 {
+		return cerrors.Errorf("%q config value mustn't be negative (got: %v)", name, value)
+	}
+
+	return nil
+}
+
+func requirePositiveValue[T constraints.Integer](name string, value T) error {
+	if value <= 0 {
+		return cerrors.Errorf("%q config value must be positive (got: %v)", name, value)
+	}
+
+	return nil
+}
+
+// StandaloneEnvPolicy returns the policy deciding which host environment
+// variables standalone connector plugin processes receive. A malformed
+// connectors.standalone.env.allow entry is an error, never silently dropped.
+func (c Config) StandaloneEnvPolicy() (conn_standalone.EnvPolicy, error) {
+	return conn_standalone.NewEnvPolicy(c.Connectors.Standalone.Env.Allow)
+}

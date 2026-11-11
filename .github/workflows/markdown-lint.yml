@@ -1,0 +1,24 @@
+name: markdown-lint
+
+on:
+  pull_request:
+    paths:
+      - '**.md'
+
+jobs:
+  markdownlint-cli2:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # Pinned to the v20 commit SHA (markdownlint-cli2 0.18.1 / markdownlint
+      # 0.38.0). Keep in sync with MARKDOWNLINT_VERSION in the Makefile — the two
+      # must match or local `make markdown-lint`/`make verify` drifts from CI.
+      - uses: DavidAnson/markdownlint-cli2-action@992badcdf24e3b8eb7e87ff9287fe931bcb00c6e # v20
+        with:
+          globs: |
+            **/*.md
+            !LICENSE.md
+            !pkg/http/openapi/**
+            !.github/*.md
+            !pkg/scaffold/template/**
+

@@ -1,0 +1,77 @@
+{
+  "specification": {
+    "name": "avro.decode",
+    "summary": "Decodes a field's raw data in the Avro format.",
+    "description": "The processor takes raw data (bytes or a string) in the specified field and decodes\nit from the [Avro format](https://avro.apache.org/) into structured data. It extracts the schema ID from the data,\ndownloads the associated schema from the [schema registry](https://docs.confluent.io/platform/current/schema-registry/index.html)\nand decodes the payload. The schema is cached locally after it's first downloaded.\n\nIf the processor encounters structured data or the data can't be decoded it returns an error.\n\nArrays and maps are limited to 1,000,000 elements each by default (engine setting\n`schema.avro.max-elements`; 0 removes the limit). A payload that declares more fails to decode with\nerror code `schema.avro.limit_exceeded`; it is never truncated. The failed record is handled like any\nother processing error: it goes to the pipeline's dead-letter queue when the DLQ is enabled with room in\nits window; otherwise the pipeline stops as degraded (default engine) or goes into recovering and retries\nthe same record (preview engine, architecture v2). See the runbook docs/operations/avro-limit-exceeded.md.\n\nThis processor is the counterpart to [`avro.encode`](/docs/using/processors/builtin/avro.encode).",
+    "version": "v0.1.0",
+    "author": "Meroxa, Inc.",
+    "parameters": {
+      "field": {
+        "default": ".Payload.After",
+        "description": "The field that will be decoded.\n\nFor more information about the format, see [Referencing fields](https://conduitdata.io/docs/using/processors/referencing-fields).",
+        "type": "string",
+        "validations": []
+      },
+      "sdk.schema.decode.key.enabled": {
+        "default": "true",
+        "description": "Whether to decode the record key using its corresponding schema from the schema registry.",
+        "type": "bool",
+        "validations": null
+      },
+      "sdk.schema.decode.payload.enabled": {
+        "default": "true",
+        "description": "Whether to decode the record payload using its corresponding schema from the schema registry.",
+        "type": "bool",
+        "validations": null
+      },
+      "sdk.schema.encode.key.enabled": {
+        "default": "true",
+        "description": "Whether to encode the record key using its corresponding schema from the schema registry.",
+        "type": "bool",
+        "validations": null
+      },
+      "sdk.schema.encode.payload.enabled": {
+        "default": "true",
+        "description": "Whether to encode the record payload using its corresponding schema from the schema registry.",
+        "type": "bool",
+        "validations": null
+      }
+    }
+  },
+  "examples": [
+    {
+      "summary": "Decode a record field in Avro format",
+      "description": "This example shows the usage of the `avro.decode` processor.\nThe processor decodes the record's`.Key` field using the schema that is\ndownloaded from the schema registry and needs to exist under the subject`example-decode`.\nIn this example we use the following schema:\n\n```json\n{\n  \"type\":\"record\",\n  \"name\":\"record\",\n  \"fields\":[\n    {\"name\":\"myString\",\"type\":\"string\"},\n    {\"name\":\"myInt\",\"type\":\"int\"}\n  ]\n}\n```",
+      "config": {
+        "field": ".Key"
+      },
+      "have": {
+        "position": "dGVzdC1wb3NpdGlvbg==",
+        "operation": "create",
+        "metadata": {
+          "key1": "val1"
+        },
+        "key": "\u0000\u0000\u0000\u0000\u0001\u0006bar\u0002",
+        "payload": {
+          "before": null,
+          "after": null
+        }
+      },
+      "want": {
+        "position": "dGVzdC1wb3NpdGlvbg==",
+        "operation": "create",
+        "metadata": {
+          "key1": "val1"
+        },
+        "key": {
+          "myInt": 1,
+          "myString": "bar"
+        },
+        "payload": {
+          "before": null,
+          "after": null
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,265 @@
+// Copyright © 2022 Meroxa, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package orchestrator
+
+import (
+	"bytes"
+	"context"
+	"encoding/base64"
+	"fmt"
+	"os"
+	"reflect"
+	"regexp"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/conduitio/conduit-commons/database/badger"
+	"github.com/conduitio/conduit-connector-protocol/pconnector/server"
+	schemaregistry "github.com/conduitio/conduit-schema-registry"
+	"github.com/conduitio/conduit/pkg/connector"
+	"github.com/conduitio/conduit/pkg/foundation/ctxutil"
+	"github.com/conduitio/conduit/pkg/foundation/log"
+	"github.com/conduitio/conduit/pkg/lifecycle"
+	"github.com/conduitio/conduit/pkg/orchestrator/mock"
+	"github.com/conduitio/conduit/pkg/pipeline"
+	conn_plugin "github.com/conduitio/conduit/pkg/plugin/connector"
+	conn_builtin "github.com/conduitio/conduit/pkg/plugin/connector/builtin"
+	"github.com/conduitio/conduit/pkg/plugin/connector/connutils"
+	conn_standalone "github.com/conduitio/conduit/pkg/plugin/connector/standalone"
+	proc_plugin "github.com/conduitio/conduit/pkg/plugin/processor"
+	proc_builtin "github.com/conduitio/conduit/pkg/plugin/processor/builtin"
+	"github.com/conduitio/conduit/pkg/processor"
+	"github.com/google/go-cmp/cmp"
+	"github.com/matryer/is"
+	"github.com/rs/zerolog"
+	"go.uber.org/mock/gomock"
+)
+
+// ctxType can be used in tests in call to gomock.AssignableToTypeOf to assert
+// a context is passed to a function.
+var ctxType = reflect.TypeOf((*context.Context)(nil)).Elem()
+
+func newMockServices(t *testing.T) (*mock.PipelineService, *mock.ConnectorService, *mock.ProcessorService, *mock.ConnectorPluginService, *mock.ProcessorPluginService, *mock.LifecycleService) {
+	ctrl := gomock.NewController(t)
+
+	return mock.NewPipelineService(ctrl),
+		mock.NewConnectorService(ctrl),
+		mock.NewProcessorService(ctrl),
+		mock.NewConnectorPluginService(ctrl),
+		mock.NewProcessorPluginService(ctrl),
+		mock.NewLifecycleService(ctrl)
+}
+
+func TestPipelineSimple(t *testing.T) {
+	is := is.New(t)
+	ctx, killAll := context.WithCancel(context.Background())
+	defer killAll()
+
+	logger := log.InitLogger(zerolog.InfoLevel, log.FormatCLI)
+	logger.Logger = logger.Hook(ctxutil.MessageIDLogCtxHook{})
+
+	db, err := badger.New(logger.Logger, t.TempDir()+"/test.db")
+	is.NoErr(err)
+	t.Cleanup(func() {
+		err := db.Close()
+		is.NoErr(err)
+	})
+
+	schemaRegistry, err := schemaregistry.NewSchemaRegistry(db)
+	is.NoErr(err)
+	authManager := connutils.NewAuthManager()
+	connSchemaService := connutils.NewSchemaService(logger, schemaRegistry, authManager)
+
+	connPluginService := conn_plugin.NewPluginService(
+		logger,
+		conn_builtin.NewRegistry(logger, conn_builtin.DefaultBuiltinConnectors, connSchemaService),
+		conn_standalone.NewRegistry(logger, ""),
+		authManager,
+	)
+	connPluginService.Init(ctx, "conn-utils-token:12345", server.DefaultMaxReceiveRecordSize)
+
+	procPluginService := proc_plugin.NewPluginService(
+		logger,
+		proc_builtin.NewRegistry(logger, proc_builtin.DefaultBuiltinProcessors, schemaRegistry),
+		nil,
+	)
+
+	connectorService := connector.NewService(logger, db, connector.NewPersister(logger, db, time.Second, 3))
+	processorService := processor.NewService(logger, db, procPluginService)
+	pipelineService := pipeline.NewService(logger, db)
+
+	errRecoveryCfg := &lifecycle.ErrRecoveryCfg{
+		MinDelay:         time.Second,
+		MaxDelay:         10 * time.Minute,
+		BackoffFactor:    2,
+		MaxRetries:       0,
+		MaxRetriesWindow: 5 * time.Minute,
+	}
+
+	lifecycleService := lifecycle.NewService(logger, errRecoveryCfg, connectorService, processorService, connPluginService, pipelineService)
+
+	orc := NewOrchestrator(
+		db,
+		logger,
+		pipelineService,
+		connectorService,
+		processorService,
+		connPluginService,
+		procPluginService,
+		lifecycleService,
+	)
+
+	// create a host pipeline
+	pl, err := orc.Pipelines.Create(ctx, pipeline.Config{Name: "test pipeline"})
+	is.NoErr(err)
+
+	// The default DLQ is builtin:log, which is refused at start
+	// (GHSA-m3mw-fpw8-w765) because it would not preserve a nacked record.
+	// Point the DLQ at a real file destination so this end-to-end test can
+	// start; the file is never written because no record is nacked.
+	pl.DLQ = pipeline.DLQ{
+		Plugin:              "builtin:file",
+		Settings:            map[string]string{"path": t.TempDir() + "/dlq.txt"},
+		WindowSize:          1,
+		WindowNackThreshold: 0,
+	}
+
+	// create connectors
+	sourcePath := "./fixtures/file-source.txt"
+	destinationPath := t.TempDir() + "/destination.txt"
+	conn, err := orc.Connectors.Create(
+		ctx,
+		connector.TypeSource,
+		"builtin:file", // use builtin plugin
+		pl.ID,
+		connector.Config{
+			Name:     "test-source",
+			Settings: map[string]string{"path": sourcePath},
+		},
+	)
+	is.NoErr(err)
+
+	_, err = orc.Processors.Create(
+		ctx,
+		"builtin:field.exclude",
+		processor.Parent{
+			ID:   pl.ID,
+			Type: processor.ParentTypePipeline,
+		},
+		processor.Config{
+			Settings: map[string]string{
+				"fields": `.Metadata["opencdc.readAt"]`,
+			},
+		},
+		"",
+	)
+	is.NoErr(err)
+
+	_, err = orc.Connectors.Create(
+		ctx,
+		connector.TypeDestination,
+		"builtin:file", // use builtin plugin
+		pl.ID,
+		connector.Config{
+			Name:     "test-destination",
+			Settings: map[string]string{"path": destinationPath},
+		},
+	)
+	is.NoErr(err)
+
+	// start the pipeline now that everything is set up
+	err = orc.Pipelines.Start(ctx, pl.ID)
+	is.NoErr(err)
+
+	// Wait until all 5 source records have been written to the destination file
+	// before stopping, instead of racing a fixed 1s sleep. A fixed sleep flaked
+	// on slow CI: if the pipeline hadn't drained all records yet, Stop cut it
+	// short and the file-content assertion below saw a truncated file.
+	const wantRecords = 5
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		got, readErr := os.ReadFile(destinationPath)
+		if readErr == nil && bytes.Count(got, []byte("\n")) >= wantRecords {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %d records in %s", wantRecords, destinationPath)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	t.Log("stopping pipeline")
+	err = orc.Pipelines.Stop(ctx, pl.ID, false)
+	is.NoErr(err)
+	t.Log("waiting")
+	err = lifecycleService.WaitPipeline(pl.ID)
+	is.NoErr(err)
+	t.Log("successfully stopped pipeline")
+
+	// The file source writes a versioned position from conduit-connector-file
+	// v0.11.0: "v1:<offset>:<dev>:<inode>:<n>:<sha256>". The device and inode
+	// differ per machine, so each position is checked by its offset and then
+	// cleared before the rest of the record is compared.
+	wantOffsets := []string{"2", "4", "6", "8", "10"}
+	want := `{"position":"","operation":"create","metadata":{"conduit.source.connector.id":"%[1]v","file.path":"./fixtures/file-source.txt"},"key":"MQ==","payload":{"before":null,"after":"MQ=="}}
+{"position":"","operation":"create","metadata":{"conduit.source.connector.id":"%[1]v","file.path":"./fixtures/file-source.txt"},"key":"Mg==","payload":{"before":null,"after":"Mg=="}}
+{"position":"","operation":"create","metadata":{"conduit.source.connector.id":"%[1]v","file.path":"./fixtures/file-source.txt"},"key":"Mw==","payload":{"before":null,"after":"Mw=="}}
+{"position":"","operation":"create","metadata":{"conduit.source.connector.id":"%[1]v","file.path":"./fixtures/file-source.txt"},"key":"NA==","payload":{"before":null,"after":"NA=="}}
+{"position":"","operation":"create","metadata":{"conduit.source.connector.id":"%[1]v","file.path":"./fixtures/file-source.txt"},"key":"NQ==","payload":{"before":null,"after":"NQ=="}}
+`
+	want = fmt.Sprintf(want, conn.ID)
+
+	// make sure destination file matches source file
+	got, err := os.ReadFile(destinationPath)
+	is.NoErr(err)
+	positionRe := regexp.MustCompile(`"position":"([^"]*)"`)
+	i := 0
+	gotCleared := positionRe.ReplaceAllStringFunc(string(got), func(m string) string {
+		enc := positionRe.FindStringSubmatch(m)[1]
+		pos, decErr := base64.StdEncoding.DecodeString(enc)
+		is.NoErr(decErr)
+		is.True(i < len(wantOffsets))
+		prefix := "v1:" + wantOffsets[i] + ":"
+		if !strings.HasPrefix(string(pos), prefix) {
+			t.Errorf("record %d position %q, want prefix %q", i, pos, prefix)
+		}
+		i++
+		return `"position":""`
+	})
+	is.Equal(i, len(wantOffsets))
+	if diff := cmp.Diff(want, gotCleared); diff != "" {
+		t.Fatal(diff)
+	}
+}
+
+// expectMutation expects exactly one TryLockForMutation(id). When it is
+// granted, the test also requires exactly one unlock by the time it ends:
+// a leaked mark would make the pipeline unstartable (#2961).
+func expectMutation(t *testing.T, lm *mock.LifecycleService, id any, granted bool) {
+	t.Helper()
+	if !granted {
+		lm.EXPECT().TryLockForMutation(id).Return(nil, false).Times(1)
+		return
+	}
+	var unlocks atomic.Int32
+	lm.EXPECT().TryLockForMutation(id).Return(func() { unlocks.Add(1) }, true).Times(1)
+	t.Cleanup(func() {
+		if got := unlocks.Load(); got != 1 {
+			t.Errorf("mutation mark released %d times, want exactly 1", got)
+		}
+	})
+}

@@ -1,0 +1,586 @@
+// Copyright © 2026 Meroxa, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package validate
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"io"
+	"os"
+	"sort"
+	"strings"
+
+	"github.com/conduitio/conduit/pkg/foundation/cerrors"
+	"github.com/conduitio/conduit/pkg/foundation/cerrors/conduiterr"
+	"github.com/conduitio/conduit/pkg/foundation/log"
+	"github.com/conduitio/conduit/pkg/plugin"
+	"github.com/conduitio/conduit/pkg/provisioning"
+	"github.com/conduitio/conduit/pkg/provisioning/config"
+	"github.com/conduitio/conduit/pkg/provisioning/config/yaml"
+)
+
+// Run resolves path (a single .yml/.yaml file or a directory of them) and
+// runs the offline parse -> enrich -> validate pipeline over every file it
+// finds, collecting every finding — parse failures, field-validation
+// errors, and cross-file/-document duplicate pipeline IDs — across every
+// file. It never fails fast: one bad file never stops the others from being
+// checked.
+//
+// Run returns a non-nil error only when path itself can't be resolved at
+// all (e.g. it does not exist) — that is a hard failure the caller (the
+// pipelines validate command) should render as a top-level command error,
+// not a Finding, since there is no file to attach it to. Everything else —
+// including every file being unparseable — comes back as findings inside a
+// (possibly all-failing) Report, with a nil error.
+func Run(ctx context.Context, path string) (Report, error) {
+	return RunWithOptions(ctx, path, Options{})
+}
+
+// Options selects which additional, opt-in checks the engine runs on top of
+// the always-on parse -> enrich -> validate. The zero value is exactly
+// `pipelines validate` (errors only, offline). `pipelines lint` sets Warnings;
+// `pipelines dry-run` sets Enriched and ResolvePlugins.
+type Options struct {
+	// Warnings surfaces the parser's advisory warnings (deprecated/renamed/
+	// unknown fields, version fallback) as SeverityWarning findings. `lint`
+	// sets this; `validate` does not (it is errors-only).
+	Warnings bool
+
+	// Enriched exposes each file's fully-enriched pipeline configs (final IDs,
+	// injected DLQ defaults, worker counts) on FileReport.Enriched. `dry-run`
+	// sets this; validate/lint leave it off so their --json is unchanged.
+	Enriched bool
+
+	// ResolvePlugins checks every connector AND processor plugin reference: a
+	// builtin (`builtin:...`) ref whose plugin is not in BuiltinPlugins /
+	// BuiltinProcessors is a connector.plugin_not_found / processor.plugin_not_found
+	// error finding; a standalone/any ref is left advisory ("not statically
+	// verifiable"), never a false failure. `dry-run` sets this. The engine stays
+	// offline: the builtin sets are injected by the command (from the builtin
+	// registries) rather than imported here.
+	ResolvePlugins bool
+
+	// BuiltinPlugins is the set of resolvable builtin connector references —
+	// both full module paths (github.com/conduitio/conduit-connector-<name>)
+	// and their short names (<name>) — supplied by the dry-run command from
+	// builtin.DefaultBuiltinConnectors. Only consulted when ResolvePlugins.
+	BuiltinPlugins map[string]struct{}
+
+	// BuiltinProcessors is the set of resolvable builtin processor plugin names
+	// (e.g. "json.decode", "field.set") — the keys of
+	// builtin.DefaultBuiltinProcessors, supplied by the dry-run command. Only
+	// consulted when ResolvePlugins.
+	BuiltinProcessors map[string]struct{}
+
+	// ArchV2 checks, on top of parse -> enrich -> validate, what the engine
+	// refuses at start under architecture v2: a dead-letter-queue with
+	// sdk.batch.size above 1 or sdk.batch.delay above 0
+	// (pipeline.archv2_destination_batching_unsupported), and a destination or
+	// dead-letter-queue sdk.batch.* value that is not a literal
+	// (pipeline.archv2_destination_batching_not_literal). Regular destinations'
+	// batching is not refused: the engine batches them itself. The offline engine has
+	// no runtime config, so the command passes this from
+	// preview.pipeline-arch-v2.
+	ArchV2 bool
+}
+
+// RunWithOptions is Run with the opt-in checks in opts. Run(ctx, path) is
+// RunWithOptions(ctx, path, Options{}).
+func RunWithOptions(ctx context.Context, path string, opts Options) (Report, error) {
+	files, err := config.ResolveFiles(path)
+	if err != nil {
+		return Report{}, err
+	}
+	sort.Strings(files) // deterministic order, independent of directory-read order
+
+	frs := make([]fileState, len(files))
+	for i, f := range files {
+		frs[i] = validateFile(ctx, f, opts)
+	}
+
+	checkCrossFileDuplicateIDs(frs)
+
+	return buildReport(frs, opts), nil
+}
+
+// DefaultInMemoryName is the label RunBytes uses when the caller supplies
+// none. It is deliberately not a plausible filename: a finding that says
+// `<generated>` cannot be mistaken for one pointing at a file on disk.
+const DefaultInMemoryName = "<generated>"
+
+// RunBytes runs the same parse -> enrich -> validate pipeline as Run over an
+// in-memory document instead of a file on disk.
+//
+// It exists because `conduit generate` must gate a candidate config through
+// THIS engine — not a second validator — before ever showing it to a human,
+// and the candidate only exists in memory. Writing it to a temp file first
+// would mean a config that failed validation still touched the filesystem,
+// and it would put a disk error in the path of a purely in-memory operation.
+// See docs/design-documents/20260722-conduit-generate.md §3, "the disk seam".
+//
+// name labels the findings (see validateReader); empty means
+// DefaultInMemoryName.
+//
+// Unlike Run it returns no error. Run's only hard failure is resolving path,
+// and there is no path here — every parse and validation problem comes back as
+// a Finding, exactly as it does for a file that exists but is unparseable.
+func RunBytes(ctx context.Context, name string, src []byte, opts Options) Report {
+	if name == "" {
+		name = DefaultInMemoryName
+	}
+
+	frs := []fileState{validateReader(ctx, name, bytes.NewReader(src), opts)}
+
+	// Still run the duplicate-ID pass: with one document it cannot find a
+	// CROSS-file collision, but a single file declaring the same pipeline ID
+	// twice is exactly as invalid, and generated configs are a plausible source
+	// of that.
+	checkCrossFileDuplicateIDs(frs)
+
+	return buildReport(frs, opts)
+}
+
+// CodeLintWarning is the stable code carried by every advisory `lint` warning
+// finding. The parser's warnings (deprecated/renamed/unknown fields, version
+// fallback) don't carry per-field conduiterr codes, so lint attaches this one
+// so a --json consumer can still filter on `code`. It is advisory-only:
+// warnings never affect the exit code unless `lint --strict` is set (see
+// ExitErrorStrict), so this code never flows through ExitError's bucket
+// classification.
+const CodeLintWarning = "config.lint_warning"
+
+// fileState is the engine's working representation of one resolved file: the
+// enriched pipelines it parsed successfully (used for cross-file duplicate-ID
+// detection, which needs every file's pipeline IDs at once) plus the
+// findings collected so far. buildReport converts this into the public
+// FileReport once every file (and the cross-file pass) has run.
+type fileState struct {
+	path      string
+	pipelines []config.Pipeline
+	findings  []Finding
+}
+
+// validateFile runs parse -> enrich -> validate (in that order — enrichment
+// mutates connector/processor IDs that validation checks, matching
+// pkg/provisioning.Service.provisionPipeline's ordering at service.go:279-280)
+// over a single file, collecting every finding along the way.
+func validateFile(ctx context.Context, path string, opts Options) fileState {
+	f, err := os.Open(path)
+	if err != nil {
+		fs := fileState{path: path}
+		ce := conduiterr.Wrap(config.CodeParseError, fmt.Sprintf("could not open file %q: %v", path, err), err)
+		ce.Suggestion = "check that the file exists and is readable"
+		fs.findings = append(fs.findings, findingFromError(ce))
+		return fs
+	}
+	defer f.Close()
+
+	return validateReader(ctx, path, f, opts)
+}
+
+// validateReader is validateFile without the disk. Everything after the open
+// in validateFile only ever touched an io.Reader, so the two share this body
+// rather than the in-memory path re-implementing (and drifting from) the
+// parse -> enrich -> validate ordering.
+//
+// name is what findings report as their file. It is a label, not a path: the
+// in-memory caller has no file, and a finding with an empty location is not
+// actionable.
+func validateReader(ctx context.Context, name string, r io.Reader, opts Options) fileState {
+	fs := fileState{path: name}
+	var err error
+
+	parser := yaml.NewParser(log.Nop())
+
+	// Both Parse and ParseWithWarnings return the same []config.Pipeline and the
+	// same raw cerrors.Join of per-document failures — the only difference is
+	// ParseWithWarnings also returns the advisory warnings the run path only
+	// logs (see parser.go). lint asks for them; validate does not.
+	var pipelines []config.Pipeline
+	if opts.Warnings {
+		var warns []yaml.Warning
+		pipelines, warns, err = parser.ParseWithWarnings(ctx, r)
+		for _, w := range warns {
+			fs.findings = append(fs.findings, warningFinding(w))
+		}
+	} else {
+		pipelines, err = parser.Parse(ctx, r)
+	}
+	// err here is the parser's raw cerrors.Join of per-document failures (no
+	// extra "%w" wrap) — walk it directly with cerrors.ForEach. Wrapping it
+	// first (e.g. via cerrors.Errorf("...: %w", err)) would collapse every
+	// finding into one; see doc.go and TestValidateFile_ParseErrors_AllFindings.
+	if err != nil {
+		cerrors.ForEach(err, func(e error) {
+			fs.findings = append(fs.findings, findingFromError(e))
+		})
+	}
+
+	for _, p := range pipelines {
+		enriched := config.Enrich(p)
+		fs.pipelines = append(fs.pipelines, enriched)
+
+		// config.Validate also returns a raw cerrors.Join — same rule as
+		// above, walk it directly, do not wrap it first.
+		if verr := config.Validate(enriched); verr != nil {
+			cerrors.ForEach(verr, func(e error) {
+				fs.findings = append(fs.findings, findingFromError(e))
+			})
+		}
+
+		if opts.ResolvePlugins {
+			fs.findings = append(fs.findings, resolvePluginRefs(enriched, opts)...)
+		}
+
+		if opts.ArchV2 {
+			fs.findings = append(fs.findings, archV2BatchingFindings(enriched)...)
+		}
+	}
+
+	return fs
+}
+
+// resolvePluginRefs is the dry-run --resolve-plugins check: every connector's
+// plugin reference is classified by plugin.FullName. A builtin ref
+// (`builtin:...`) whose plugin name (or full module path) is not in builtins is
+// a connector.plugin_not_found error finding (codes.NotFound -> exit 2). A
+// standalone or unqualified ("any") ref is left alone — it points at a plugin
+// binary that isn't loaded during an offline dry-run, so it is "not statically
+// verifiable", never a false failure (design doc). configPath points at the
+// connector's plugin field within the file's pipelines list.
+func resolvePluginRefs(p config.Pipeline, opts Options) []Finding {
+	var findings []Finding
+	add := func(f Finding, ok bool) {
+		if ok {
+			findings = append(findings, f)
+		}
+	}
+	for ci, conn := range p.Connectors {
+		add(builtinRefFinding(conn.Plugin, conn.ID,
+			fmt.Sprintf("/pipelines/connectors/%d/plugin", ci),
+			conduiterr.CodeConnectorPluginNotFound.Reason(), "connector", opts.BuiltinPlugins))
+		// processors attached to a connector
+		for pi, proc := range conn.Processors {
+			add(builtinRefFinding(proc.Plugin, proc.ID,
+				fmt.Sprintf("/pipelines/connectors/%d/processors/%d/plugin", ci, pi),
+				conduiterr.CodeProcessorPluginNotFound.Reason(), "processor", opts.BuiltinProcessors))
+		}
+	}
+	// pipeline-level processors
+	for pi, proc := range p.Processors {
+		add(builtinRefFinding(proc.Plugin, proc.ID,
+			fmt.Sprintf("/pipelines/processors/%d/plugin", pi),
+			conduiterr.CodeProcessorPluginNotFound.Reason(), "processor", opts.BuiltinProcessors))
+	}
+	return findings
+}
+
+// builtinRefFinding classifies one plugin reference. A builtin (`builtin:...`)
+// ref whose plugin name (or full ref) is not in builtins yields a not-found
+// Finding (ok=true); a standalone/"any" ref, or a resolvable builtin, yields
+// none. kind ("connector"/"processor") shapes the message + suggestion.
+func builtinRefFinding(pluginRef, id, configPath, code, kind string, builtins map[string]struct{}) (Finding, bool) {
+	fn := plugin.FullName(pluginRef)
+	if fn.PluginType() != plugin.PluginTypeBuiltin {
+		return Finding{}, false // standalone/any: not statically verifiable, advisory-by-omission
+	}
+	if _, ok := builtins[fn.PluginName()]; ok {
+		return Finding{}, false
+	}
+	if _, ok := builtins[pluginRef]; ok {
+		return Finding{}, false
+	}
+	return Finding{
+		Severity:   SeverityError,
+		Code:       code,
+		Message:    fmt.Sprintf("%s %q: builtin plugin %q is not available", kind, id, pluginRef),
+		ConfigPath: configPath,
+		Suggestion: fmt.Sprintf("check the plugin name, or use a standalone plugin path; run `conduit %s-plugins list` to see available builtins", kind),
+	}, true
+}
+
+// codeArchV2DestinationBatchingUnsupported is the runtime engine's error code
+// for a batched destination/DLQ under arch-v2 (lifecycle.CodeArchV2DestinationBatchingUnsupported).
+// It is a literal here so the offline engine does not import pkg/lifecycle-poc;
+// keep it in sync with that registration.
+const codeArchV2DestinationBatchingUnsupported = "pipeline.archv2_destination_batching_unsupported"
+
+// codeArchV2DestinationBatchingNotLiteral is the runtime engine's error code
+// for a destination/DLQ sdk.batch.* value that is not a literal under arch-v2
+// (lifecycle.CodeArchV2DestinationBatchingNotLiteral). A literal for the same
+// reason as codeArchV2DestinationBatchingUnsupported; keep it in sync.
+const codeArchV2DestinationBatchingNotLiteral = "pipeline.archv2_destination_batching_not_literal"
+
+// archV2BatchingFindings is the --preview.pipeline-arch-v2 check. It reports
+// what the engine refuses at start (and PreflightPipelineConfig refuses on a
+// live apply): a dead-letter-queue with sdk.batch.size above 1 or
+// sdk.batch.delay above 0 (pipeline.archv2_destination_batching_unsupported;
+// the engine does not batch the DLQ), and a destination or DLQ sdk.batch.*
+// value that is not a literal (pipeline.archv2_destination_batching_not_literal,
+// config.SDKBatchNonLiteral). A batched destination is not reported: the
+// engine batches it itself. It shares config.SDKBatchSizeAboveOne and
+// config.SDKBatchDelayAboveZero with the runtime guard so the two agree. The
+// code strings must stay in sync with the lifecycle constants (literals here
+// keep the offline engine from importing the whole lifecycle package).
+func archV2BatchingFindings(p config.Pipeline) []Finding {
+	add := func(findings []Finding, configPath, msg string) []Finding {
+		return append(findings, Finding{
+			Severity:   SeverityError,
+			Code:       codeArchV2DestinationBatchingUnsupported,
+			Message:    fmt.Sprintf("architecture v2 does not support %s", msg),
+			ConfigPath: configPath,
+			Suggestion: "set sdk.batch.size to 1 or remove it, or run the pipeline without architecture v2",
+			Fix:        &conduiterr.Fix{ConfigPath: configPath, Op: "remove"},
+		})
+	}
+
+	// A value that is not a literal (an environment reference) is refused at
+	// start, by the guard and the live-apply preflight alike: the engine reads
+	// it as written and the plugin gets it expanded, so they would disagree on
+	// who batches. config.SDKBatchNonLiteral is shared with both.
+	nonLiteral := func(findings []Finding, label, pointerPrefix string, settings map[string]string) []Finding {
+		for _, k := range config.SDKBatchNonLiteral(settings) {
+			findings = append(findings, Finding{
+				Severity: SeverityError,
+				Code:     codeArchV2DestinationBatchingNotLiteral,
+				Message: fmt.Sprintf("architecture v2 needs a literal %s on %s (sets %s=%s): "+
+					"the engine batches with the value as written, and an environment reference is expanded only for the connector",
+					strings.TrimSpace(k), label, strings.TrimSpace(k), strings.TrimSpace(settings[k])),
+				ConfigPath: pointerPrefix + k,
+				Suggestion: "set sdk.batch.size and sdk.batch.delay to literal values (for example 1000 and 1s) instead of an environment reference, or run the pipeline without architecture v2",
+			})
+		}
+		return findings
+	}
+
+	var findings []Finding
+	for ci, conn := range p.Connectors {
+		if conn.Type != config.TypeDestination {
+			continue
+		}
+		findings = nonLiteral(findings, fmt.Sprintf("destination connector %q", conn.ID),
+			fmt.Sprintf("/pipelines/connectors/%d/settings/", ci), conn.Settings)
+	}
+	findings = nonLiteral(findings, "the dead letter queue", "/pipelines/dead-letter-queue/settings/", p.DLQ.Settings)
+
+	// A destination's sdk.batch.size/delay is not refused: the engine batches
+	// destinations itself, so only the DLQ is checked here (same as Start).
+	if _, value, bad := config.SDKBatchSizeAboveOne(p.DLQ.Settings); bad {
+		findings = add(findings,
+			"/pipelines/dead-letter-queue/settings/"+config.SDKBatchSizeSetting,
+			fmt.Sprintf("the dead letter queue (sets %s=%s)", config.SDKBatchSizeSetting, value),
+		)
+	}
+	// #3321: the runtime guard refuses a DLQ delay above 0 too (the SDK
+	// batches on a delay alone); config.SDKBatchDelayAboveZero is shared.
+	if _, value, bad := config.SDKBatchDelayAboveZero(p.DLQ.Settings); bad {
+		findings = append(findings, Finding{
+			Severity:   SeverityError,
+			Code:       codeArchV2DestinationBatchingUnsupported,
+			Message:    fmt.Sprintf("architecture v2 does not support the dead letter queue (sets %s=%s)", config.SDKBatchDelaySetting, value),
+			ConfigPath: "/pipelines/dead-letter-queue/settings/" + config.SDKBatchDelaySetting,
+			Suggestion: "remove sdk.batch.delay from the dead letter queue, or run the pipeline without architecture v2",
+			Fix:        &conduiterr.Fix{ConfigPath: "/pipelines/dead-letter-queue/settings/" + config.SDKBatchDelaySetting, Op: "remove"},
+		})
+	}
+	return findings
+}
+
+// findingFromError converts one element of a cerrors.ForEach walk into a
+// Finding. A *conduiterr.ConduitError (every config.Validate error, and any
+// error this package itself wraps with a Code) carries its own code,
+// configPath, and suggestion through as-is. A plain error (a YAML syntax or
+// unrecognized-version failure from the parser, which has no per-field
+// configPath to attach) still gets a stable code so no finding is ever
+// uncoded — see design doc AC-5, "unparseable/unknown-version -> exit 2
+// coded finding, not panic".
+func findingFromError(e error) Finding {
+	if ce, ok := conduiterr.Get(e); ok {
+		return Finding{
+			Severity:   SeverityError,
+			Code:       ce.Code.Reason(),
+			Message:    ce.Message,
+			ConfigPath: ce.ConfigPath,
+			Suggestion: ce.Suggestion,
+			Fix:        ce.Fix,
+		}
+	}
+
+	ce := conduiterr.Wrap(config.CodeParseError, e.Error(), e)
+	if ce.Suggestion == "" {
+		ce.Suggestion = `fix the YAML syntax, or set "version" to a supported pipeline config version`
+	}
+	return Finding{
+		Severity:   SeverityError,
+		Code:       ce.Code.Reason(),
+		Message:    ce.Message,
+		ConfigPath: ce.ConfigPath,
+		Suggestion: ce.Suggestion,
+		Fix:        ce.Fix,
+	}
+}
+
+// warningFinding converts one parser Warning into an advisory (SeverityWarning)
+// Finding. Warnings locate by line/column in the source file rather than by a
+// config-path JSON pointer, and most carry the fixed CodeLintWarning code
+// (the parser's warnings mostly have no per-field conduiterr code of their
+// own) — except a rename-class warning (w.Code == config.CodeFieldRenamed,
+// repair v1 starter set item #1), which carries its own code and a
+// machine-appliable w.Fix straight through, so
+// cmd/conduit/internal/repair.Collect (which runs this engine with
+// Options.Warnings set) can find and offer it. A warning never affects the
+// exit code unless `lint --strict` is set.
+func warningFinding(w yaml.Warning) Finding {
+	code := CodeLintWarning
+	if w.Code != "" {
+		code = w.Code
+	}
+	return Finding{
+		Severity:   SeverityWarning,
+		Code:       code,
+		Message:    w.Message,
+		ConfigPath: w.Field,
+		Fix:        w.Fix,
+		Line:       w.Line,
+		Column:     w.Column,
+	}
+}
+
+// checkCrossFileDuplicateIDs is new code, not a reuse of
+// pkg/provisioning.Service.findDuplicateIDs: that method returns a bare
+// index map and a sentinel error (ErrDuplicatedPipelineID) suited to
+// provisioning's "skip the duplicates, keep going" recovery, not a coded,
+// located Finding. This walks every file's successfully-parsed (and
+// enriched — though enrichment never touches the pipeline's own top-level
+// ID, so parsed vs. enriched makes no difference here) pipeline IDs at once
+// and appends a provisioning.CodePipelineIDDuplicate Finding, with a
+// configPath into that file's own "pipelines" list, to every file that
+// contributes an occurrence of a duplicated ID — including two different
+// files sharing one ID, which findDuplicateIDs was never asked to locate
+// (it only ever saw the flattened, already-merged list).
+func checkCrossFileDuplicateIDs(frs []fileState) {
+	type loc struct {
+		fileIdx, pipeIdx int
+	}
+	byID := map[string][]loc{}
+	for fi, fr := range frs {
+		for pi, p := range fr.pipelines {
+			if p.ID == "" {
+				continue // already reported via config.CodeFieldRequired; don't double up
+			}
+			byID[p.ID] = append(byID[p.ID], loc{fileIdx: fi, pipeIdx: pi})
+		}
+	}
+
+	// Sort IDs for deterministic finding order across runs.
+	ids := make([]string, 0, len(byID))
+	for id := range byID {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+
+	for _, id := range ids {
+		locs := byID[id]
+		if len(locs) < 2 {
+			continue
+		}
+		sort.Slice(locs, func(i, j int) bool {
+			if locs[i].fileIdx != locs[j].fileIdx {
+				return frs[locs[i].fileIdx].path < frs[locs[j].fileIdx].path
+			}
+			return locs[i].pipeIdx < locs[j].pipeIdx
+		})
+
+		files := make([]string, 0, len(locs))
+		for _, l := range locs {
+			files = append(files, frs[l.fileIdx].path)
+		}
+
+		for _, l := range locs {
+			ce := conduiterr.New(provisioning.CodePipelineIDDuplicate,
+				fmt.Sprintf("pipeline %q: id is used by %d pipelines (%s)", id, len(locs), strings.Join(files, ", ")))
+			ce.ConfigPath = fmt.Sprintf("/pipelines/%d/id", l.pipeIdx)
+			ce.Suggestion = fmt.Sprintf("rename this pipeline's id or the other pipeline(s) sharing %q", id)
+
+			frs[l.fileIdx].findings = append(frs[l.fileIdx].findings, Finding{
+				Severity:   SeverityError,
+				Code:       ce.Code.Reason(),
+				Message:    ce.Message,
+				ConfigPath: ce.ConfigPath,
+				Suggestion: ce.Suggestion,
+			})
+		}
+	}
+}
+
+// buildReport converts the engine's working fileState slice into the public
+// Report: findings sorted by configPath within each file (the design doc's
+// ordering guarantee), plus the report-wide Summary rollup.
+func buildReport(frs []fileState, opts Options) Report {
+	report := Report{Files: make([]FileReport, len(frs))}
+	report.Summary.Files = len(frs)
+
+	for i, fr := range frs {
+		sort.SliceStable(fr.findings, func(a, b int) bool {
+			return fr.findings[a].ConfigPath < fr.findings[b].ConfigPath
+		})
+
+		ids := make([]string, 0, len(fr.pipelines))
+		for _, p := range fr.pipelines {
+			ids = append(ids, p.ID)
+		}
+
+		findings := fr.findings
+		if findings == nil {
+			// A nil slice marshals to JSON `null`; a --json consumer
+			// iterating result.files[].findings shouldn't have to special-case
+			// "no findings" as null vs. an empty array.
+			findings = []Finding{}
+		}
+
+		report.Files[i] = FileReport{
+			Path:      fr.path,
+			OK:        len(fr.findings) == 0,
+			Pipelines: ids,
+			Findings:  findings,
+		}
+		if opts.Enriched {
+			report.Files[i].Enriched = fr.pipelines
+		}
+
+		report.Summary.Pipelines += len(ids)
+		for _, find := range fr.findings {
+			switch find.Severity {
+			case SeverityWarning:
+				report.Summary.Warnings++
+			case SeverityError:
+				report.Summary.Errors++
+			default:
+				// Every Finding this package constructs sets Severity
+				// explicitly (findingFromError and
+				// checkCrossFileDuplicateIDs both always use SeverityError;
+				// `lint`, in a future PR, will be the first caller to ever
+				// produce SeverityWarning). An unset/unknown value is a bug
+				// in a finding constructor, not a real severity — counting
+				// it as an error is the conservative choice (never silently
+				// under-report a problem into exit 0).
+				report.Summary.Errors++
+			}
+		}
+	}
+
+	return report
+}

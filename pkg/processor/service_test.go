@@ -1,0 +1,708 @@
+// Copyright © 2022 Meroxa, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package processor
+
+import (
+	"context"
+	"strings"
+	"sync"
+	"testing"
+
+	"github.com/conduitio/conduit-commons/database/inmemory"
+	dbmock "github.com/conduitio/conduit-commons/database/mock"
+	sdk "github.com/conduitio/conduit-processor-sdk"
+	"github.com/conduitio/conduit/pkg/foundation/cerrors"
+	"github.com/conduitio/conduit/pkg/foundation/cerrors/conduiterr"
+	"github.com/conduitio/conduit/pkg/foundation/log"
+	"github.com/conduitio/conduit/pkg/plugin"
+	proc_plugin "github.com/conduitio/conduit/pkg/plugin/processor"
+	"github.com/conduitio/conduit/pkg/plugin/processor/egress"
+	proc_mock "github.com/conduitio/conduit/pkg/plugin/processor/mock"
+	"github.com/conduitio/conduit/pkg/processor/mock"
+	"github.com/google/uuid"
+	"github.com/matryer/is"
+	"go.uber.org/mock/gomock"
+)
+
+// TestService_resolveEgressPolicy_DefaultDenyAll is the end-to-end proof of the
+// security default: a Service with NO WithEgressCeiling option (the stock engine
+// wiring) has a zero-value/deny-all ceiling, so a processor that explicitly
+// requests egress via sdk.egress.allow still resolves to DenyAll. This closes
+// red-team finding #4 in the safe direction — the default stays fully closed.
+func TestService_resolveEgressPolicy_DefaultDenyAll(t *testing.T) {
+	is := is.New(t)
+	db := &inmemory.DB{}
+	registry := newPluginService(t, map[string]sdk.Processor{})
+
+	// No WithEgressCeiling => egressCeiling is the zero value (Enabled=false).
+	service := NewService(log.Nop(), db, registry)
+
+	inst := &Instance{
+		ID: uuid.NewString(),
+		Config: Config{Settings: map[string]string{
+			egress.ConfigKeyAllow: "api.openai.com", // the pipeline DOES opt in
+		}},
+	}
+
+	eff, err := service.resolveEgressPolicy(inst)
+	is.NoErr(err)
+	is.True(!eff.Enabled) // closed engine ceiling wins: effective policy is deny-all
+}
+
+// TestService_resolveEgressPolicy_EnabledIntersection verifies that an operator
+// ceiling (set via WithEgressCeiling, as runtime.go wires it from config) clamps
+// the per-processor request to the intersection.
+func TestService_resolveEgressPolicy_EnabledIntersection(t *testing.T) {
+	is := is.New(t)
+	db := &inmemory.DB{}
+	registry := newPluginService(t, map[string]sdk.Processor{})
+
+	ceiling := egress.Policy{
+		Enabled: true,
+		Allowlist: []egress.AllowEntry{
+			{Scheme: "https", Host: "api.openai.com", Port: "443"},
+		},
+	}
+	service := NewService(log.Nop(), db, registry, WithEgressCeiling(ceiling))
+
+	inst := &Instance{
+		ID: uuid.NewString(),
+		Config: Config{Settings: map[string]string{
+			egress.ConfigKeyAllow: "api.openai.com, api.voyageai.com", // one in, one out
+		}},
+	}
+
+	eff, err := service.resolveEgressPolicy(inst)
+	is.NoErr(err)
+	is.True(eff.Enabled)
+	is.Equal(len(eff.Allowlist), 1) // intersection: only the in-ceiling host survives
+	is.Equal(eff.Allowlist[0].Host, "api.openai.com")
+}
+
+// TestService_resolveEgressPolicy_MalformedFails verifies a malformed
+// per-processor egress config surfaces as an error (which fails the processor
+// build) rather than silently disabling egress.
+func TestService_resolveEgressPolicy_MalformedFails(t *testing.T) {
+	is := is.New(t)
+	db := &inmemory.DB{}
+	registry := newPluginService(t, map[string]sdk.Processor{})
+	service := NewService(log.Nop(), db, registry, WithEgressCeiling(egress.Policy{Enabled: true}))
+
+	inst := &Instance{
+		ID: uuid.NewString(),
+		Config: Config{Settings: map[string]string{
+			egress.ConfigKeyAllow: "*.evil.com", // wildcard is rejected
+		}},
+	}
+
+	_, err := service.resolveEgressPolicy(inst)
+	is.True(err != nil)
+}
+
+func TestService_Init_Success(t *testing.T) {
+	is := is.New(t)
+	ctx := context.Background()
+	db := &inmemory.DB{}
+
+	procType := "processor-type"
+	p := proc_mock.NewProcessor(gomock.NewController(t))
+	p.EXPECT().Teardown(ctx).Return(nil)
+
+	registry := newPluginService(t, map[string]sdk.Processor{procType: p})
+	service := NewService(log.Nop(), db, registry)
+
+	// create a processor instance
+	_, err := service.Create(
+		ctx,
+		uuid.NewString(),
+		procType,
+		Parent{},
+		Config{},
+		ProvisionTypeAPI,
+		"",
+	)
+	is.NoErr(err)
+
+	want := service.List(ctx)
+
+	// create a new processor service and initialize it
+	service = NewService(log.Nop(), db, registry)
+	err = service.Init(ctx)
+	is.NoErr(err)
+
+	got := service.List(ctx)
+
+	for k := range got {
+		got[k].UpdatedAt = want[k].UpdatedAt
+		got[k].CreatedAt = want[k].CreatedAt
+	}
+	is.Equal(want, got)
+	is.Equal(len(got), 1)
+}
+
+func TestService_Check(t *testing.T) {
+	ctx := context.Background()
+	logger := log.Nop()
+	db := dbmock.NewDB(gomock.NewController(t))
+
+	testCases := []struct {
+		name    string
+		wantErr error
+	}{
+		{name: "db ok", wantErr: nil},
+		{name: "db not ok", wantErr: cerrors.New("db error")},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			is := is.New(t)
+			db.EXPECT().Ping(gomock.Any()).Return(tc.wantErr)
+			service := NewService(logger, db, &proc_plugin.PluginService{})
+
+			gotErr := service.Check(ctx)
+			is.Equal(tc.wantErr, gotErr)
+		})
+	}
+}
+
+func TestService_Create_Success(t *testing.T) {
+	is := is.New(t)
+	ctx := context.Background()
+	db := &inmemory.DB{}
+	p := proc_mock.NewProcessor(gomock.NewController(t))
+	p.EXPECT().Teardown(ctx).Return(nil)
+
+	want := &Instance{
+		ID:     "uuid will be taken from the result",
+		Plugin: "processor-type",
+		Parent: Parent{
+			ID:   uuid.NewString(),
+			Type: ParentTypeConnector,
+		},
+		Config: Config{
+			Settings: map[string]string{
+				"processor-config-field-1": "foo",
+				"processor-config-field-2": "bar",
+			},
+			Workers: 1,
+		},
+	}
+
+	registry := newPluginService(t, map[string]sdk.Processor{want.Plugin: p})
+	service := NewService(log.Nop(), db, registry)
+
+	got, err := service.Create(
+		ctx,
+		want.ID,
+		want.Plugin,
+		want.Parent,
+		want.Config,
+		ProvisionTypeAPI,
+		"",
+	)
+	is.NoErr(err)
+	want.ID = got.ID // uuid is random
+	want.CreatedAt = got.CreatedAt
+	want.UpdatedAt = got.UpdatedAt
+
+	// just ensure inspectors are set
+	is.True(got.inInsp != nil)
+	is.True(got.outInsp != nil)
+	got.inInsp = nil
+	got.outInsp = nil
+
+	is.Equal(want, got)
+}
+
+func TestService_Init_PluginNotFound(t *testing.T) {
+	is := is.New(t)
+	ctx := context.Background()
+	db := &inmemory.DB{}
+
+	procGetter := mock.NewPluginService(gomock.NewController(t))
+	procGetter.EXPECT().
+		NewProcessor(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+		Return(nil, plugin.ErrPluginNotFound)
+	service := NewService(log.Nop(), db, procGetter)
+
+	_, err := service.Create(
+		ctx,
+		uuid.NewString(),
+		"non-existent processor",
+		Parent{},
+		Config{},
+		ProvisionTypeAPI,
+		"{{true}}",
+	)
+	is.True(cerrors.Is(err, plugin.ErrPluginNotFound))
+}
+
+func TestService_Create_BuilderFail(t *testing.T) {
+	is := is.New(t)
+	ctx := context.Background()
+	db := &inmemory.DB{}
+
+	wantErr := cerrors.New("builder failed")
+
+	procGetter := mock.NewPluginService(gomock.NewController(t))
+	procGetter.EXPECT().
+		NewProcessor(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+		Return(nil, wantErr)
+	service := NewService(log.Nop(), db, procGetter)
+
+	i, err := service.Create(
+		ctx,
+		uuid.NewString(),
+		"processor-type",
+		Parent{},
+		Config{},
+		ProvisionTypeAPI,
+		"{{true}}",
+	)
+	is.True(cerrors.Is(err, wantErr)) // expected builder error
+	is.Equal(i, nil)
+}
+
+func TestService_Create_WorkersNegative(t *testing.T) {
+	is := is.New(t)
+	ctx := context.Background()
+	db := &inmemory.DB{}
+
+	service := NewService(log.Nop(), db, &proc_plugin.PluginService{})
+
+	got, err := service.Create(
+		ctx,
+		uuid.NewString(),
+		"processor-type",
+		Parent{},
+		Config{Workers: -1},
+		ProvisionTypeAPI,
+		"{{true}}",
+	)
+	is.True(err != nil) // expected workers error
+	is.Equal("processor workers can't be negative", err.Error())
+	is.Equal(got, nil)
+}
+
+func TestService_Delete_Success(t *testing.T) {
+	is := is.New(t)
+	ctx := context.Background()
+	db := &inmemory.DB{}
+
+	procType := "processor-type"
+	p := proc_mock.NewProcessor(gomock.NewController(t))
+	p.EXPECT().Teardown(ctx).Return(nil)
+	registry := newPluginService(t, map[string]sdk.Processor{procType: p})
+	service := NewService(log.Nop(), db, registry)
+
+	// create a processor instance
+	i, err := service.Create(
+		ctx,
+		uuid.NewString(),
+		procType,
+		Parent{},
+		Config{},
+		ProvisionTypeAPI,
+		"cond",
+	)
+	is.NoErr(err)
+
+	err = service.Delete(ctx, i.ID)
+	is.NoErr(err)
+
+	got, err := service.Get(ctx, i.ID)
+	is.True(cerrors.Is(err, ErrInstanceNotFound)) // expected instance not found error
+	is.Equal(got, nil)
+}
+
+func TestService_Delete_ProcessorIsRunning(t *testing.T) {
+	is := is.New(t)
+	ctx := context.Background()
+	db := &inmemory.DB{}
+
+	procType := "processor-type"
+	p := proc_mock.NewProcessor(gomock.NewController(t))
+	p.EXPECT().Teardown(ctx).Return(nil).AnyTimes()
+	registry := newPluginService(t, map[string]sdk.Processor{procType: p})
+	service := NewService(log.Nop(), db, registry)
+
+	// create a processor instance
+	i, err := service.Create(
+		ctx,
+		uuid.NewString(),
+		procType,
+		Parent{},
+		Config{},
+		ProvisionTypeAPI,
+		"cond",
+	)
+	is.NoErr(err)
+
+	// make a runnable processor
+	proc, err := service.MakeRunnableProcessor(ctx, i)
+	is.NoErr(err)
+
+	err = service.Delete(ctx, i.ID)
+	is.True(cerrors.Is(err, ErrProcessorRunning))
+
+	err = proc.Teardown(ctx)
+	is.NoErr(err)
+
+	err = service.Delete(ctx, i.ID)
+	is.NoErr(err)
+
+	got, err := service.Get(ctx, i.ID)
+	is.True(cerrors.Is(err, ErrInstanceNotFound)) // expected instance not found error
+	is.Equal(got, nil)
+}
+
+func TestService_Delete_Fail(t *testing.T) {
+	is := is.New(t)
+	ctx := context.Background()
+	db := &inmemory.DB{}
+	service := NewService(log.Nop(), db, &proc_plugin.PluginService{})
+
+	err := service.Delete(ctx, "non-existent processor")
+	is.True(cerrors.Is(err, ErrInstanceNotFound)) // expected instance not found error
+}
+
+func TestService_Get_Success(t *testing.T) {
+	is := is.New(t)
+	ctx := context.Background()
+	db := &inmemory.DB{}
+
+	procType := "processor-type"
+	p := proc_mock.NewProcessor(gomock.NewController(t))
+	p.EXPECT().Teardown(ctx).Return(nil)
+
+	registry := newPluginService(t, map[string]sdk.Processor{procType: p})
+	service := NewService(log.Nop(), db, registry)
+
+	// create a processor instance
+	want, err := service.Create(ctx, uuid.NewString(), procType, Parent{}, Config{}, ProvisionTypeAPI, "cond")
+	is.NoErr(err)
+
+	got, err := service.Get(ctx, want.ID)
+	is.NoErr(err)
+	is.Equal(want, got)
+}
+
+func TestService_Get_Fail(t *testing.T) {
+	is := is.New(t)
+	ctx := context.Background()
+	db := &inmemory.DB{}
+	service := NewService(log.Nop(), db, &proc_plugin.PluginService{})
+
+	got, err := service.Get(ctx, "non-existent processor")
+	is.True(cerrors.Is(err, ErrInstanceNotFound)) // sentinel still in the chain
+	ce, ok := conduiterr.Get(err)
+	is.True(ok) // now also carries a machine-actionable ConduitError code
+	is.Equal(ce.Code.Reason(), CodeProcessorNotFound.Reason())
+	is.True(ce.Suggestion != "") // with a suggested fix
+	is.Equal(got, nil)
+}
+
+func TestService_List_Empty(t *testing.T) {
+	is := is.New(t)
+	ctx := context.Background()
+	db := &inmemory.DB{}
+	service := NewService(log.Nop(), db, &proc_plugin.PluginService{})
+
+	instances := service.List(ctx)
+	is.True(instances != nil)
+	is.True(len(instances) == 0) // expected an empty map
+}
+
+func TestService_List_Some(t *testing.T) {
+	is := is.New(t)
+	ctx := context.Background()
+	db := &inmemory.DB{}
+
+	procType := "processor-type"
+	p := proc_mock.NewProcessor(gomock.NewController(t))
+	p.EXPECT().Teardown(ctx).Return(nil).Times(3)
+
+	registry := newPluginService(t, map[string]sdk.Processor{procType: p})
+	service := NewService(log.Nop(), db, registry)
+
+	// create a couple of processor instances
+	i1, err := service.Create(ctx, uuid.NewString(), procType, Parent{}, Config{}, ProvisionTypeAPI, "")
+	is.NoErr(err)
+	i2, err := service.Create(ctx, uuid.NewString(), procType, Parent{}, Config{}, ProvisionTypeAPI, "")
+	is.NoErr(err)
+	i3, err := service.Create(ctx, uuid.NewString(), procType, Parent{}, Config{}, ProvisionTypeAPI, "")
+	is.NoErr(err)
+
+	instances := service.List(ctx)
+	is.Equal(map[string]*Instance{i1.ID: i1, i2.ID: i2, i3.ID: i3}, instances)
+}
+
+func TestService_Update_Success(t *testing.T) {
+	is := is.New(t)
+	ctx := context.Background()
+	db := &inmemory.DB{}
+
+	procType := "processor-type"
+	p := proc_mock.NewProcessor(gomock.NewController(t))
+	p.EXPECT().Teardown(ctx).Return(nil)
+
+	registry := newPluginService(t, map[string]sdk.Processor{procType: p})
+	service := NewService(log.Nop(), db, registry)
+
+	// create a processor instance
+	want, err := service.Create(ctx, uuid.NewString(), procType, Parent{}, Config{}, ProvisionTypeAPI, "")
+	is.NoErr(err)
+
+	newConfig := Config{
+		Settings: map[string]string{
+			"processor-config-field-1": "foo",
+			"processor-config-field-2": "bar",
+		},
+	}
+	newProcType := "new-proc-type"
+
+	got, err := service.Update(ctx, want.ID, newProcType, newConfig)
+	is.NoErr(err)
+	is.Equal(want, got)             // same instance is returned
+	is.Equal(newConfig, got.Config) // config was updated
+
+	got, err = service.Get(ctx, want.ID)
+	is.NoErr(err)
+	is.Equal(newConfig, got.Config)
+	is.Equal(newProcType, got.Plugin)
+}
+
+// TestService_UpdateWhileRunning_BypassesRunningGuard is the regression test for
+// the live in-place hot-reload bug: Update refuses a RUNNING processor
+// (ErrProcessorRunning), which is exactly the guard that made
+// provisioning.applyInPlace fail before it committed the new config through
+// UpdateWhileRunning instead — so ReconfigureProcessor was never reached and
+// in-place hot-reload never worked. UpdateWhileRunning must bypass that guard (it
+// is paired with an immediate node swap) and commit the config.
+func TestService_UpdateWhileRunning_BypassesRunningGuard(t *testing.T) {
+	is := is.New(t)
+	ctx := context.Background()
+	db := &inmemory.DB{}
+
+	procType := "processor-type"
+	p := proc_mock.NewProcessor(gomock.NewController(t))
+	p.EXPECT().Teardown(gomock.Any()).Return(nil).AnyTimes()
+	registry := newPluginService(t, map[string]sdk.Processor{procType: p})
+	service := NewService(log.Nop(), db, registry)
+
+	inst, err := service.Create(ctx, uuid.NewString(), procType, Parent{}, Config{}, ProvisionTypeAPI, "")
+	is.NoErr(err)
+	inst.running.Store(true) // as it is inside a running pipeline
+
+	newConfig := Config{Settings: map[string]string{"k": "v"}}
+
+	// Update refuses a running instance — the guard direct API callers rely on.
+	_, err = service.Update(ctx, inst.ID, procType, newConfig)
+	is.True(err != nil)
+	is.True(cerrors.Is(err, ErrProcessorRunning))
+
+	// UpdateWhileRunning bypasses it and commits the new config.
+	got, err := service.UpdateWhileRunning(ctx, inst.ID, procType, newConfig)
+	is.NoErr(err)
+	is.Equal(newConfig, got.Config)
+
+	reread, err := service.Get(ctx, inst.ID)
+	is.NoErr(err)
+	is.Equal(newConfig, reread.Config)
+}
+
+// TestService_MakeRunnableProcessorForReconfigure_BypassesRunningGuard is the
+// regression test for the SECOND running-guard that blocked live in-place
+// hot-reload. MakeRunnableProcessor refuses a RUNNING instance
+// (ErrProcessorRunning) and flips i.running — correct for a fresh pipeline
+// start, but wrong for the reconfigure swap, where the instance legitimately
+// stays running across an open-before-teardown node replacement. Fixing only
+// Update (guard #1, UpdateWhileRunning) was not enough: lifecycle.Reconfigure-
+// Processor then called MakeRunnableProcessor on the still-running instance and
+// got ErrProcessorRunning, so the swap never happened. This guard was invisible
+// to the existing suite because every in-place test mocked ProcessorService.
+// MakeRunnableProcessorForReconfigure must build the runnable WITHOUT the guard
+// and WITHOUT touching i.running (the caller owns the running lifetime).
+func TestService_MakeRunnableProcessorForReconfigure_BypassesRunningGuard(t *testing.T) {
+	is := is.New(t)
+	ctx := context.Background()
+	db := &inmemory.DB{}
+
+	procType := "processor-type"
+	p := proc_mock.NewProcessor(gomock.NewController(t))
+	p.EXPECT().Teardown(gomock.Any()).Return(nil).AnyTimes()
+	registry := newPluginService(t, map[string]sdk.Processor{procType: p})
+	service := NewService(log.Nop(), db, registry)
+
+	inst, err := service.Create(ctx, uuid.NewString(), procType, Parent{}, Config{}, ProvisionTypeAPI, "")
+	is.NoErr(err)
+	inst.running.Store(true) // as it is inside a running pipeline being reconfigured
+
+	// MakeRunnableProcessor refuses a running instance — the guard the fresh-
+	// start path relies on so two nodes never wrap the same instance.
+	_, err = service.MakeRunnableProcessor(ctx, inst)
+	is.True(err != nil)
+	is.True(cerrors.Is(err, ErrProcessorRunning))
+
+	// MakeRunnableProcessorForReconfigure builds the runnable anyway, for the
+	// live swap, and leaves i.running exactly as it was (the instance stays
+	// running across the swap; the caller does not re-enter the running state).
+	rp, err := service.MakeRunnableProcessorForReconfigure(ctx, inst)
+	is.NoErr(err)
+	is.True(rp != nil)
+	is.True(inst.running.Load()) // unchanged: the swap does not toggle the running flag
+}
+
+// TestReconfigureSwap_KeepsInstanceRunning_GuardsStayArmed is the regression test
+// for the shared-Instance running-flag corruption in the live in-place swap.
+// RunnableProcessor embeds a single *Instance that is SHARED across the two
+// runnables of a swap (the old one and the MakeRunnableProcessorForReconfigure
+// one). The plain Teardown clears that instance's running flag. During a swap the
+// node tears down one runnable while the instance stays running via the other —
+// so the swap must use TeardownForReconfigure, which tears down the plugin WITHOUT
+// clearing running. If it used the plain Teardown, the instance would be marked
+// stopped while still processing records, silently disarming the Update and Delete
+// running-guards for the rest of the pipeline's life (config could then be mutated
+// out from under the live node, or the instance deleted while running).
+func TestReconfigureSwap_KeepsInstanceRunning_GuardsStayArmed(t *testing.T) {
+	is := is.New(t)
+	ctx := context.Background()
+	db := &inmemory.DB{}
+
+	procType := "processor-type"
+	p := proc_mock.NewProcessor(gomock.NewController(t))
+	p.EXPECT().Teardown(gomock.Any()).Return(nil).AnyTimes()
+	registry := newPluginService(t, map[string]sdk.Processor{procType: p})
+	service := NewService(log.Nop(), db, registry)
+
+	inst, err := service.Create(ctx, uuid.NewString(), procType, Parent{}, Config{}, ProvisionTypeAPI, "")
+	is.NoErr(err)
+
+	// Pipeline start: build the live runnable R1 (sets running=true).
+	r1, err := service.MakeRunnableProcessor(ctx, inst)
+	is.NoErr(err)
+	is.True(inst.running.Load())
+
+	// Reconfigure: build R2 for the SAME instance (does not touch running).
+	r2, err := service.MakeRunnableProcessorForReconfigure(ctx, inst)
+	is.NoErr(err)
+
+	// Successful-swap teardown of the old runnable: the instance stays running via
+	// R2, so running must remain true.
+	is.NoErr(r1.TeardownForReconfigure(ctx))
+	is.True(inst.running.Load()) // regression: the plain Teardown would make this false
+
+	// The real-world consequence: the running-guards must still be armed.
+	_, err = service.Update(ctx, inst.ID, procType, Config{Settings: map[string]string{"k": "v"}})
+	is.True(cerrors.Is(err, ErrProcessorRunning))
+	err = service.Delete(ctx, inst.ID)
+	is.True(cerrors.Is(err, ErrProcessorRunning))
+
+	// Failed-open path variant: tearing down the failed NEW runnable likewise must
+	// not clear running (the old one keeps running).
+	r3, err := service.MakeRunnableProcessorForReconfigure(ctx, inst)
+	is.NoErr(err)
+	is.NoErr(r3.TeardownForReconfigure(ctx))
+	is.True(inst.running.Load())
+
+	// A real pipeline stop tears down the node's current processor (R2) via the
+	// plain Teardown, which clears running and re-arms ordinary Update/Delete.
+	is.NoErr(r2.Teardown(ctx))
+	is.True(!inst.running.Load())
+	_, err = service.Update(ctx, inst.ID, procType, Config{Settings: map[string]string{"k": "v2"}})
+	is.NoErr(err) // now allowed: the instance is genuinely stopped
+}
+
+// TestService_RunningFlag_ConcurrentUpdateAndTeardown_NoRace pins the
+// synchronization of Instance.running: it is read on the API goroutine (Update's
+// guard) and written on the pipeline's Run goroutine (Teardown at stop). With a
+// plain bool this is a data race the -race detector fails on; running is an
+// atomic.Bool so this is race-free. Run with -race for it to be meaningful.
+func TestService_RunningFlag_ConcurrentUpdateAndTeardown_NoRace(t *testing.T) {
+	is := is.New(t)
+	ctx := context.Background()
+	db := &inmemory.DB{}
+
+	procType := "processor-type"
+	p := proc_mock.NewProcessor(gomock.NewController(t))
+	p.EXPECT().Teardown(gomock.Any()).Return(nil).AnyTimes()
+	registry := newPluginService(t, map[string]sdk.Processor{procType: p})
+	service := NewService(log.Nop(), db, registry)
+
+	inst, err := service.Create(ctx, uuid.NewString(), procType, Parent{}, Config{}, ProvisionTypeAPI, "")
+	is.NoErr(err)
+	proc, err := service.MakeRunnableProcessor(ctx, inst) // running = true
+	is.NoErr(err)
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 200; i++ {
+			// Reads inst.running via the guard; return value is irrelevant here.
+			_, _ = service.Update(ctx, inst.ID, procType, Config{})
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		_ = proc.Teardown(ctx) // writes inst.running
+	}()
+	wg.Wait()
+}
+
+func TestService_Update_NonExistentProcessor(t *testing.T) {
+	is := is.New(t)
+	ctx := context.Background()
+	db := &inmemory.DB{}
+	service := NewService(log.Nop(), db, &proc_plugin.PluginService{})
+
+	got, err := service.Update(ctx, "non-existent processor", "test-processor", Config{})
+	is.True(cerrors.Is(err, ErrInstanceNotFound)) // expected instance not found error
+	is.Equal(got, nil)
+}
+
+func TestService_Update_EmptyPluginName(t *testing.T) {
+	is := is.New(t)
+	ctx := context.Background()
+	db := &inmemory.DB{}
+
+	procType := "processor-type"
+	p := proc_mock.NewProcessor(gomock.NewController(t))
+	p.EXPECT().Teardown(ctx).Return(nil)
+
+	registry := newPluginService(t, map[string]sdk.Processor{procType: p})
+	service := NewService(log.Nop(), db, registry)
+
+	// create a processor instance
+	want, err := service.Create(ctx, uuid.NewString(), procType, Parent{}, Config{}, ProvisionTypeAPI, "")
+	is.NoErr(err)
+
+	_, err = service.Update(ctx, want.ID, "", Config{})
+	is.True(err != nil)
+	is.True(strings.Contains(err.Error(), "plugin name is empty"))
+}
+
+// newPluginService creates a registry with builders for the supplied
+// processors map keyed by processor type. If a value in the map is nil then a
+// builder will be registered that returns an error.
+func newPluginService(t *testing.T, processors map[string]sdk.Processor) *mock.PluginService {
+	pg := mock.NewPluginService(gomock.NewController(t))
+	for name, proc := range processors {
+		pg.EXPECT().
+			NewProcessor(gomock.Any(), name, gomock.Any(), gomock.Any()).AnyTimes().
+			Return(proc, nil)
+	}
+	return pg
+}

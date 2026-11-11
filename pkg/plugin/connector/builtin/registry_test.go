@@ -1,0 +1,154 @@
+// Copyright © 2024 Meroxa, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package builtin
+
+import (
+	"context"
+	"testing"
+
+	"github.com/conduitio/conduit-connector-protocol/pconnector"
+	"github.com/conduitio/conduit/pkg/foundation/cerrors"
+	"github.com/conduitio/conduit/pkg/foundation/cerrors/conduiterr"
+	"github.com/conduitio/conduit/pkg/foundation/log"
+	"github.com/conduitio/conduit/pkg/plugin"
+	"github.com/conduitio/conduit/pkg/plugin/connector"
+	"github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp/cmpopts"
+	"github.com/matryer/is"
+)
+
+func TestRegistry_InitList(t *testing.T) {
+	is := is.New(t)
+	ctx := context.Background()
+
+	underTest := NewRegistry(log.Nop(), DefaultBuiltinConnectors, nil)
+	underTest.Init(ctx)
+
+	specs := underTest.List()
+
+	is.Equal(len(DefaultBuiltinConnectors), len(specs))
+	for _, gotSpec := range specs {
+		wantSpec := DefaultBuiltinConnectors["github.com/conduitio/conduit-connector-"+gotSpec.Name].NewSpecification()
+		is.Equal(
+			"",
+			cmp.Diff(
+				wantSpec,
+				gotSpec,
+				cmpopts.IgnoreFields(pconnector.Specification{}, "SourceParams", "DestinationParams"),
+			),
+		)
+	}
+}
+
+func TestRegistry_NewDispenser_PluginNotFound(t *testing.T) {
+	testCases := []struct {
+		name       string
+		pluginName string
+		wantErr    bool
+	}{
+		{
+			name:       "non-existing plugin",
+			pluginName: "builtin:foobar",
+			wantErr:    true,
+		},
+		{
+			name:       "plugin exists, version doesn't",
+			pluginName: "builtin:file@v12.34.56",
+			wantErr:    true,
+		},
+		{
+			name:       "existing plugin, no builtin prefix, no version",
+			pluginName: "file",
+			wantErr:    false,
+		},
+		{
+			name:       "existing plugin, with builtin prefix, no version",
+			pluginName: "builtin:file",
+			wantErr:    false,
+		},
+		{
+			name: "existing plugin, with builtin prefix, with version",
+			pluginName: func() string {
+				v := DefaultBuiltinConnectors["github.com/conduitio/conduit-connector-file"].
+					NewSpecification().
+					Version
+				return "builtin:file@" + v
+			}(),
+			wantErr: false,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			is := is.New(t)
+			ctx := context.Background()
+
+			underTest := NewRegistry(log.Nop(), DefaultBuiltinConnectors, nil)
+			underTest.Init(ctx)
+
+			dispenser, err := underTest.NewDispenser(log.Nop(), plugin.FullName(tc.pluginName), pconnector.PluginConfig{})
+			if tc.wantErr {
+				is.True(cerrors.Is(err, plugin.ErrPluginNotFound)) // sentinel still in the chain
+				ce, ok := conduiterr.Get(err)
+				is.True(ok) // now also carries a machine-actionable ConduitError code
+				is.Equal(ce.Code.Reason(), conduiterr.CodeConnectorPluginNotFound.Reason())
+				is.True(ce.Suggestion != "") // with a suggested fix
+				is.True(dispenser == nil)
+				return
+			}
+
+			is.NoErr(err)
+			is.True(dispenser != nil)
+		})
+	}
+}
+
+// TestRegistry_NewDispenser_CarriesSpecification (#3321): the dispenser carries
+// the specification of the version the registry resolved, through the
+// cleanup wrapper the plugin service adds, so the arch-v2 engine reads the
+// connector's sdk.batch.* defaults without starting a plugin. The S3 default
+// (1000 / 1 s) is what made a 1-record pipeline run at 1 record/s. File
+// v0.13.0 declares 1000 / 100ms (every write pays for two fsyncs); Postgres
+// declares "0".
+func TestRegistry_NewDispenser_CarriesSpecification(t *testing.T) {
+	r := NewRegistry(log.Nop(), DefaultBuiltinConnectors, nil)
+	r.Init(context.Background())
+	for name, want := range map[string][2]string{
+		"builtin:s3":       {"1000", "1s"},
+		"builtin:file":     {"1000", "100ms"},
+		"builtin:postgres": {"0", "0"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			is := is.New(t)
+			d, err := r.NewDispenser(log.Nop(), plugin.FullName(name), pconnector.PluginConfig{})
+			is.NoErr(err)
+			for _, d := range []connector.Dispenser{d, connector.DispenserWithCleanup(d, func() {})} {
+				spec, ok := connector.DispenserSpecification(d)
+				is.True(ok)
+				is.Equal(spec.DestinationParams["sdk.batch.size"].Default, want[0])
+				is.Equal(spec.DestinationParams["sdk.batch.delay"].Default, want[1])
+			}
+		})
+	}
+}
+
+// TestDispenser_NoSpecificationOutsideRegistry: a dispenser built directly,
+// not by the registry, reports no specification.
+func TestDispenser_NoSpecificationOutsideRegistry(t *testing.T) {
+	is := is.New(t)
+	d := NewDispenser("builtin:x", log.Nop(), nil, nil, nil)
+	_, ok := connector.DispenserSpecification(d)
+	is.True(!ok)
+}
