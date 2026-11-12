@@ -35,7 +35,7 @@ services:
   # test/compose-schemaregistry.yaml, kept as its own service rather than
   # reused since that file's kafka has no host-published port.
   templates-kafka:
-    image: confluentinc/cp-kafka:7.9.1
+    image: confluentinc/cp-kafka:8.4.0
     ports:
       - "9095:9095"
     environment:
